@@ -22,6 +22,18 @@ from app.config_loader import (
     load_app_config_validated,
 )
 from app.shared_market import get_steam_smart_price_cny, batch_fetch_prices
+from app.database import (
+    db_get_purchase_orders,
+    db_replace_cancelled_order_with_paid_purchase,
+    db_update_purchase_order,
+)
+from app.order_state import (
+    BLOCKING_PAYMENT_STATUSES,
+    ORDER_STATUS_LABELS,
+    derive_purchase_status,
+    get_daily_budget_summary,
+    reconcile_orders_from_local_records,
+)
 router = APIRouter()
 class AddPurchaseBody(BaseModel):
     name: str = ""
@@ -42,6 +54,11 @@ class TransactionUpdateBody(BaseModel):
     pending_receipt: Optional[bool] = None
     assetid: Optional[str] = None
     listing: Optional[bool] = None
+
+class ReplacePaidOrderBody(BaseModel):
+    new_external_order_id: str
+    unit_price: float
+    market_price: Optional[float] = None
 def _name_from_steam_link(steam_link: str) -> Optional[str]:
     from steam.client import resolve_market_hash_name_from_listing_url
     from utils.proxy_manager import get_proxy_manager
@@ -105,7 +122,7 @@ def api_add_purchase(body: AddPurchaseBody):
     market_price = _fetch_steam_lowest_cny(name)
     assetid_val = (body.assetid or "").strip() or None
     for _ in range(qty):
-        rec = {"name": name, "goods_id": goods_id, "price": price, "at": now}
+        rec = {"name": name, "goods_id": goods_id, "price": price, "at": now, "source": "manual"}
         if market_price is not None and market_price > 0:
             rec["market_price"] = round(float(market_price), 2)
         if assetid_val is not None:
@@ -138,6 +155,19 @@ def api_transactions(enrich_current_price: bool = False):
             row["listing"] = bool(p.get("listing"))
         if p.get("listing_status") is not None:
             row["listing_status"] = p.get("listing_status")
+        if p.get("external_order_id") is not None:
+            row["external_order_id"] = p.get("external_order_id")
+        row["source"] = p.get("source") or "legacy"
+        row["order_status"] = derive_purchase_status(p)
+        row["order_status_label"] = ORDER_STATUS_LABELS.get(row["order_status"], row["order_status"])
+        if p.get("current_market_price") is not None:
+            row["current_market_price"] = round(float(p.get("current_market_price")), 2)
+        if p.get("current_price_updated_at") is not None:
+            row["current_price_updated_at"] = float(p.get("current_price_updated_at"))
+        if p.get("received_at") is not None:
+            row["received_at"] = float(p.get("received_at"))
+        if p.get("tradable_at") is not None:
+            row["tradable_at"] = float(p.get("tradable_at"))
         out.append(row)
     for i, s in enumerate(sales):
         row = {"type": "sale", "idx": i, "name": s.get("name", ""), "goods_id": s.get("goods_id", ""), "price": float(s.get("price", 0)), "at": s.get("at", 0), "assetid": s.get("assetid") or ""}
@@ -152,6 +182,79 @@ def api_transactions(enrich_current_price: bool = False):
     if resell_ratio <= 0:
         resell_ratio = 0.85
     return {"transactions": out, "resell_ratio": resell_ratio}
+
+@router.get("/api/orders")
+def api_orders():
+    reconcile_orders_from_local_records()
+    cfg = load_app_config_validated().get("pipeline", {})
+    target = float(cfg.get("target_balance", 100) or 100)
+    orders = db_get_purchase_orders()
+    for order in orders:
+        order["status_label"] = ORDER_STATUS_LABELS.get(order.get("status"), order.get("status"))
+        order["blocking"] = order.get("status") in BLOCKING_PAYMENT_STATUSES
+    return {
+        "orders": list(reversed(orders)),
+        "budget": get_daily_budget_summary(target),
+    }
+
+@router.post("/api/order/{external_order_id}/cancel")
+def api_cancel_unresolved_order(external_order_id: str):
+    order = next(
+        (row for row in db_get_purchase_orders() if row.get("external_order_id") == external_order_id),
+        None,
+    )
+    if order is None:
+        return {"ok": False, "error": "订单不存在"}
+    if order.get("status") not in BLOCKING_PAYMENT_STATUSES:
+        return {"ok": False, "error": "该订单当前不是待支付或待核对状态"}
+    ok = db_update_purchase_order(external_order_id, {
+        "status": "cancelled",
+        "error": "用户在确认平台订单已取消后手动解除阻断",
+    })
+    return {"ok": ok}
+
+@router.post("/api/order/{external_order_id}/replace-paid")
+def api_replace_cancelled_order_with_paid_order(
+    external_order_id: str,
+    body: ReplacePaidOrderBody,
+):
+    try:
+        result = db_replace_cancelled_order_with_paid_purchase(
+            external_order_id,
+            body.new_external_order_id,
+            body.unit_price,
+            body.market_price,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    log(
+        f"订单修正: 旧单 {external_order_id} 已取消，已登记手工付款新单 "
+        f"{result['new_external_order_id']}，金额={result['total_price']:.2f}",
+        "info",
+        category="buff",
+    )
+    return {"ok": True, "order": result}
+
+@router.get("/api/order/{external_order_id}/current-market-price")
+def api_replacement_order_current_market_price(external_order_id: str):
+    order = next(
+        (row for row in db_get_purchase_orders() if row.get("external_order_id") == external_order_id),
+        None,
+    )
+    if order is None:
+        return {"ok": False, "error": "订单不存在"}
+    if order.get("status") not in BLOCKING_PAYMENT_STATUSES:
+        return {"ok": False, "error": "该订单当前不是待支付或待核对状态"}
+    if not is_steam_background_allowed():
+        return {"ok": False, "error": "Steam 后台请求当前不可用，请停止任务后重试"}
+    market_price = _fetch_steam_lowest_cny(order.get("name") or "")
+    if market_price is None or float(market_price) <= 0:
+        return {"ok": False, "error": "暂时无法获取该商品的 Steam 当前市场价"}
+    return {
+        "ok": True,
+        "name": order.get("name") or "",
+        "market_price": round(float(market_price), 2),
+    }
 @router.delete("/api/transaction")
 def api_delete_transaction(type: str = "purchase", idx: int = 0, db_id: int = 0):
     if type == "purchase":

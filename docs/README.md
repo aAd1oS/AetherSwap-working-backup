@@ -1,32 +1,76 @@
-# AetherSwap 文档目录
+# AetherSwap 本地文档
 
-这里放本地复现和使用说明。项目源码结构没有移动，避免破坏启动。
+本目录记录当前本机版本的安装、配置、交易、安全和排障方法。
+
+适用项目目录：`D:\Vibe Coding\steam`
+
+最后整理：2026-08-05
+
+> 本目录只保存说明文档。Steam Cookie、BUFF Cookie、PushPlus Token、邮箱授权码、`shared_secret`、`identity_secret` 和 `.maFile` 都不得写进文档或提交到 GitHub。
 
 ## 推荐阅读顺序
 
-1. `AETHERSWAP_小白操作说明.md`
+1. [01_安装与日常使用.md](01_安装与日常使用.md)
 
-   从启动、停止、配置、常见问题讲起，适合第一次打开项目时看。
+   从安装、启动、首次配置、页面功能到每天如何操作，适合第一次接触项目时阅读。
 
-2. `AETHERSWAP_初次交易建议步骤.md`
+2. [02_账号配置与初次交易.md](02_账号配置与初次交易.md)
 
-   讲第一次绑定账号、第一次小额交易、第一次上架时怎么稳一点。
+   说明 Steam、BUFF、Steam Guard、PushPlus 的配置，以及第一次小额购买、入库、冷却和上架流程。
 
-3. `AETHERSWAP_LOCAL_REPRO_NOTES.md`
+3. [03_网络与故障排查.md](03_网络与故障排查.md)
 
-   记录本机复现过程、已处理的问题和当前状态。
+   说明当前网络路由逻辑，并按 `429`、`10054`、超时、证书错误、Cookie 失效等现象排查。
 
-## 根目录保留的文件
+4. [04_数据安全与备份.md](04_数据安全与备份.md)
 
-这些文件继续留在项目根目录，不建议移动：
+   说明哪些文件包含秘密、哪些目录不应上传，以及如何使用本地安全备份和私有 GitHub 仓库。
 
-- `run.py`
-- `requirements.txt`
-- `requirements-server.txt`
-- `Dockerfile`
-- `docker-compose.yml`
-- `.env.example`
-- `README.md`
-- `start-aetherswap-server.cmd`
+5. [05_后续改进建议.md](05_后续改进建议.md)
 
-其中 `start-aetherswap-server.cmd` 留在根目录，是为了双击启动方便。
+   记录已经完成的关键改进、仍存在的边界和推荐开发顺序。
+
+6. [06_价格与支付说明.md](06_价格与支付说明.md)
+
+   解释购入价、Steam 市场价、税后价格、折扣比率和收益口径，并记录 BUFF 可用资金调查与安全改进方案。
+
+## 当前本机状态
+
+- 项目目录：`D:\Vibe Coding\steam`
+- 桌面启动器：`start-aetherswap-desktop.cmd`
+- 服务器启动器：`start-aetherswap-server.cmd`
+- 本地地址：`http://127.0.0.1:28472/`
+- Python 虚拟环境：`.venv`
+- Playwright 浏览器：`.playwright`
+- 数据库：`config/app.db`
+- 日志：`log/`
+- PushPlus：本项目引导要求配置，Token 只保存在本地配置中
+- 代理池：默认可关闭，实际 Steam 路由由当前网络环境和项目路由逻辑决定
+
+## 当前主要操作流程
+
+```text
+启动桌面版
+  -> 检查账号与配置
+  -> 查看今日投入额度和未决订单
+  -> 启动购买任务
+  -> PushPlus 收到待付款通知
+  -> 完成付款并在面板确认
+  -> 同步入库状态
+  -> 等待 Steam 交易冷却
+  -> 按出售策略上架
+  -> 在订单台账和操作记录中复盘
+```
+
+## 已整理和删除的旧内容
+
+以下旧文档已经合并到当前主文档中，不再单独保留：
+
+- 本地复现记录
+- 小白操作说明
+- 初次交易建议步骤
+- 账号选择与安全问答
+- 旧网络配置手册
+- Steam 429 待实施方案
+
+`cookies.md` 和 `.maFile` 敏感副本已从 `docs` 删除。实际运行所需凭证仍由本地 `config` 和浏览器资料目录管理。

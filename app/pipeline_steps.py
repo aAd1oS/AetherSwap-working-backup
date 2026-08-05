@@ -12,6 +12,7 @@ from app.services.steam_client import SteamClient
 from app.services.analysis_client import StabilityAnalyzer
 from app.services.buff_client import count_lowest_price_orders, first_order_at_price
 from app.notify import send_pushplus, build_payment_notify_content, wait_email_command
+from app.database import db_upsert_purchase_order, db_update_purchase_order
 from utils.delay import jittered_sleep
 from buff.buyer import BuffAuthExpired, BuffVerificationRequired
 from utils.buff_protection import BuffProtectionError, get_buff_request_protection
@@ -810,6 +811,20 @@ def _do_payment_notify_and_wait(
         "pay_type": pay_type,
         "name": name,
         "order_id": order_id,
+        "unit_price": unit_price,
+        "quantity": num,
+        "total_price": round(unit_price * num, 2),
+    })
+    db_upsert_purchase_order({
+        "external_order_id": order_id,
+        "name": name,
+        "goods_id": int(item.get("goods_id") or 0),
+        "quantity": int(num),
+        "unit_price": round(float(unit_price), 2),
+        "total_price": round(float(unit_price) * int(num), 2),
+        "status": "awaiting_payment",
+        "source": "buff",
+        "error": None,
     })
     if on_entering_payment:
         on_entering_payment()
@@ -856,6 +871,17 @@ def _do_payment_notify_and_wait(
     else:
         ok = wait_payment_confirm(timeout_seconds=timeout_sec)
     set_pending_payment(None)
+    if ok:
+        db_update_purchase_order(order_id, {
+            "status": "user_confirmed",
+            "user_confirmed_at": time.time(),
+            "error": None,
+        })
+    else:
+        db_update_purchase_order(order_id, {
+            "status": "payment_unconfirmed",
+            "error": "用户取消、等待超时或程序停止，需人工核对平台订单",
+        })
     if log_fn:
         log_fn(f"[Buff]   → 用户确认={'成功' if ok else '取消/失败'}", "info")
     return ok
@@ -892,6 +918,10 @@ def _do_batch_wait_finalize_and_append(
         goods_id, game_buff, unit_price, num, batch_id
     )
     if not matched:
+        db_update_purchase_order(batch_id, {
+            "status": "needs_review",
+            "error": "用户确认付款后未匹配到可核销商品",
+        })
         if log_fn:
             log_fn("[Buff]   → 未找到符合价格的商品，冻结资金将自动退回", "warn")
         return None
@@ -905,10 +935,24 @@ def _do_batch_wait_finalize_and_append(
     for m in matched:
         p = m.get("price", 0)
         total += p
-        rec = {"name": saved_name, "goods_id": goods_id, "price": p, "at": time.time(), "pending_receipt": True}
+        rec = {
+            "name": saved_name,
+            "goods_id": goods_id,
+            "price": p,
+            "at": time.time(),
+            "pending_receipt": True,
+            "external_order_id": batch_id,
+            "source": "auto",
+            "order_status": "awaiting_ship",
+        }
         if market_price is not None and market_price > 0:
             rec["market_price"] = round(float(market_price), 2)
         append_purchase(rec)
+    db_update_purchase_order(batch_id, {
+        "status": "awaiting_ship",
+        "paid_at": time.time(),
+        "error": None,
+    })
     bill_order_ids = [m.get("bill_order_id") for m in matched if m.get("bill_order_id")]
     if bill_order_ids:
         try:
@@ -954,11 +998,25 @@ def _do_wait_payment_and_append(
         mhn = (item.get("steam_market_name") or item.get("name") or "").strip()
         market_price = _fetch_smart_market_price(mhn, config, app_id=730)
     saved_name = (item.get("steam_market_name") or item.get("name") or "").strip()
-    base_rec = {"name": saved_name, "goods_id": goods_id, "price": unit_price, "at": time.time(), "pending_receipt": True}
+    base_rec = {
+        "name": saved_name,
+        "goods_id": goods_id,
+        "price": unit_price,
+        "at": time.time(),
+        "pending_receipt": True,
+        "external_order_id": order_id,
+        "source": "auto",
+        "order_status": "awaiting_ship",
+    }
     if market_price is not None and market_price > 0:
         base_rec["market_price"] = round(float(market_price), 2)
     for _ in range(num):
         append_purchase(dict(base_rec))
+    db_update_purchase_order(order_id, {
+        "status": "awaiting_ship",
+        "paid_at": time.time(),
+        "error": None,
+    })
     try:
         if buff_client.ask_seller_to_send(order_id, game_buff) and log_fn:
             log_fn("[Buff]   → 已提醒卖家发货，请留意 Steam 报价", "info")

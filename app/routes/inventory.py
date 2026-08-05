@@ -36,7 +36,7 @@ def _try_steam_auto_relogin():
     from app.services.steam_auth import try_steam_auto_relogin
     return try_steam_auto_relogin()
 @router.get("/api/inventory")
-def api_inventory(refresh: bool = False):
+def api_inventory(refresh: bool = False, trigger_sell: bool = False):
     if refresh or not get_inventory():
         if not is_steam_background_allowed():
             return {"items": get_inventory()}
@@ -53,7 +53,8 @@ def api_inventory(refresh: bool = False):
                         old = get_inventory()
                         _enrich_inventory_with_steam_prices(items2, old)
                         set_inventory(items2)
-                        run_sell_phase_on_inventory_update(items2)
+                        if trigger_sell:
+                            run_sell_phase_on_inventory_update(items2)
                         log("inventory: 等待后库存获取成功", "info", category="steam")
                         return {"items": get_inventory()}
                     if not err2 or "登录已过期" not in err2:
@@ -69,7 +70,8 @@ def api_inventory(refresh: bool = False):
                     old = get_inventory()
                     _enrich_inventory_with_steam_prices(items, old)
                     set_inventory(items)
-                    run_sell_phase_on_inventory_update(items)
+                    if trigger_sell:
+                        run_sell_phase_on_inventory_update(items)
                     return {"items": get_inventory()}
                 if err and "登录已过期" in err:
                     log("auto_relogin: 首次重试仍过期，再等 7 秒…", "info", category="steam")
@@ -79,7 +81,8 @@ def api_inventory(refresh: bool = False):
                         old = get_inventory()
                         _enrich_inventory_with_steam_prices(items, old)
                         set_inventory(items)
-                        run_sell_phase_on_inventory_update(items)
+                        if trigger_sell:
+                            run_sell_phase_on_inventory_update(items)
                         return {"items": get_inventory()}
                 log(f"auto_relogin: 登录成功但库存获取仍失败: {err}，返回缓存", "warn", category="steam")
                 return {"items": get_inventory()}
@@ -98,7 +101,8 @@ def api_inventory(refresh: bool = False):
         old = get_inventory()
         _enrich_inventory_with_steam_prices(items, old)
         set_inventory(items)
-        run_sell_phase_on_inventory_update(items)
+        if trigger_sell:
+            run_sell_phase_on_inventory_update(items)
     return {"items": get_inventory()}
 @router.get("/api/market-prices")
 def api_market_prices():
@@ -124,4 +128,54 @@ def api_market_prices():
     if not all_names:
         return {"prices": {}}
     prices = batch_fetch_prices(all_names)
-    return {"prices": prices}
+    import time
+    updated_at = time.time()
+    from app.database import db_update_current_prices
+    updated_records = db_update_current_prices(prices, updated_at)
+    return {
+        "prices": prices,
+        "updated_at": updated_at,
+        "updated_names": len(prices),
+        "updated_records": updated_records,
+    }
+
+@router.post("/api/inventory/sync-receipts")
+def api_sync_receipts():
+    """Process existing incoming trades and refresh local receipt state only."""
+    if not is_steam_background_allowed():
+        return {"ok": False, "error": "Steam 后台请求当前不可用"}
+    from app.receive_flow import try_receive_once, reconcile_pending_purchases_from_inventory
+    from app.state import get_purchases, update_purchase, update_purchase_by_id
+    from app.config_loader import get_buff_credentials
+    from app.order_state import reconcile_orders_from_local_records
+    received = try_receive_once(
+        get_purchases,
+        update_purchase,
+        lambda: (get_buff_credentials() or {}).get("cookies", ""),
+        get_steam_credentials,
+        scan_inventory=scan_cs2_inventory,
+        update_purchase_by_id=update_purchase_by_id,
+    )
+    ok, items, err = scan_cs2_inventory()
+    inventory_reconcile = {"matched": 0, "ambiguous": 0}
+    if ok:
+        old = get_inventory()
+        _enrich_inventory_with_steam_prices(items, old)
+        set_inventory(items)
+        inventory_reconcile = reconcile_pending_purchases_from_inventory(
+            get_purchases,
+            items,
+            update_purchase,
+            update_purchase_by_id=update_purchase_by_id,
+        )
+        received += int(inventory_reconcile.get("matched") or 0)
+    reconciled = reconcile_orders_from_local_records()
+    return {
+        "ok": bool(ok),
+        "received": int(received or 0),
+        "inventory_matched": int(inventory_reconcile.get("matched") or 0),
+        "ambiguous": int(inventory_reconcile.get("ambiguous") or 0),
+        "items": get_inventory(),
+        "orders_changed": reconciled.get("changed", 0),
+        "error": None if ok else err,
+    }

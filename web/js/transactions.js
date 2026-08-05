@@ -3,6 +3,141 @@ let holdingsMultiSelectMode = false;
 let historyMultiSelectMode = false;
 let lastEnrichTime = 0;
 let lastEnrichData = null;
+
+async function refreshOrderLedger() {
+  const tbody = document.querySelector("#order-ledger-table tbody");
+  const summary = el("order-budget-summary");
+  if (!tbody && !summary) return;
+  try {
+    const data = await fetchJson(API + "/orders");
+    const budget = data.budget || {};
+    if (summary) {
+      summary.innerHTML = [
+        `<span class="summary-stat"><span class="summary-label">今日额度</span><span class="summary-value mono">${Number(budget.target || 0).toFixed(2)}</span></span>`,
+        `<span class="summary-stat"><span class="summary-label">已确认</span><span class="summary-value mono">${Number(budget.confirmed || 0).toFixed(2)}</span></span>`,
+        `<span class="summary-stat"><span class="summary-label">未决占用</span><span class="summary-value mono">${Number(budget.reserved || 0).toFixed(2)}</span></span>`,
+        `<span class="summary-stat"><span class="summary-label">剩余</span><span class="summary-value mono">${Number(budget.remaining || 0).toFixed(2)}</span></span>`,
+      ].join("");
+    }
+    if (!tbody) return;
+    const orders = data.orders || [];
+    tbody.innerHTML = orders.map((order) => {
+      const updated = order.updated_at ? new Date(order.updated_at * 1000).toLocaleString() : "—";
+      const action = order.blocking
+        ? `<button type="button" class="btn btn-sm btn-secondary order-btn-replace-paid" data-order-id="${escapeHtml(order.external_order_id || "")}">旧单取消，新单已付款</button> <button type="button" class="btn btn-sm btn-danger-outline order-btn-cancel" data-order-id="${escapeHtml(order.external_order_id || "")}">仅确认已取消</button>`
+        : "";
+      return `<tr>
+        <td class="mono">${escapeHtml(updated)}</td>
+        <td class="mono">${escapeHtml(order.external_order_id || "—")}</td>
+        <td>${escapeHtml(order.name || "—")}</td>
+        <td class="mono">${escapeHtml(String(order.quantity || 0))}</td>
+        <td class="mono">${Number(order.total_price || 0).toFixed(2)}</td>
+        <td class="status-cell ${order.blocking ? "status-error" : ""}">${escapeHtml(order.status_label || order.status || "—")}</td>
+        <td>${escapeHtml(order.error || "")}</td>
+        <td class="tx-actions">${action}</td>
+      </tr>`;
+    }).join("");
+    tbody.querySelectorAll(".order-btn-cancel").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const orderId = btn.dataset.orderId || "";
+        const confirmed = await appConfirm(
+          "请先在 Buff 确认该订单确实没有支付、已经取消或已经退款。这里只解除 AetherSwap 的下单阻断，不会取消平台订单。",
+          { title: "确认订单已取消", danger: true, confirmText: "解除阻断" }
+        );
+        if (!confirmed) return;
+        btn.disabled = true;
+        try {
+          const result = await fetchJson(API + "/order/" + encodeURIComponent(orderId) + "/cancel", { method: "POST" });
+          if (!result.ok) throw new Error(result.error || "解除失败");
+          toast("订单阻断已解除");
+          await refreshOrderLedger();
+        } catch (e) {
+          toast("解除订单阻断失败", e.message || "");
+          btn.disabled = false;
+        }
+      });
+    });
+    tbody.querySelectorAll(".order-btn-replace-paid").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const oldOrderId = btn.dataset.orderId || "";
+        const order = orders.find((row) => String(row.external_order_id || "") === oldOrderId);
+        if (!order) return;
+        const newOrderValue = await appPrompt("填写第二次 BUFF 订单号", "", {
+          message: `旧订单 ${oldOrderId} 将标记为已取消。请从 BUFF 订单详情复制手工重新购买后生成的新订单号。`,
+          label: "新平台订单号",
+          placeholder: "例如 260805T...",
+          confirmText: "下一步",
+        });
+        if (newOrderValue === false) return;
+        const newOrderId = String(newOrderValue || "").trim();
+        if (!newOrderId || newOrderId === oldOrderId) {
+          toast("新订单号无效", "必须填写与旧订单不同的 BUFF 订单号");
+          return;
+        }
+        const priceValue = await appPrompt("填写实际支付单价", Number(order.unit_price || 0).toFixed(2), {
+          message: `${order.name || "该商品"}，数量 ${Number(order.quantity || 1)}。填写第二次订单实际支付的每件单价。`,
+          label: "实际支付单价（元/件）",
+          type: "number",
+          placeholder: "0.01",
+          confirmText: "核对",
+        });
+        if (priceValue === false) return;
+        const unitPrice = Number(priceValue);
+        if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
+          toast("支付单价无效");
+          return;
+        }
+        const quantity = Math.max(1, Number(order.quantity || 1));
+        const totalPrice = unitPrice * quantity;
+        const shouldUseCurrentMarket = await appConfirm(
+          "是否立即获取该商品目前的 Steam 市场价，并将它作为这笔手工换单的“购入市场价”？\n\n该数值是换单登记时的当前价，不是第一次锁单时的历史精确快照。选择获取会产生一次 Steam 市场价格查询。",
+          {
+            title: "补充购入市场价",
+            cancelText: "不填写",
+            confirmText: "获取并填写",
+            width: "540px",
+          }
+        );
+        let marketPrice = null;
+        if (shouldUseCurrentMarket) {
+          try {
+            const priceResult = await fetchJson(API + "/order/" + encodeURIComponent(oldOrderId) + "/current-market-price");
+            if (!priceResult.ok) throw new Error(priceResult.error || "当前市场价获取失败");
+            marketPrice = Number(priceResult.market_price);
+            if (!Number.isFinite(marketPrice) || marketPrice <= 0) throw new Error("返回的市场价无效");
+          } catch (e) {
+            toast("无法补充购入市场价", e.message || "请稍后重试，或重新操作并选择不填写");
+            return;
+          }
+        }
+        const confirmed = await appConfirm(
+          `请最后核对：\n旧订单：${oldOrderId}（BUFF 已取消）\n新订单：${newOrderId}（已经付款）\n商品：${order.name || "—"}\n金额：${unitPrice.toFixed(2)} × ${quantity} = ${totalPrice.toFixed(2)} 元\n购入市场价：${marketPrice != null ? marketPrice.toFixed(2) + " 元（登记时当前价）" : "不填写"}\n\n确认后会同时解除旧单阻断并登记新购入记录，不会向 BUFF 发出请求。`,
+          { title: "登记手工换单", confirmText: "确认登记", width: "560px" }
+        );
+        if (!confirmed) return;
+        tbody.querySelectorAll("button").forEach((node) => { node.disabled = true; });
+        try {
+          const result = await fetchJson(API + "/order/" + encodeURIComponent(oldOrderId) + "/replace-paid", {
+            method: "POST",
+            body: JSON.stringify({
+              new_external_order_id: newOrderId,
+              unit_price: unitPrice,
+              market_price: marketPrice,
+            }),
+          });
+          if (!result.ok) throw new Error(result.error || "登记失败");
+          toast("换单已登记", `新订单 ${newOrderId} 已记为待发货`);
+          await refreshTransactions();
+        } catch (e) {
+          toast("换单登记失败", e.message || "");
+          await refreshOrderLedger();
+        }
+      });
+    });
+  } catch (e) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="8" class="muted">${escapeHtml(e.message || "订单台账加载失败")}</td></tr>`;
+  }
+}
 function renderTxTable(tbody, list, isPurchase = false, resellRatio = 0.85, multiSelectMode = false) {
   const ratio = Math.max(0.01, Math.min(1, Number(resellRatio) || 0.85));
   const rowHtmls = [];
@@ -130,7 +265,7 @@ function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelect
     const mp = t.market_price != null ? Number(t.market_price).toFixed(2) : "—";
     const sold = t.sale_price != null && Number(t.sale_price) > 0;
     const listingError = t.listing_status === "error";
-    const statusStr = t.pending_receipt ? "待收货" : sold ? "已出售" : listingError ? "ERROR" : t.listing ? "出售中" : "持有中";
+    const statusStr = t.order_status_label || (t.pending_receipt ? "待收货" : sold ? "已出售" : listingError ? "ERROR" : t.listing ? "出售中" : "持有中");
     const statusCellClass = t.pending_receipt ? "status-pending" : sold ? "status-sold" : listingError ? "status-error" : t.listing ? "status-listing" : "status-holding";
     const salePriceStr = sold ? Number(t.sale_price).toFixed(2) : "—";
     let discountRatioStr = "—", cashProfitStr = "—", selfUseStr = "—", discountRatioClass = "";
@@ -365,10 +500,11 @@ async function refreshTransactions() {
     const enrichedMap = new Map((lastEnrichData || []).map((t) => [byKey(t), t]));
     for (const t of all) {
       const e = enrichedMap.get(byKey(t));
-      if (e && e.current_market_price != null) t.current_market_price = e.current_market_price;
+      if (t.current_market_price == null && e && e.current_market_price != null) t.current_market_price = e.current_market_price;
     }
     lastEnrichData = all;
     applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, d.resell_ratio);
+    await refreshOrderLedger();
   } catch (e) {
     toast("加载操作记录失败", e.message || "");
   }

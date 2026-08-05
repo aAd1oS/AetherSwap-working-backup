@@ -22,6 +22,7 @@ from app.services.buff_client import create_buff_client_from_config
 from app.services.steam_client import SteamClient
 from app.state import get_state, append_sale
 from app.strategy_engine import apply_strategy_to_config
+from app.order_state import get_blocking_payment_orders, get_daily_budget_summary
 from buff.buyer import BuffAuthExpired, BuffVerificationRequired
 from utils.buff_protection import BuffManualCircuitOpen, BuffTemporaryCircuitOpen
 from steamdt.models import SteamDTQueryParams
@@ -193,6 +194,17 @@ def _run_pipeline(config: dict) -> None:
     ctx = PipelineContext(state, str(uuid.uuid4())[:8], verbose=verbose)
 
     target = float(pipeline_cfg.get("target_balance", 100))
+    budget = get_daily_budget_summary(target)
+    blocking_orders = get_blocking_payment_orders()
+    if blocking_orders:
+        order_ids = ", ".join(str(order.get("external_order_id")) for order in blocking_orders[:3])
+        ctx.log(
+            f"检测到 {len(blocking_orders)} 个待支付或待核对订单（{order_ids}），已阻止继续锁单；请先处理订单状态",
+            "error",
+            category="buff",
+        )
+        ctx.set_status("error", "PENDING_ORDER_REVIEW")
+        return
     exclude = pipeline_cfg.get("exclude_keywords", [])
     cred_buff = get_buff_credentials()
     cookies_buff = cred_buff.get("cookies", "")
@@ -226,7 +238,17 @@ def _run_pipeline(config: dict) -> None:
     else:
         ctx.debug("代理池未启用或策略为关闭，跳过预热")
 
-    acc = 0.0
+    acc = float(budget.get("used") or 0)
+    ctx.log(
+        f"今日投入额度: 目标={target:.2f}, 已确认={budget.get('confirmed', 0):.2f}, "
+        f"未决占用={budget.get('reserved', 0):.2f}, 剩余={budget.get('remaining', 0):.2f}",
+        "info",
+        category="pipeline",
+    )
+    if acc >= target:
+        ctx.log("今日投入额度已用完，不再启动新的购买", "info", category="pipeline")
+        ctx.set_status("idle", "DAILY_BUDGET_REACHED")
+        return
     total_bought = 0
     time_limit_enabled = bool(pipeline_cfg.get("start_time_limit_enabled", False))
     start_time_hour = max(0, min(23, int(pipeline_cfg.get("start_time_hour", DEFAULT_START_TIME_HOUR))))

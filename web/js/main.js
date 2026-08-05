@@ -249,11 +249,14 @@ function hideReloginModal() {
   const overlay = el("relogin-overlay");
   if (overlay) overlay.classList.add("hidden");
 }
-async function refreshInventory(forceRefresh = true) {
+async function refreshInventory(forceRefresh = true, triggerSell = false) {
   if (inventoryRefreshInFlight) return;
   inventoryRefreshInFlight = true;
   try {
-    const d = await fetchJson(API + "/inventory" + (forceRefresh ? "?refresh=1" : ""));
+    const query = forceRefresh
+      ? `?refresh=1${triggerSell ? "&trigger_sell=1" : ""}`
+      : "";
+    const d = await fetchJson(API + "/inventory" + query);
     if (d.auth_expired && _hasAnyAccount) {
       showReloginModal("steam", { reason: d.auth_expired_reason, error: d.error });
       return;
@@ -315,11 +318,16 @@ async function refreshInventory(forceRefresh = true) {
     inventoryRefreshInFlight = false;
   }
 }
-async function refreshMarketPrices() {
+async function refreshMarketPrices(showResult = false) {
+  const btn = el("btn-refresh-holdings-prices");
+  if (btn) { btn.disabled = true; btn.textContent = "刷新中..."; }
   try {
     const d = await fetchJson(API + "/market-prices");
     const prices = d.prices || {};
-    if (Object.keys(prices).length === 0) return;
+    if (Object.keys(prices).length === 0) {
+      if (showResult) toast("没有可刷新的商品价格");
+      return false;
+    }
     const invItems = getInventoryCache();
     if (invItems && invItems.length > 0) {
       let totalValue = 0;
@@ -357,9 +365,51 @@ async function refreshMarketPrices() {
         if (p != null) t.current_market_price = p;
       }
       lastEnrichTime = Date.now();
-      refreshTransactions();
+      await refreshTransactions();
     }
+    if (showResult) toast("商品现价已更新", `更新 ${d.updated_names || Object.keys(prices).length} 个商品名称`);
+    return true;
   } catch (e) {
+    if (showResult) toast("刷新商品现价失败", e.message || "请稍后重试");
+    return false;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "刷新商品现价"; }
+  }
+}
+
+async function syncReceiptStatus(showResult = true) {
+  const btn = el("btn-sync-receipts");
+  if (btn) { btn.disabled = true; btn.textContent = "同步中..."; }
+  try {
+    const d = await fetchJson(API + "/inventory/sync-receipts", { method: "POST" });
+    await refreshInventory(false, false);
+    await refreshTransactions();
+    if (showResult) {
+      toast(
+        d.ok ? "入库状态已同步" : "入库状态部分同步失败",
+        `本次确认入库 ${d.received || 0} 件，更新订单 ${d.orders_changed || 0} 条${d.ambiguous ? `；${d.ambiguous} 条同名库存无法唯一匹配，需人工核对` : ""}${d.error ? "；" + d.error : ""}`
+      );
+    }
+    return !!d.ok;
+  } catch (e) {
+    if (showResult) toast("同步入库状态失败", e.message || "请稍后重试");
+    return false;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "同步入库状态"; }
+  }
+}
+
+async function refreshAllHoldings() {
+  const btn = el("btn-refresh-all-holdings");
+  if (btn) { btn.disabled = true; btn.textContent = "刷新中..."; }
+  try {
+    const receiptsOk = await syncReceiptStatus(false);
+    if (!receiptsOk) await refreshInventory(true, false);
+    const pricesOk = await refreshMarketPrices(false);
+    await refreshTransactions();
+    toast(pricesOk ? "持有信息已全部刷新" : "持有状态已刷新", pricesOk ? "入库、库存和现价均已更新" : "现价未能更新，请稍后单独重试");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "刷新全部持有信息"; }
   }
 }
 function getInventoryCache() {
@@ -509,7 +559,10 @@ function bindEvents() {
       .then(() => toast("设置已保存"))
       .catch((e) => toast("保存失败", e.message || "请稍后再试"))
   );
-  el("btn-refresh-inventory")?.addEventListener("click", () => refreshInventory(true));
+  el("btn-refresh-inventory")?.addEventListener("click", () => refreshInventory(true, false));
+  el("btn-sync-receipts")?.addEventListener("click", () => syncReceiptStatus(true));
+  el("btn-refresh-holdings-prices")?.addEventListener("click", () => refreshMarketPrices(true));
+  el("btn-refresh-all-holdings")?.addEventListener("click", refreshAllHoldings);
   el("btn-refresh-sales")?.addEventListener("click", () => refreshTransactions());
   el("btn-add-account")?.addEventListener("click", () => openAccountForm());
   el("accounts-search")?.addEventListener("input", (e) => {

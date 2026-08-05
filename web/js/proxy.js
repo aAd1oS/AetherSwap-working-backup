@@ -152,45 +152,6 @@ async function testAllProxies() {
     }
 }
 
-async function checkNetworkServices() {
-    const btn = el("btn-service-check");
-    const target = el("service-check-results");
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = "检查中...";
-    }
-    if (target) target.innerHTML = `<div style="opacity:.65">正在检查四项服务...</div>`;
-    try {
-        const data = await fetchJson(API + "/network/services/check", { method: "POST" });
-        const services = data.services || [];
-        if (target) {
-            target.innerHTML = services.map(service => {
-                const badgeClass = service.ok ? "proxy-badge--ok" : "proxy-badge--fail";
-                const badgeText = service.rate_limited ? "受限" : (service.ok ? "正常" : "失败");
-                const detail = service.ok
-                    ? `HTTP ${service.http_status} · ${service.latency_ms} ms`
-                    : (service.error || "连接失败");
-                return `<div style="border:1px solid var(--border);border-radius:8px;padding:12px">
-                  <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
-                    <strong>${escapeHtml(service.label || service.id)}</strong>
-                    <span class="proxy-badge ${badgeClass}">${badgeText}</span>
-                  </div>
-                  <div style="margin-top:8px;font-size:12px;opacity:.72">${escapeHtml(service.route || "")}</div>
-                  <div style="margin-top:4px;font-size:12px;word-break:break-word">${escapeHtml(detail)}</div>
-                </div>`;
-            }).join("") || `<div style="opacity:.65">后端未返回检查结果</div>`;
-        }
-        toast(data.ok ? "四项服务均可用" : "部分服务不可用", data.ok ? "网络路径符合配置" : "请查看各服务的错误详情");
-    } catch (e) {
-        if (target) target.innerHTML = `<div style="color:var(--danger)">${escapeHtml(e.message || "自检失败")}</div>`;
-        toast("服务自检失败", e.message || "请检查后端日志");
-    } finally {
-        if (btn) {
-            btn.disabled = false;
-            btn.textContent = "检查四项服务";
-        }
-    }
-}
 async function _doSaveProxyConfig() {
     const strategy = Number(
         document.querySelector(".proxy-strategy-card.active")?.dataset?.strategy ?? 1

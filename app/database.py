@@ -35,6 +35,30 @@ class Purchase(SQLModel, table=True):
     assetid: Optional[str] = None
     listing: Optional[bool] = None
     listing_status: Optional[str] = None
+    external_order_id: Optional[str] = Field(default=None, index=True)
+    source: str = "legacy"
+    order_status: Optional[str] = None
+    current_market_price: Optional[float] = None
+    current_price_updated_at: Optional[float] = None
+    received_at: Optional[float] = None
+    tradable_at: Optional[float] = None
+
+class PurchaseOrder(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    external_order_id: str = Field(index=True, unique=True)
+    name: str = ""
+    goods_id: int = 0
+    quantity: int = 1
+    unit_price: float = 0.0
+    total_price: float = 0.0
+    status: str = "awaiting_payment"
+    source: str = "buff"
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    user_confirmed_at: Optional[float] = None
+    paid_at: Optional[float] = None
+    received_at: Optional[float] = None
+    error: Optional[str] = None
 class Sale(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = ""
@@ -119,6 +143,22 @@ def init_db() -> None:
             conn.commit()
         except Exception:
             pass  
+    purchase_columns = {
+        "external_order_id": "TEXT",
+        "source": "TEXT DEFAULT 'legacy'",
+        "order_status": "TEXT",
+        "current_market_price": "REAL",
+        "current_price_updated_at": "REAL",
+        "received_at": "REAL",
+        "tradable_at": "REAL",
+    }
+    with engine.connect() as conn:
+        for column, sql_type in purchase_columns.items():
+            try:
+                conn.execute(sa_text(f"ALTER TABLE purchase ADD COLUMN {column} {sql_type}"))
+                conn.commit()
+            except Exception:
+                pass
     with engine.connect() as conn:
         rows = conn.execute(
             sa_text("SELECT id, positive_rate, total_reviews FROM steamdealgame WHERE wilson_score IS NULL")
@@ -144,6 +184,13 @@ def _purchase_from_dict(d: dict) -> Purchase:
         assetid=str(d["assetid"]) if d.get("assetid") is not None else None,
         listing=bool(d["listing"]) if d.get("listing") is not None else None,
         listing_status=str(d["listing_status"]) if d.get("listing_status") is not None else None,
+        external_order_id=str(d["external_order_id"]) if d.get("external_order_id") is not None else None,
+        source=str(d.get("source") or "legacy"),
+        order_status=str(d["order_status"]) if d.get("order_status") is not None else None,
+        current_market_price=float(d["current_market_price"]) if d.get("current_market_price") is not None else None,
+        current_price_updated_at=float(d["current_price_updated_at"]) if d.get("current_price_updated_at") is not None else None,
+        received_at=float(d["received_at"]) if d.get("received_at") is not None else None,
+        tradable_at=float(d["tradable_at"]) if d.get("tradable_at") is not None else None,
     )
 def _sale_from_dict(d: dict) -> Sale:
     return Sale(
@@ -175,6 +222,19 @@ def _purchase_to_dict(p: Purchase) -> dict:
         d["listing"] = p.listing
     if p.listing_status is not None:
         d["listing_status"] = p.listing_status
+    if p.external_order_id is not None:
+        d["external_order_id"] = p.external_order_id
+    d["source"] = p.source or "legacy"
+    if p.order_status is not None:
+        d["order_status"] = p.order_status
+    if p.current_market_price is not None:
+        d["current_market_price"] = p.current_market_price
+    if p.current_price_updated_at is not None:
+        d["current_price_updated_at"] = p.current_price_updated_at
+    if p.received_at is not None:
+        d["received_at"] = p.received_at
+    if p.tradable_at is not None:
+        d["tradable_at"] = p.tradable_at
     return d
 def _sale_to_dict(s: Sale) -> dict:
     d = {
@@ -220,12 +280,194 @@ def migrate_from_json() -> bool:
 _PURCHASE_UPDATABLE = frozenset({
     "name", "price", "goods_id", "market_price", "sale_price",
     "sold_at", "pending_receipt", "assetid", "listing", "listing_status",
+    "external_order_id", "source", "order_status", "current_market_price",
+    "current_price_updated_at", "received_at", "tradable_at",
 })
 _SALE_UPDATABLE = frozenset({"name", "price", "goods_id", "assetid", "at"})
 def db_append_purchase(p: dict) -> None:
     with get_session() as session:
         session.add(_purchase_from_dict(p))
         session.commit()
+
+def db_upsert_purchase_order(order: dict) -> dict:
+    import time
+    external_order_id = str(order.get("external_order_id") or "").strip()
+    if not external_order_id:
+        raise ValueError("external_order_id is required")
+    now = time.time()
+    with get_session() as session:
+        row = session.exec(
+            select(PurchaseOrder).where(PurchaseOrder.external_order_id == external_order_id)
+        ).first()
+        if row is None:
+            row = PurchaseOrder(
+                external_order_id=external_order_id,
+                created_at=float(order.get("created_at") or now),
+            )
+        for key in (
+            "name", "goods_id", "quantity", "unit_price", "total_price",
+            "status", "source", "user_confirmed_at", "paid_at", "received_at", "error",
+        ):
+            if key in order:
+                setattr(row, key, order[key])
+        row.updated_at = now
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return {
+            "id": row.id,
+            "external_order_id": row.external_order_id,
+            "status": row.status,
+            "total_price": row.total_price,
+        }
+
+def db_update_purchase_order(external_order_id: str, data: dict) -> bool:
+    import time
+    with get_session() as session:
+        row = session.exec(
+            select(PurchaseOrder).where(PurchaseOrder.external_order_id == str(external_order_id))
+        ).first()
+        if row is None:
+            return False
+        for key in ("status", "user_confirmed_at", "paid_at", "received_at", "error"):
+            if key in data:
+                setattr(row, key, data[key])
+        row.updated_at = time.time()
+        session.add(row)
+        session.commit()
+        return True
+
+def db_replace_cancelled_order_with_paid_purchase(
+    old_external_order_id: str,
+    new_external_order_id: str,
+    unit_price: float,
+    market_price: Optional[float] = None,
+) -> dict:
+    """Atomically cancel an unresolved order and record its manually paid replacement."""
+    import time
+
+    old_order_id = str(old_external_order_id or "").strip()
+    new_order_id = str(new_external_order_id or "").strip()
+    if not old_order_id or not new_order_id:
+        raise ValueError("旧订单号和新订单号均不能为空")
+    if old_order_id == new_order_id:
+        raise ValueError("新订单号不能与已取消的旧订单号相同")
+    price = round(float(unit_price or 0), 2)
+    if price <= 0:
+        raise ValueError("实际支付单价须大于 0")
+    purchase_market_price = None
+    if market_price is not None:
+        purchase_market_price = round(float(market_price or 0), 2)
+        if purchase_market_price <= 0:
+            raise ValueError("购入市场价须大于 0")
+
+    now = time.time()
+    with get_session() as session:
+        old_order = session.exec(
+            select(PurchaseOrder).where(PurchaseOrder.external_order_id == old_order_id)
+        ).first()
+        if old_order is None:
+            raise ValueError("旧订单不存在")
+        if old_order.status not in {
+            "awaiting_payment", "user_confirmed", "payment_unconfirmed", "needs_review",
+        }:
+            raise ValueError("旧订单当前不是待支付或待核对状态")
+        existing_order = session.exec(
+            select(PurchaseOrder).where(PurchaseOrder.external_order_id == new_order_id)
+        ).first()
+        existing_purchase = session.exec(
+            select(Purchase).where(Purchase.external_order_id == new_order_id)
+        ).first()
+        if existing_order is not None or existing_purchase is not None:
+            raise ValueError("新订单号已存在，未执行重复登记")
+
+        quantity = max(1, int(old_order.quantity or 1))
+        total_price = round(price * quantity, 2)
+        old_order.status = "cancelled"
+        old_order.updated_at = now
+        old_order.error = f"BUFF 旧订单已取消；已登记手工换单 {new_order_id}"
+        session.add(old_order)
+
+        replacement = PurchaseOrder(
+            external_order_id=new_order_id,
+            name=old_order.name,
+            goods_id=int(old_order.goods_id or 0),
+            quantity=quantity,
+            unit_price=price,
+            total_price=total_price,
+            status="awaiting_ship",
+            source="buff_manual_replacement",
+            created_at=now,
+            updated_at=now,
+            user_confirmed_at=now,
+            paid_at=now,
+            error=f"手工重新下单并付款，替代已取消订单 {old_order_id}",
+        )
+        session.add(replacement)
+        for _ in range(quantity):
+            session.add(Purchase(
+                name=old_order.name,
+                goods_id=int(old_order.goods_id or 0),
+                price=price,
+                at=now,
+                market_price=purchase_market_price,
+                pending_receipt=True,
+                external_order_id=new_order_id,
+                source="manual_replacement",
+                order_status="awaiting_ship",
+            ))
+        session.commit()
+        return {
+            "old_external_order_id": old_order_id,
+            "new_external_order_id": new_order_id,
+            "quantity": quantity,
+            "unit_price": price,
+            "total_price": total_price,
+            "market_price": purchase_market_price,
+            "status": "awaiting_ship",
+        }
+
+def db_get_purchase_orders() -> list:
+    with get_session() as session:
+        rows = session.exec(select(PurchaseOrder).order_by(PurchaseOrder.id)).all()
+        return [
+            {
+                "id": row.id,
+                "external_order_id": row.external_order_id,
+                "name": row.name,
+                "goods_id": row.goods_id,
+                "quantity": row.quantity,
+                "unit_price": row.unit_price,
+                "total_price": row.total_price,
+                "status": row.status,
+                "source": row.source,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+                "user_confirmed_at": row.user_confirmed_at,
+                "paid_at": row.paid_at,
+                "received_at": row.received_at,
+                "error": row.error,
+            }
+            for row in rows
+        ]
+
+def db_update_current_prices(prices: dict, updated_at: float) -> int:
+    changed = 0
+    with get_session() as session:
+        rows = session.exec(select(Purchase)).all()
+        for row in rows:
+            if row.sale_price is not None and float(row.sale_price or 0) > 0:
+                continue
+            price = prices.get((row.name or "").strip())
+            if price is None:
+                continue
+            row.current_market_price = round(float(price), 2)
+            row.current_price_updated_at = float(updated_at)
+            session.add(row)
+            changed += 1
+        if changed:
+            session.commit()
+    return changed
 def db_get_purchases() -> list:
     with get_session() as session:
         rows = session.exec(select(Purchase).order_by(Purchase.id)).all()

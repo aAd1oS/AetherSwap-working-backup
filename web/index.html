@@ -499,6 +499,9 @@
         <div class="panel-toolbar panel-toolbar--purchases">
           <div class="panel-toolbar-row">
             <span class="label">持有饰品</span>
+            <button id="btn-sync-receipts" class="btn btn-sm btn-secondary">同步入库状态</button>
+            <button id="btn-refresh-holdings-prices" class="btn btn-sm btn-secondary">刷新商品现价</button>
+            <button id="btn-refresh-all-holdings" class="btn btn-sm btn-primary">刷新全部持有信息</button>
             <button id="btn-holdings-multiselect" class="btn btn-sm btn-secondary">多选</button>
             <div id="holdings-batch-actions" class="hidden" style="display:none;gap:8px;align-items:center;">
               <button id="btn-holdings-batch-sell" class="btn btn-sm btn-primary">批量出售</button>
@@ -541,6 +544,29 @@
       </section>
 
       <section id="panel-purchase-history" class="panel">
+        <div class="panel-toolbar panel-toolbar--purchase-history">
+          <div class="panel-toolbar-row">
+            <span class="label">订单台账</span>
+            <div id="order-budget-summary" class="purchases-summary"></div>
+          </div>
+        </div>
+        <div class="table-container">
+          <table id="order-ledger-table">
+            <thead>
+              <tr>
+                <th>更新时间</th>
+                <th>平台订单号</th>
+                <th>商品</th>
+                <th>数量</th>
+                <th>金额</th>
+                <th>状态</th>
+                <th>说明</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
         <div class="panel-toolbar panel-toolbar--purchase-history">
           <div class="panel-toolbar-row">
             <span class="label">操作记录</span>
@@ -1048,7 +1074,7 @@
             <span class="label">税后价值</span>
             <span class="value mono" id="inv-tax-value">0.00</span>
           </div>
-          <button id="btn-refresh-inventory" class="btn btn-sm btn-secondary">立即刷新</button>
+          <button id="btn-refresh-inventory" class="btn btn-sm btn-secondary">刷新库存</button>
         </div>
         <div class="table-container">
           <table id="inv-table">
@@ -1111,22 +1137,6 @@
           <div class="proxy-hero-text">
             <h2>代理 IP 池管理</h2>
             <p>管理出口代理节点，支持策略切换、连通性检测与批量导入</p>
-          </div>
-        </div>
-
-
-        <div class="proxy-section">
-          <div class="proxy-section-header">
-            <div class="proxy-section-title">
-              <span>服务级网络自检</span>
-            </div>
-            <button id="btn-service-check" class="btn btn-sm btn-secondary" onclick="checkNetworkServices()">
-              检查四项服务
-            </button>
-          </div>
-          <p class="field-hint">仅检查 Steam Community、Steam Store、BUFF 与 SteamDT 的 HTTP 连通性，不代表账号已经登录。</p>
-          <div id="service-check-results" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:12px">
-            <div style="opacity:.55">尚未运行自检</div>
           </div>
         </div>
 

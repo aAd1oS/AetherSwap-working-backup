@@ -387,7 +387,7 @@ function setupInventoryAutoRefresh() {
   }
   if (inventoryRefreshSeconds && inventoryRefreshSeconds > 0) {
     inventoryTimer = setInterval(() => {
-      refreshInventory(true);
+      refreshInventory(true, true);
     }, inventoryRefreshSeconds * 1000);
   }
   if (currentPriceRefreshMinutes && currentPriceRefreshMinutes > 0) {

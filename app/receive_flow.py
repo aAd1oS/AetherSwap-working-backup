@@ -181,6 +181,76 @@ def _match_purchase_for_item(
         return None
     candidates.sort(key=lambda x: (x.get("at") or 0))
     return candidates[0]
+
+def reconcile_pending_purchases_from_inventory(
+    get_purchases: Callable[[], List[dict]],
+    inventory_items: List[dict],
+    update_purchase: Callable[[int, dict], bool],
+    update_purchase_by_id: Optional[Callable[[int, dict], bool]] = None,
+) -> dict:
+    """Match manually accepted trades using an inventory snapshot already fetched by the caller."""
+    purchases = list(get_purchases() or [])
+    pending_by_name: Dict[str, List[Tuple[int, dict]]] = {}
+    used_assetids = {
+        str(p.get("assetid") or "").strip()
+        for p in purchases if str(p.get("assetid") or "").strip()
+    }
+    for idx, purchase in enumerate(purchases):
+        if not purchase.get("pending_receipt") or purchase.get("assetid"):
+            continue
+        name = (purchase.get("name") or "").strip().casefold()
+        if not name:
+            continue
+        pending_by_name.setdefault(name, []).append((idx, purchase))
+
+    inventory_by_name: Dict[str, List[dict]] = {}
+    for item in inventory_items or []:
+        assetid = str(item.get("assetid") or "").strip()
+        name = (item.get("market_hash_name") or item.get("name") or "").strip().casefold()
+        if not assetid or assetid in used_assetids or not name:
+            continue
+        inventory_by_name.setdefault(name, []).append(item)
+
+    matched = 0
+    ambiguous = 0
+    for name, pending_rows in pending_by_name.items():
+        candidates = inventory_by_name.get(name) or []
+        if not candidates:
+            continue
+        if len(candidates) != len(pending_rows):
+            ambiguous += len(pending_rows)
+            continue
+        pending_rows.sort(key=lambda pair: (
+            float(pair[1].get("at") or 0),
+            int(pair[1].get("_db_id") or 0),
+        ))
+        candidates.sort(key=lambda item: str(item.get("assetid") or ""))
+        for (positional_idx, purchase), item in zip(pending_rows, candidates):
+            assetid = str(item.get("assetid") or "").strip()
+            tradable_at = item.get("cooldown_at")
+            now_ts = time.time()
+            order_status = (
+                "trade_locked"
+                if tradable_at and float(tradable_at) > now_ts
+                else "received"
+            )
+            data = {
+                "assetid": assetid,
+                "pending_receipt": False,
+                "received_at": now_ts,
+                "tradable_at": tradable_at,
+                "order_status": order_status,
+            }
+            db_id = int(purchase.get("_db_id") or 0)
+            if update_purchase_by_id and db_id:
+                updated = update_purchase_by_id(db_id, data)
+            else:
+                updated = update_purchase(positional_idx, data)
+            if updated:
+                used_assetids.add(assetid)
+                matched += 1
+    return {"matched": matched, "ambiguous": ambiguous}
+
 def try_receive_once(
     get_purchases: Callable[[], List[dict]],
     update_purchase: Callable[[int, dict], bool],
@@ -226,6 +296,23 @@ def try_receive_once(
         offer_id = task.get("tradeofferid")
         if not offer_id:
             continue
+        assigned_before_accept: set = set()
+        for item in task.get("items") or []:
+            matched = _match_purchase_for_item(item, pending_records, assigned_before_accept)
+            if matched is None:
+                continue
+            db_id = matched.get("_db_id") or 0
+            positional_idx = next(
+                (i for i, p in enumerate(purchases) if p.get("_db_id") == db_id),
+                -1,
+            )
+            if positional_idx >= 0 and _do_update(
+                db_id,
+                positional_idx,
+                {"order_status": "awaiting_trade"},
+            ):
+                matched["order_status"] = "awaiting_trade"
+                assigned_before_accept.add(db_id)
         if not accept_steam_trade_offer(str(offer_id), steam_cookies):
             continue
         received += 1
@@ -261,12 +348,14 @@ def try_receive_once(
         for purchase_rec, it in pairs:
             mhn = (it.get("market_hash_name") or "").strip()
             our_assetid = None
+            matched_inventory_item = None
             if mhn and inv_by_name.get(mhn):
                 for inv_item in inv_by_name[mhn][:]:
                     aid = str(inv_item.get("assetid") or "")
                     if aid in already_used:
                         continue
                     our_assetid = aid
+                    matched_inventory_item = inv_item
                     already_used.add(aid)
                     inv_by_name[mhn].remove(inv_item)
                     break
@@ -278,7 +367,18 @@ def try_receive_once(
                     (i for i, p in enumerate(purchases) if p.get("_db_id") == db_id),
                     -1,
                 )
-                _do_update(db_id, pos_idx, {"assetid": our_assetid, "pending_receipt": False})
+                tradable_at = None
+                if matched_inventory_item:
+                    tradable_at = matched_inventory_item.get("cooldown_at")
+                now_ts = time.time()
+                order_status = "trade_locked" if tradable_at and float(tradable_at) > now_ts else "received"
+                _do_update(db_id, pos_idx, {
+                    "assetid": our_assetid,
+                    "pending_receipt": False,
+                    "received_at": now_ts,
+                    "tradable_at": tradable_at,
+                    "order_status": order_status,
+                })
                 already_used.add(our_assetid)
         jittered_sleep(1)
     return received

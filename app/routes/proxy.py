@@ -79,10 +79,6 @@ def api_test_proxies():
     return {"results": results}
 
 
-@router.post("/api/network/services/check")
-def api_check_network_services():
-    from utils.service_check import check_services
-    return check_services()
 @router.post("/api/proxy/clear")
 def api_clear_proxies():
     """清空代理池列表并保存."""
