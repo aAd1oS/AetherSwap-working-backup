@@ -20,6 +20,16 @@ def _parse_cooldown(owner_descriptions: List[dict]) -> Tuple[str, float]:
         if "trade-protected" not in val:
             continue
         text = val
+        date_tag = re.search(r"\[date\]\s*(\d{9,13})\s*\[/date\]", val, re.IGNORECASE)
+        if date_tag:
+            try:
+                ts = float(date_tag.group(1))
+                if ts >= 1_000_000_000_000:
+                    ts /= 1000
+                datetime.fromtimestamp(ts, tz=timezone.utc)
+            except (OSError, OverflowError, TypeError, ValueError):
+                ts = 0.0
+            break
         m = re.search(r"until (.+?) GMT", val)
         if not m:
             break

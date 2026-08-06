@@ -35,11 +35,51 @@ function hasLogFilter() {
   const lv = el("log-level")?.value || "all";
   return !!q || lv !== "all";
 }
-function _levelClass(level) {
+const MAJOR_BUSINESS_SUCCESS_MARKERS = [
+  "选定本件",
+  "[Buff余额] 预览通过:",
+  "→ 锁单成功",
+  "→ 批量锁单成功",
+  "→ 用户确认=成功",
+  "→ 核销成功",
+  "[Buff余额] 自动支付已确认成功",
+  "已确认付款 本笔=",
+  "本次共成功购买",
+  "[出售] 已上架",
+  "[确认] 已自动确认",
+  "下架成功",
+  "已入库",
+  "已售出",
+];
+function _isMajorBusinessSuccess(message) {
+  const text = String(message || "");
+  return MAJOR_BUSINESS_SUCCESS_MARKERS.some((marker) => text.includes(marker));
+}
+function _levelClass(level, message = "") {
   if (level === "error") return "log-line-error";
   if (level === "warn") return "log-line-warn";
   if (level === "debug") return "log-line-debug";
+  if (level === "info" && _isMajorBusinessSuccess(message)) return "log-line-success";
   return "log-line-info";
+}
+function _roundSummaryClass(category = "") {
+  const classes = {
+    round_summary_header: "log-round-summary log-round-summary-header",
+    round_summary_scan: "log-round-summary log-round-summary-scan",
+    round_summary_success: "log-round-summary log-round-summary-success",
+    round_summary_failure: "log-round-summary log-round-summary-failure",
+    round_summary_money: "log-round-summary log-round-summary-money",
+    round_summary_note: "log-round-summary log-round-summary-note",
+    round_summary_neutral: "log-round-summary log-round-summary-neutral",
+    round_summary_end: "log-round-summary log-round-summary-end",
+  };
+  return classes[category] || "";
+}
+function _lineClasses(entry) {
+  return [
+    _levelClass(entry.level || "info", entry.msg || ""),
+    _roundSummaryClass(entry.category || ""),
+  ].filter(Boolean).join(" ");
 }
 function _fmtTime(t) {
   if (t == null) return "";
@@ -47,7 +87,7 @@ function _fmtTime(t) {
   return d.toTimeString().slice(0, 8);
 }
 function _lineToHtml(x) {
-  const cls = _levelClass(x.level || "info");
+  const cls = _lineClasses(x);
   const time = _fmtTime(x.t);
   const txt = `${time} [${x.level || "info"}] ${x.msg || ""}`;
   // escape HTML special chars
@@ -78,7 +118,14 @@ async function refreshLog() {
     const lines = d.lines || [];
     if (!lines.length) return;
     lines.forEach((l) => {
-      logLines.push({ t: l.t, level: l.level || "info", msg: l.msg || "", id: l.id });
+      logLines.push({
+        t: l.t,
+        level: l.level || "info",
+        msg: l.msg || "",
+        id: l.id,
+        category: l.category || "",
+        flow_id: l.flow_id || "",
+      });
     });
     const nextSince = lines.length ? Math.max(...lines.map((l) => l.id || 0)) : since;
     out.dataset.lastIndex = String(nextSince);
@@ -91,7 +138,7 @@ async function refreshLog() {
       lines.forEach((l, i) => {
         if (i > 0) frag.appendChild(document.createTextNode("\n"));
         const span = document.createElement("span");
-        span.className = _levelClass(l.level || "info");
+        span.className = _lineClasses(l);
         span.textContent = `${_fmtTime(l.t)} [${l.level || "info"}] ${l.msg || ""}`;
         frag.appendChild(span);
       });
@@ -175,6 +222,19 @@ async function exportLog() {
     }
   } catch (e) {
     toast("导出失败", e.message || "请稍后再试");
+  }
+}
+async function exportRoundSummary() {
+  try {
+    const r = await fetch(API + "/log/export-summary", { method: "POST" });
+    const d = await r.json();
+    if (d.ok) {
+      toast("轮次总结已导出", `共 ${d.rounds} 轮 → ${d.path}`);
+    } else {
+      toast("导出失败", d.error || "当前还没有轮次总结");
+    }
+  } catch (e) {
+    toast("导出失败", e.message || "请稍后重试");
   }
 }
 

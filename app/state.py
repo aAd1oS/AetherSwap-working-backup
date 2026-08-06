@@ -25,6 +25,7 @@ class State:
     _status: str
     _step: str
     _log: Deque[dict]
+    _round_summaries: List[dict]
     _log_seq: int
     _pending_payment: Optional[dict]
     _user_confirmed: Optional[bool]
@@ -44,6 +45,7 @@ class State:
         self._status = "idle"
         self._step = ""
         self._log = deque(maxlen=_LOG_MAXLEN)
+        self._round_summaries = []
         self._log_seq = 0
         self._pending_payment = None
         self._user_confirmed = None
@@ -130,20 +132,26 @@ class State:
     def log(self, msg: str, level: str = "info", category: str = "", flow_id: str = "") -> None:
         with self._lock:
             self._log_seq += 1
-            self._log.append({
+            entry = {
                 "id": self._log_seq,
                 "t": time.time(),
                 "level": level,
                 "msg": msg,
                 "category": category or "",
                 "flow_id": flow_id or "",
-            })
+            }
+            self._log.append(entry)
+            if entry["category"].startswith("round_summary"):
+                self._round_summaries.append(dict(entry))
     def get_log(self, since_idx: int = 0) -> list:
         with self._lock:
             out = list(self._log)
             if since_idx > 0:
                 out = [e for e in out if e.get("id", 0) > since_idx]
             return out
+    def get_round_summaries(self) -> list:
+        with self._lock:
+            return [dict(entry) for entry in self._round_summaries]
     def set_pending_payment(self, p: Optional[dict]) -> None:
         with self._lock:
             self._pending_payment = p
@@ -198,19 +206,24 @@ class State:
     def clear_log(self) -> None:
         with self._lock:
             self._log.clear()
+            self._round_summaries.clear()
     def replace_log(self, lines: list) -> None:
         with self._lock:
             self._log.clear()
+            self._round_summaries.clear()
             for e in lines:
                 if isinstance(e, dict) and ("msg" in e or "level" in e):
-                    self._log.append({
+                    entry = {
                         "id": e.get("id", 0),
                         "t": e.get("t", time.time()),
                         "level": e.get("level", "info"),
                         "msg": e.get("msg", ""),
                         "category": e.get("category", ""),
                         "flow_id": e.get("flow_id", ""),
-                    })
+                    }
+                    self._log.append(entry)
+                    if str(entry["category"]).startswith("round_summary"):
+                        self._round_summaries.append(dict(entry))
             if self._log:
                 self._log_seq = max(e.get("id", 0) for e in self._log)
 _instance: Optional[State] = None
@@ -239,6 +252,8 @@ def log(msg: str, level: str = "info", category: str = "", flow_id: str = "") ->
     get_state().log(msg, level, category, flow_id)
 def get_log(since_idx: int = 0) -> list:
     return get_state().get_log(since_idx)
+def get_round_summaries() -> list:
+    return get_state().get_round_summaries()
 def set_pending_payment(p: Optional[dict]) -> None:
     get_state().set_pending_payment(p)
 def get_pending_payment() -> Optional[dict]:

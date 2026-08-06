@@ -14,7 +14,7 @@ from app.services.buff_client import count_lowest_price_orders, first_order_at_p
 from app.notify import send_pushplus, build_payment_notify_content, wait_email_command
 from app.database import db_upsert_purchase_order, db_update_purchase_order
 from utils.delay import jittered_sleep
-from buff.buyer import BuffAuthExpired, BuffVerificationRequired
+from buff.buyer import BuffAuthExpired, BuffOrderOutcomeUnknown, BuffVerificationRequired
 from utils.buff_protection import BuffProtectionError, get_buff_request_protection
 
 STEAM_FEE_FACTOR = 1.15  # Steam take rate for calculating net proceeds
@@ -251,6 +251,8 @@ def _fetch_smart_market_price(market_hash_name: str, config: dict, app_id: int =
 TARGET_REACHED = object()
 SKIP_NO_FAILED = object()
 SKIP_VERIFICATION_FAILED = object()
+SKIP_BALANCE_UNAVAILABLE = object()
+PAYMENT_REVIEW_REQUIRED = object()
 
 
 def _parse_threshold(val) -> Optional[float]:
@@ -1028,6 +1030,239 @@ def _do_wait_payment_and_append(
         if log_fn:
             log_fn("[Buff]   → 提醒卖家发货请求异常，可稍后在订单页手动催发货", "warn")
     return unit_price * num
+
+def _balance_order_info_confirms_payment(order_info: Optional[dict]) -> bool:
+    items = ((order_info or {}).get("data") or {}).get("items") or []
+    if not items:
+        return False
+    item = items[0] or {}
+    state = str(item.get("state") or "").strip().upper()
+    state_text = str(item.get("state_text") or "").strip().casefold()
+    if any(marker in state_text for marker in ("等待付款", "waiting for payment", "待支付")):
+        return False
+    paid_text_markers = (
+        "等待你发起报价",
+        "等待卖家发货",
+        "等待卖家发送报价",
+        "待发货",
+        "待收货",
+        "offer",
+        "shipping",
+    )
+    if any(marker.casefold() in state_text for marker in paid_text_markers):
+        return True
+    return state in {"PAID", "SUCCESS", "DELIVERING", "DELIVERED", "TRADE"}
+
+def _balance_payment_confirmed(page_pay: Optional[dict], order_info: Optional[dict]) -> bool:
+    if _balance_order_info_confirms_payment(order_info):
+        return True
+    if not page_pay or page_pay.get("code") != "OK":
+        return False
+    data = page_pay.get("data") or {}
+    return data.get("auto_pay") is True
+
+def _record_unknown_balance_order(
+    item: Dict[str, Any],
+    goods_id: int,
+    unit_price: float,
+    reason: str,
+) -> str:
+    local_id = f"buff-unknown-{time.time_ns()}"
+    db_upsert_purchase_order({
+        "external_order_id": local_id,
+        "name": (item.get("steam_market_name") or item.get("name") or "").strip(),
+        "goods_id": int(goods_id),
+        "quantity": 1,
+        "unit_price": round(float(unit_price), 2),
+        "total_price": round(float(unit_price), 2),
+        "status": "payment_unconfirmed",
+        "source": "buff_balance_unknown",
+        "error": reason,
+    })
+    return local_id
+
+def _execute_balance_purchase(
+    buff_client: Any,
+    item: Dict[str, Any],
+    config: dict,
+    unit_price: float,
+    goods_id: int,
+    sell_order: dict,
+    game_buff: str,
+    append_purchase: callable,
+    log_fn: Optional[Callable[[str, str], None]],
+    market_price: Optional[float] = None,
+    on_entering_payment: Optional[Callable[[], None]] = None,
+    preview: Optional[dict] = None,
+):
+    """Preview, lock, persist, and pay one BUFF balance order without payment retries."""
+    if not bool((config.get("buff") or {}).get("balance_auto_pay_acknowledged", False)):
+        if log_fn:
+            log_fn("[Buff余额] 未确认自动扣款授权，本件不会锁单", "error")
+        return PAYMENT_REVIEW_REQUIRED
+
+    if preview is None:
+        try:
+            preview = buff_client.preview_balance_payment(
+                game_buff,
+                goods_id,
+                str(sell_order.get("id") or ""),
+                str(sell_order.get("price") or unit_price),
+            )
+        except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+            raise
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"[Buff余额] 购买预览失败，未锁单: {type(exc).__name__}: {exc}", "warn")
+            return SKIP_BALANCE_UNAVAILABLE
+
+    if not preview or not preview.get("usable"):
+        reason = (preview or {}).get("reason") or "购买预览未明确允许余额支付"
+        if log_fn:
+            log_fn(f"[Buff余额] 不可用，未锁单: {reason}", "warn")
+            if (preview or {}).get("balance_observation_trustworthy") is False:
+                log_fn(
+                    "[Buff余额] 该订单支付通道返回的余额不代表账号余额，未覆盖最近可信缓存",
+                    "warn",
+                )
+        return SKIP_BALANCE_UNAVAILABLE
+
+    pay_method = preview.get("pay_method")
+    balance = preview.get("balance")
+    free_password = bool(preview.get("free_password"))
+    if log_fn:
+        balance_text = f"{float(balance):.2f}" if balance is not None else "未知"
+        log_fn(
+            f"[Buff余额] 预览通过: 动态支付编号={pay_method} 可用资金={balance_text} "
+            f"本笔={unit_price:.2f} 免密={'是' if free_password else '否'}",
+            "info",
+        )
+
+    try:
+        lock_result = buff_client.lock_balance_order_once(
+            game_buff,
+            goods_id,
+            str(sell_order.get("id") or ""),
+            str(sell_order.get("price") or unit_price),
+            pay_method,
+        )
+    except BuffOrderOutcomeUnknown as exc:
+        reason = f"锁单请求结果未知，必须先去 BUFF 订单页核对；不会自动重试。{exc}"
+        local_id = _record_unknown_balance_order(item, goods_id, unit_price, reason)
+        if log_fn:
+            log_fn(f"[Buff余额] {reason} 本地核对号={local_id}", "error")
+        return PAYMENT_REVIEW_REQUIRED
+    except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+        raise
+    except Exception as exc:
+        reason = f"锁单请求结果未知，必须先去 BUFF 订单页核对；不会自动重试。{type(exc).__name__}: {exc}"
+        local_id = _record_unknown_balance_order(item, goods_id, unit_price, reason)
+        if log_fn:
+            log_fn(f"[Buff余额] {reason} 本地核对号={local_id}", "error")
+        return PAYMENT_REVIEW_REQUIRED
+
+    if not lock_result or not lock_result.get("success"):
+        code = (lock_result or {}).get("code") or "未知"
+        msg = (lock_result or {}).get("msg") or "BUFF 明确拒绝锁单"
+        if log_fn:
+            log_fn(f"[Buff余额] 锁单失败 code={code} msg={msg}；本件不重试", "warn")
+        return SKIP_BALANCE_UNAVAILABLE
+
+    order_id = str(lock_result.get("order_id") or "").strip()
+    if not order_id:
+        reason = "锁单响应缺少平台订单号，必须人工核对；不会发起余额支付"
+        local_id = _record_unknown_balance_order(item, goods_id, unit_price, reason)
+        if log_fn:
+            log_fn(f"[Buff余额] {reason} 本地核对号={local_id}", "error")
+        return PAYMENT_REVIEW_REQUIRED
+
+    saved_name = (item.get("steam_market_name") or item.get("name") or "").strip()
+    db_upsert_purchase_order({
+        "external_order_id": order_id,
+        "name": saved_name,
+        "goods_id": int(goods_id),
+        "quantity": 1,
+        "unit_price": round(float(unit_price), 2),
+        "total_price": round(float(unit_price), 2),
+        "status": "awaiting_payment",
+        "source": "buff_balance",
+        "error": None,
+    })
+    if on_entering_payment:
+        on_entering_payment()
+    if log_fn:
+        log_fn(f"[Buff余额] 平台订单 {order_id} 已写入台账；现在发起唯一一次余额支付", "info")
+
+    page_pay = None
+    payment_error = None
+    try:
+        page_pay = buff_client.pay_bill_order_once(order_id)
+    except Exception as exc:
+        payment_error = f"{type(exc).__name__}: {exc}"
+
+    order_info = None
+    try:
+        order_info = buff_client.get_bill_order_info_once(order_id)
+    except Exception as exc:
+        if payment_error:
+            payment_error += f"；订单查询失败 {type(exc).__name__}: {exc}"
+        else:
+            payment_error = f"订单查询失败 {type(exc).__name__}: {exc}"
+
+    if not _balance_payment_confirmed(page_pay, order_info):
+        page_code = (page_pay or {}).get("code") or "无明确返回"
+        reason = (
+            f"余额支付结果未获明确确认（page_pay={page_code}"
+            f"{f'；{payment_error}' if payment_error else ''}），请去 BUFF 核对；不会自动重试"
+        )
+        db_update_purchase_order(order_id, {
+            "status": "payment_unconfirmed",
+            "error": reason,
+        })
+        if log_fn:
+            log_fn(f"[Buff余额] {reason}", "error")
+        return PAYMENT_REVIEW_REQUIRED
+
+    purchase = {
+        "name": saved_name,
+        "goods_id": int(goods_id),
+        "price": round(float(unit_price), 2),
+        "at": time.time(),
+        "pending_receipt": True,
+        "external_order_id": order_id,
+        "source": "auto_balance",
+        "order_status": "awaiting_ship",
+    }
+    if market_price is not None and market_price > 0:
+        purchase["market_price"] = round(float(market_price), 2)
+    try:
+        append_purchase(purchase)
+    except Exception as exc:
+        reason = f"余额已确认支付，但本地购买记录写入失败: {type(exc).__name__}: {exc}"
+        db_update_purchase_order(order_id, {"status": "needs_review", "error": reason})
+        if log_fn:
+            log_fn(f"[Buff余额] {reason}", "error")
+        return PAYMENT_REVIEW_REQUIRED
+
+    db_update_purchase_order(order_id, {
+        "status": "awaiting_ship",
+        "paid_at": time.time(),
+        "error": None,
+    })
+    from app.services.buff_balance import record_confirmed_buff_spend
+    record_confirmed_buff_spend(unit_price)
+    if log_fn:
+        log_fn(f"[Buff余额] 自动支付已确认成功 order_id={order_id} 金额={unit_price:.2f}", "info")
+    try:
+        if buff_client.ask_seller_to_send(order_id, game_buff) and log_fn:
+            log_fn("[Buff余额] 已提醒卖家发货，请留意 Steam 报价", "info")
+        elif log_fn:
+            log_fn("[Buff余额] 提醒卖家发货未成功，可稍后手动催发货", "warn")
+    except Exception:
+        if log_fn:
+            log_fn("[Buff余额] 提醒卖家发货请求异常，可稍后手动催发货", "warn")
+    return round(float(unit_price), 2)
+
 def lock_and_confirm_payment(
     buff_client: Any,
     item: Dict[str, Any],
@@ -1074,6 +1309,19 @@ def lock_and_confirm_payment(
         return None
     market_hash_name = (item.get("steam_market_name") or item.get("name") or "").strip()
     scfg = config.get("pipeline", {})
+    max_unit_price = (
+        _parse_threshold(scfg.get("max_unit_purchase_price"))
+        if is_strategy_module_enabled(config, "buy", "guard.max_unit_purchase_price")
+        else None
+    )
+    if max_unit_price is not None and lowest_price > max_unit_price + 1e-9:
+        if log_fn:
+            log_fn(
+                f"[资金保护] BUFF 实际单价 {lowest_price:.2f} 超过单件最高购买价 "
+                f"{max_unit_price:.2f}，未锁单",
+                "warn",
+            )
+        return SKIP_NO_FAILED
     max_discount = scfg.get("max_discount") if is_strategy_module_enabled(config, "buy", "guard.max_discount") else None
     sell_pressure_threshold = _parse_threshold(scfg.get("sell_pressure_threshold")) if is_strategy_module_enabled(config, "buy", "guard.sell_pressure") else None
     steam_depth_enabled = is_strategy_module_enabled(config, "buy", "buy.steam_sell_depth")
@@ -1182,11 +1430,105 @@ def lock_and_confirm_payment(
     num_to_buy = min(num_to_buy, max(1, safe_limit))
     if log_fn and orig_num > num_to_buy:
         log_fn(f"[Buff]   → 安全采购上限={safe_limit}，原计划={orig_num} 实际购买={num_to_buy}", "info")
+    payment_mode = str(getattr(buff_client, "payment_mode", "") or "").strip().lower()
+    balance_mode = payment_mode == "balance"
+    smart_balance_mode = payment_mode == "balance_first"
+    fallback_mode = str(
+        getattr(buff_client, "fallback_payment_mode", "wechat") or "wechat"
+    ).strip().lower()
     def _try_single_buy():
         o = first_order_at_price(orders, lowest_price)
         if not o:
             return None
         p = float(o.get("price", 0))
+        if max_unit_price is not None and p > max_unit_price + 1e-9:
+            if log_fn:
+                log_fn(
+                    f"[资金保护] 最终卖单价 {p:.2f} 超过单件最高购买价 "
+                    f"{max_unit_price:.2f}，未锁单",
+                    "warn",
+                )
+            return SKIP_NO_FAILED
+        if balance_mode:
+            if log_fn:
+                log_fn(f"[Buff余额] 准备预览 sell_order_id={o.get('id')} price={o.get('price')}", "info")
+            return _execute_balance_purchase(
+                buff_client,
+                item,
+                config,
+                p,
+                goods_id,
+                o,
+                game_buff,
+                append_purchase,
+                log_fn,
+                market_price=ref_price,
+                on_entering_payment=on_entering_payment,
+            )
+        if smart_balance_mode:
+            if not bool((config.get("buff") or {}).get("balance_auto_pay_acknowledged", False)):
+                if log_fn:
+                    log_fn("[智能支付] 未确认余额自动扣款授权，本件不会锁单", "error")
+                return PAYMENT_REVIEW_REQUIRED
+            if log_fn:
+                log_fn(
+                    f"[智能支付] 正在比较 BUFF 可用资金与本笔 {p:.2f} 元订单",
+                    "info",
+                )
+            try:
+                preview = buff_client.preview_balance_payment(
+                    game_buff,
+                    goods_id,
+                    str(o.get("id") or ""),
+                    str(o.get("price") or p),
+                )
+            except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+                raise
+            except Exception as exc:
+                if log_fn:
+                    log_fn(
+                        f"[智能支付] 余额预览请求异常，无法安全选择付款方式；未锁单: "
+                        f"{type(exc).__name__}: {exc}",
+                        "warn",
+                    )
+                return SKIP_BALANCE_UNAVAILABLE
+            if preview and preview.get("usable"):
+                if log_fn:
+                    balance = preview.get("balance")
+                    balance_text = f"{float(balance):.2f}" if balance is not None else "未知"
+                    log_fn(
+                        f"[智能支付] 可用资金 {balance_text} 元可覆盖本笔 {p:.2f} 元，选择余额自动支付",
+                        "info",
+                    )
+                return _execute_balance_purchase(
+                    buff_client,
+                    item,
+                    config,
+                    p,
+                    goods_id,
+                    o,
+                    game_buff,
+                    append_purchase,
+                    log_fn,
+                    market_price=ref_price,
+                    on_entering_payment=on_entering_payment,
+                    preview=preview,
+                )
+            reason = (preview or {}).get("reason") or "购买预览未返回明确余额状态"
+            if (preview or {}).get("balance_status") != "unavailable":
+                if log_fn:
+                    log_fn(
+                        f"[智能支付] 无法明确确认余额是否可用，不会自动改用其他方式；未锁单: {reason}",
+                        "warn",
+                    )
+                return SKIP_BALANCE_UNAVAILABLE
+            fallback_label = "微信" if fallback_mode == "wechat" else "支付宝"
+            if log_fn:
+                log_fn(
+                    f"[智能支付] 余额不足或本订单不支持余额（{reason}）；"
+                    f"整笔改用{fallback_label}手动支付，不拆分付款",
+                    "info",
+                )
         if log_fn:
             log_fn(f"[Buff]   → 锁单 order_id={o.get('id')} price={o.get('price')}", "info")
         try:
@@ -1261,6 +1603,8 @@ def lock_and_confirm_payment(
             market_price=ref_price,
             on_entering_payment=on_entering_payment,
         )
+    if balance_mode or smart_balance_mode:
+        return _try_single_buy()
     if num_to_buy == 1:
         retry_delay = max(0, int(config.get("pipeline", {}).get("buff_retry_delay_seconds", 5) or 5))
         for attempt in range(3):

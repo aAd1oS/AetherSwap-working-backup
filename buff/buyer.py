@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import threading
 import time
 import logging
@@ -33,6 +34,11 @@ class BuffAuthExpired(Exception):
 class BuffVerificationRequired(Exception):
     pass
 
+class BuffOrderOutcomeUnknown(RuntimeError):
+    """A buy request may have reached BUFF, but no order id was confirmed."""
+
+    pass
+
 def _is_auth_error(status_code: int, data: dict) -> bool:
     if status_code == 401:
         return True
@@ -62,7 +68,9 @@ API_HISTORY = "https://buff.163.com/api/market/buy_order/history"
 API_SELL_ORDER = "https://buff.163.com/api/market/goods/sell_order"
 API_GOODS = "https://buff.163.com/api/market/goods"
 API_BUY = "https://buff.163.com/api/market/goods/buy"
+API_BUY_PREVIEW = "https://buff.163.com/api/market/goods/buy/preview"
 API_PAGE_PAY = "https://buff.163.com/api/market/bill_order/page_pay"
+API_BILL_ORDER_INFO = "https://buff.163.com/api/market/bill_order/batch/info"
 API_WX_PAY_QRCODE = "https://buff.163.com/api/market/bill_order/wx_pay_qrcode"
 API_BATCH_BUY_CREATE = "https://buff.163.com/api/market/goods/batch_buy/create"
 API_BATCH_WX_PAY_QRCODE = "https://buff.163.com/api/market/goods/batch_buy/wx_pay_qrcode"
@@ -134,6 +142,225 @@ class BuffBuyer:
             msg = data.get("error") or data.get("msg") or data.get("message") or "Buff 需要刷新页面或完成人机验证"
             raise BuffVerificationRequired(str(msg))
         return data
+
+    @staticmethod
+    def _flag_is_true(value) -> bool:
+        if value is True or value == 1:
+            return True
+        return isinstance(value, str) and value.strip().lower() in {"1", "true", "yes"}
+
+    @staticmethod
+    def _amount_value(value) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+        return float(match.group(0)) if match else None
+
+    @staticmethod
+    def _is_balance_method_name(value) -> bool:
+        return re.sub(r"\s+", "", str(value or "")).casefold() == "buff可用资金".casefold()
+
+    def _assess_balance_method(self, method: dict, amount: Optional[float]) -> dict:
+        balance = self._amount_value(method.get("balance"))
+        reasons = []
+        if method.get("value") is None:
+            reasons.append("支付方式编号缺失")
+        if not self._flag_is_true(method.get("btn_clickable")):
+            reasons.append("余额支付按钮不可用")
+        if not self._flag_is_true(method.get("enough")):
+            reasons.append("余额不足或该通道未确认可支付")
+        if "real_enough" in method and not self._flag_is_true(method.get("real_enough")):
+            reasons.append("平台实际可用余额不足或未确认")
+        if method.get("error"):
+            reasons.append(str(method.get("error")))
+        if amount is None or amount <= 0:
+            reasons.append("订单金额无效")
+        if balance is None:
+            reasons.append("该通道未返回可核对的余额")
+        elif amount is not None and balance + 1e-9 < amount:
+            reasons.append(f"通道余额 {balance:.2f} 小于订单金额 {amount:.2f}")
+        return {
+            "usable": not reasons,
+            "reason": "；".join(reasons),
+            "method": dict(method),
+            "pay_method": method.get("value"),
+            "balance": balance,
+            "amount": amount,
+            "free_password": self._flag_is_true(method.get("free_password")),
+        }
+
+    @staticmethod
+    def _balance_candidate_summary(candidate: dict) -> str:
+        method_id = candidate.get("pay_method")
+        balance = candidate.get("balance")
+        balance_text = f"{float(balance):.2f}" if balance is not None else "未知"
+        reason = candidate.get("reason") or "可用"
+        return f"编号={method_id if method_id is not None else '缺失'} 余额={balance_text} 原因={reason}"
+
+    def preview_balance_payment(
+        self,
+        game: str,
+        goods_id: int,
+        sell_order_id: str,
+        price: str,
+        steam_id: str,
+        timeout: int = 15,
+    ) -> dict:
+        """Read the current order preview and conservatively select BUFF balance."""
+        if not str(steam_id or "").strip():
+            return {
+                "usable": False,
+                "balance_status": "indeterminate",
+                "reason": "未配置 SteamID64，无法读取 BUFF 购买预览",
+            }
+        params = {
+            "game": str(game),
+            "sell_order_id": str(sell_order_id),
+            "goods_id": int(goods_id),
+            "price": str(price),
+            "allow_tradable_cooldown": 0,
+            "cdkey_id": "",
+            "steamid": str(steam_id),
+        }
+        h = {"Referer": f"https://buff.163.com/goods/{goods_id}?from=market"}
+        res = self._make_request(
+            "GET",
+            API_BUY_PREVIEW,
+            params=params,
+            headers=h,
+            timeout=timeout,
+        )
+        if res.get("code") != "OK":
+            reason = res.get("error") or res.get("msg") or f"购买预览返回 {res.get('code', '未知状态')}"
+            return {
+                "usable": False,
+                "balance_status": "indeterminate",
+                "reason": str(reason),
+                "response_code": res.get("code"),
+            }
+
+        methods = res.get("data", {}).get("pay_methods") or []
+        amount = self._amount_value(price)
+        candidates = [
+            self._assess_balance_method(candidate, amount)
+            for candidate in methods
+            if isinstance(candidate, dict) and self._is_balance_method_name(candidate.get("name"))
+        ]
+        if not candidates:
+            return {
+                "usable": False,
+                "balance_status": "unavailable",
+                "reason": "当前订单预览未提供 BUFF可用资金",
+                "balance_observation_trustworthy": False,
+                "balance_observation_reason": "当前订单没有可用于核对账号余额的 BUFF可用资金通道",
+            }
+
+        summaries = [self._balance_candidate_summary(candidate) for candidate in candidates]
+        usable_candidates = [candidate for candidate in candidates if candidate.get("usable")]
+        if usable_candidates:
+            selected = max(
+                usable_candidates,
+                key=lambda candidate: candidate.get("balance")
+                if candidate.get("balance") is not None
+                else -1.0,
+            )
+            selected["candidate_summaries"] = summaries
+            selected["candidate_count"] = len(candidates)
+            selected["balance_status"] = "available"
+            selected["reported_balance"] = selected.get("balance")
+            selected["balance_observation_trustworthy"] = True
+            selected["balance_observation_reason"] = "当前订单存在明确可用的 BUFF可用资金通道"
+            return selected
+
+        reported_balances = [
+            candidate.get("balance")
+            for candidate in candidates
+            if candidate.get("balance") is not None
+        ]
+        reported_balance = max(reported_balances) if reported_balances else None
+        trustworthy_observations = [
+            candidate
+            for candidate in candidates
+            if candidate.get("balance") is not None
+            and not str((candidate.get("method") or {}).get("error") or "").strip()
+        ]
+        observation_trustworthy = bool(trustworthy_observations)
+        return {
+            "usable": False,
+            "balance_status": "unavailable",
+            "reason": (
+                f"当前订单返回 {len(candidates)} 个 BUFF可用资金通道，但均不可用："
+                + "；".join(summaries)
+            ),
+            "candidate_summaries": summaries,
+            "candidate_count": len(candidates),
+            "amount": amount,
+            "balance": reported_balance,
+            "reported_balance": reported_balance,
+            "balance_observation_trustworthy": observation_trustworthy,
+            "balance_observation_reason": (
+                "至少一个通道返回了无平台错误的余额字段"
+                if observation_trustworthy
+                else "当前订单只返回带平台错误的支付通道，其余额不能代表账号可用资金"
+            ),
+        }
+
+    def lock_order_once(
+        self,
+        game: str,
+        goods_id: int,
+        sell_order_id: str,
+        price: str,
+        pay_method,
+        steam_id: str,
+        timeout: int = 15,
+    ) -> dict:
+        """Submit one buy request. Network uncertainty is never retried here."""
+        payload = {
+            "game": str(game),
+            "goods_id": int(goods_id),
+            "sell_order_id": str(sell_order_id),
+            "price": str(price),
+            "pay_method": pay_method,
+            "allow_tradable_cooldown": 0,
+            "token": "",
+            "cdkey_id": "",
+            "hide_non_epay": True,
+            "steamid": str(steam_id),
+        }
+        h = {"Referer": f"https://buff.163.com/goods/{goods_id}?from=market"}
+        try:
+            res = self._make_request(
+                "POST",
+                API_BUY,
+                headers=h,
+                data=json.dumps(payload),
+                timeout=timeout,
+            )
+        except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+            raise
+        except Exception as exc:
+            raise BuffOrderOutcomeUnknown(f"BUFF 锁单请求结果未知: {type(exc).__name__}: {exc}") from exc
+
+        if res.get("code") != "OK":
+            error = res.get("error") or res.get("msg") or f"接口返回 {res.get('code', '未知状态')}"
+            return {"success": False, "code": res.get("code") or "FAIL", "msg": str(error)}
+        order_id = str(res.get("data", {}).get("id") or "").strip()
+        if not order_id:
+            raise BuffOrderOutcomeUnknown("BUFF 返回锁单成功，但没有返回平台订单号")
+        return {"success": True, "order_id": order_id, "data": res.get("data") or {}}
+
+    def pay_bill_order_once(self, order_id: str, timeout: int = 15) -> dict:
+        params = {"bill_order_id": str(order_id), "_": str(int(time.time() * 1000))}
+        h = {"Referer": "https://buff.163.com/market/buy_order/history?game=csgo"}
+        return self._make_request("GET", API_PAGE_PAY, params=params, headers=h, timeout=timeout)
+
+    def get_bill_order_info_once(self, order_id: str, timeout: int = 15) -> dict:
+        params = {"bill_orders": str(order_id), "_": str(int(time.time() * 1000))}
+        h = {"Referer": "https://buff.163.com/market/buy_order/history?game=csgo"}
+        return self._make_request("GET", API_BILL_ORDER_INFO, params=params, headers=h, timeout=timeout)
     def check_wait_pay_orders(self, game: str = "csgo") -> bool:
         params = {
             "game": game,

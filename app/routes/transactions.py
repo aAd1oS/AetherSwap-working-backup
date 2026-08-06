@@ -1,4 +1,5 @@
 """Transaction routes (purchases, sales, stats, delist, sync)."""
+import math
 from typing import Optional
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -10,14 +11,18 @@ from app.state import (
     delete_sale_by_id,
     get_purchases,
     get_sales,
+    get_status,
     is_steam_background_allowed,
     log,
     reload_transactions,
+    set_buff_auth_expired,
+    set_buff_verification_required,
     update_purchase,
     update_purchase_by_id,
     update_sale,
 )
 from app.config_loader import (
+    get_buff_credentials,
     get_steam_credentials,
     load_app_config_validated,
 )
@@ -27,6 +32,14 @@ from app.database import (
     db_replace_cancelled_order_with_paid_purchase,
     db_update_purchase_order,
 )
+from buff.buyer import BuffAuthExpired, BuffVerificationRequired
+from utils.buff_protection import BuffProtectionError
+from app.services.buff_balance import (
+    get_buff_balance,
+    get_buff_balance_probe,
+    record_buff_balance_preview,
+)
+from app.services.buff_client import create_buff_client_from_config
 from app.order_state import (
     BLOCKING_PAYMENT_STATUSES,
     ORDER_STATUS_LABELS,
@@ -35,6 +48,16 @@ from app.order_state import (
     reconcile_orders_from_local_records,
 )
 router = APIRouter()
+
+
+def _positive_amount(value) -> float:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return amount if math.isfinite(amount) and amount > 0 else 0.0
+
+
 class AddPurchaseBody(BaseModel):
     name: str = ""
     price: float = 0
@@ -304,36 +327,151 @@ def api_update_transaction(body: TransactionUpdateBody):
 @router.get("/api/stats")
 def api_stats():
     purchases = get_purchases()
-    total_purchased = sum(
-        float(p.get("price", 0))
-        for p in purchases
-        if p.get("sale_price") is not None and float(p.get("sale_price", 0) or 0) > 0
-    )
-    total_sold = sum(
-        float(p.get("sale_price", 0))
-        for p in purchases
-        if p.get("sale_price") is not None and float(p.get("sale_price", 0) or 0) > 0
-    )
+    total_invested = sum(_positive_amount(p.get("price")) for p in purchases)
+    sold_purchases = [p for p in purchases if _positive_amount(p.get("sale_price")) > 0]
+    total_sold = sum(_positive_amount(p.get("sale_price")) for p in sold_purchases)
     ratio_sum = 0.0
     ratio_count = 0
     total_profit = 0.0
-    for p in purchases:
-        sp = p.get("sale_price")
-        if sp is None or float(sp or 0) <= 0:
-            continue
-        after_tax = float(sp) / 1.15
-        cost = float(p.get("price", 0))
+    for p in sold_purchases:
+        after_tax = _positive_amount(p.get("sale_price")) / 1.15
+        cost = _positive_amount(p.get("price"))
         total_profit += after_tax - cost
         if after_tax > 0 and cost > 0:
             ratio_sum += cost / after_tax
             ratio_count += 1
     discount_ratio = (ratio_sum / ratio_count) if ratio_count > 0 else None
     return {
-        "total_purchased": round(total_purchased, 2),
+        "total_invested": round(total_invested, 2),
+        "total_purchased": round(total_invested, 2),
         "total_sold": round(total_sold, 2),
         "total_profit": round(total_profit, 2),
         "discount_ratio": round(discount_ratio, 4) if discount_ratio is not None else None,
+        "buff_balance": get_buff_balance(),
     }
+
+
+@router.post("/api/buff/balance/refresh")
+def api_refresh_buff_balance():
+    cached = get_buff_balance()
+    if get_status().get("status") == "running":
+        return {
+            "ok": False,
+            "error": "任务正在运行，余额会在购买预检时自动更新；为避免增加 BUFF 请求，本次未刷新",
+            "buff_balance": cached,
+        }
+
+    buff_credentials = get_buff_credentials() or {}
+    steam_credentials = get_steam_credentials() or {}
+    if not str(buff_credentials.get("cookies") or "").strip():
+        return {"ok": False, "error": "尚未配置 BUFF Cookie", "buff_balance": cached}
+    if not str(steam_credentials.get("steam_id") or "").strip():
+        return {"ok": False, "error": "尚未配置 SteamID64", "buff_balance": cached}
+
+    probe = get_buff_balance_probe()
+    try:
+        goods_id = int(probe.get("goods_id") or 0)
+    except (TypeError, ValueError):
+        goods_id = 0
+    game = str(probe.get("game") or "csgo")
+    if goods_id <= 0:
+        for purchase in reversed(get_purchases()):
+            try:
+                goods_id = int(purchase.get("goods_id") or 0)
+            except (TypeError, ValueError):
+                goods_id = 0
+            if goods_id > 0:
+                break
+    if goods_id <= 0:
+        return {
+            "ok": False,
+            "error": "暂无可用于只读查询的已知 BUFF 商品；任务首次进行余额预检后会自动显示",
+            "buff_balance": cached,
+        }
+
+    try:
+        client = create_buff_client_from_config(
+            buff_credentials,
+            load_app_config_validated(),
+            steam_credentials,
+        )
+        orders = client.get_sell_orders(goods_id, game) or []
+        order = next(
+            (
+                row for row in orders
+                if str(row.get("id") or "").strip()
+                and _positive_amount(row.get("price")) > 0
+            ),
+            None,
+        )
+        if order is None:
+            return {
+                "ok": False,
+                "error": "该参考商品当前没有可用于余额预览的在售订单，请稍后重试",
+                "buff_balance": cached,
+            }
+        preview = client.preview_balance_payment(
+            game,
+            goods_id,
+            str(order.get("id")),
+            str(order.get("price")),
+        )
+        balance = record_buff_balance_preview(
+            preview,
+            game=game,
+            goods_id=goods_id,
+            sell_order_id=str(order.get("id")),
+            price=str(order.get("price")),
+        )
+        if balance.get("observation_accepted") is False:
+            retained = (
+                f"，已保留最近可信余额 {float(balance['balance']):.2f}"
+                if balance.get("has_value")
+                else ""
+            )
+            return {
+                "ok": False,
+                "error": f"当前参考订单只返回订单级不可用支付通道，不能据此更新账号余额{retained}",
+                "buff_balance": balance,
+            }
+        if not balance.get("has_value"):
+            return {
+                "ok": False,
+                "error": (preview or {}).get("reason") or "BUFF 预览未返回可识别的余额",
+                "buff_balance": balance,
+            }
+        log(
+            f"BUFF 可用资金已手动刷新: {float(balance['balance']):.2f}",
+            "info",
+            category="buff",
+        )
+        return {"ok": True, "buff_balance": balance}
+    except BuffAuthExpired:
+        set_buff_auth_expired(True)
+        return {
+            "ok": False,
+            "error": "BUFF 登录已过期，请更新 Cookie 后重试",
+            "buff_balance": cached,
+        }
+    except BuffVerificationRequired as exc:
+        set_buff_verification_required(True, str(exc))
+        return {
+            "ok": False,
+            "error": f"BUFF 需要先完成页面验证: {exc}",
+            "buff_balance": cached,
+        }
+    except BuffProtectionError as exc:
+        return {
+            "ok": False,
+            "error": f"BUFF 请求保护暂时阻止刷新: {exc}",
+            "buff_balance": cached,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"BUFF 余额刷新失败: {type(exc).__name__}: {exc}",
+            "buff_balance": cached,
+        }
 @router.post("/api/purchase/{idx}/delist")
 def api_delist_purchase(idx: int):
     from app.steam_delist import delist_item

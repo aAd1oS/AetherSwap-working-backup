@@ -1,7 +1,14 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 from app.services.retry import with_retry
-from buff.buyer import BuffAuthExpired, BuffBuyer, BuffVerificationRequired, PAY_METHOD_ALIPAY, PAY_METHOD_WECHAT
+from buff.buyer import (
+    BuffAuthExpired,
+    BuffBuyer,
+    BuffVerificationRequired,
+    PAY_METHOD_ALIPAY,
+    PAY_METHOD_WECHAT,
+)
 from utils.buff_protection import BuffProtectionError
+from app.services.buff_balance import record_buff_balance_preview
 buff_timeout = 15
 buff_retry_attempts = 2
 def count_lowest_price_orders(orders: List[dict]) -> Tuple[float, int]:
@@ -36,12 +43,27 @@ class BuffClient:
         self,
         cookies: str,
         pay_method: str = "alipay",
+        balance_fallback_method: str = "wechat",
         timeout_sec: int = buff_timeout,
+        steam_id: str = "",
     ) -> None:
-        pm = PAY_METHOD_WECHAT if (pay_method or "alipay").strip().lower() == "wechat" else PAY_METHOD_ALIPAY
+        payment_mode = (pay_method or "alipay").strip().lower()
+        fallback_mode = (balance_fallback_method or "wechat").strip().lower()
+        if fallback_mode not in {"alipay", "wechat"}:
+            fallback_mode = "wechat"
+        manual_mode = fallback_mode if payment_mode == "balance_first" else payment_mode
+        pm = PAY_METHOD_WECHAT if manual_mode == "wechat" else PAY_METHOD_ALIPAY
         self._buyer = BuffBuyer(cookies, pay_method=pm)
-        self._pay_method = pay_method
+        self._pay_method = payment_mode
+        self._fallback_payment_mode = fallback_mode
         self._timeout = timeout_sec
+        self._steam_id = str(steam_id or "").strip()
+    @property
+    def payment_mode(self) -> str:
+        return self._pay_method
+    @property
+    def fallback_payment_mode(self) -> str:
+        return self._fallback_payment_mode
     def get_sell_orders(self, goods_id: int, game: str = "csgo") -> Optional[list]:
         return self._buyer.get_sell_orders(goods_id, game)
     def get_goods_steam_price_cny(self, search_name: str, game: str = "csgo") -> Optional[float]:
@@ -57,6 +79,64 @@ class BuffClient:
         price: str,
     ) -> Dict[str, Any]:
         return self._buyer.lock_and_get_pay_url(game, goods_id, sell_order_id, price)
+    def preview_balance_payment_once(
+        self,
+        game: str,
+        goods_id: int,
+        sell_order_id: str,
+        price: str,
+    ) -> Dict[str, Any]:
+        result = self._buyer.preview_balance_payment(
+            game,
+            goods_id,
+            sell_order_id,
+            price,
+            self._steam_id,
+            timeout=self._timeout,
+        )
+        record_buff_balance_preview(
+            result,
+            game=game,
+            goods_id=goods_id,
+            sell_order_id=sell_order_id,
+            price=price,
+        )
+        return result
+    @with_retry(max_attempts=buff_retry_attempts, fatal_exceptions=(BuffAuthExpired, BuffVerificationRequired, BuffProtectionError))
+    def preview_balance_payment(
+        self,
+        game: str,
+        goods_id: int,
+        sell_order_id: str,
+        price: str,
+    ) -> Dict[str, Any]:
+        return self.preview_balance_payment_once(
+            game,
+            goods_id,
+            sell_order_id,
+            price,
+        )
+    def lock_balance_order_once(
+        self,
+        game: str,
+        goods_id: int,
+        sell_order_id: str,
+        price: str,
+        pay_method,
+    ) -> Dict[str, Any]:
+        return self._buyer.lock_order_once(
+            game,
+            goods_id,
+            sell_order_id,
+            price,
+            pay_method,
+            self._steam_id,
+            timeout=self._timeout,
+        )
+    def pay_bill_order_once(self, order_id: str) -> Dict[str, Any]:
+        return self._buyer.pay_bill_order_once(order_id, timeout=self._timeout)
+    def get_bill_order_info_once(self, order_id: str) -> Dict[str, Any]:
+        return self._buyer.get_bill_order_info_once(order_id, timeout=self._timeout)
     @with_retry(max_attempts=buff_retry_attempts, fatal_exceptions=(BuffAuthExpired, BuffVerificationRequired, BuffProtectionError))
     def try_batch_buy(
         self,
@@ -110,8 +190,20 @@ class BuffClient:
                 if bill_order_id:
                     matched.append({"id": o.get("id"), "price": p, "bill_order_id": bill_order_id})
         return matched
-def create_buff_client_from_config(credentials: dict, config: dict) -> BuffClient:
+def create_buff_client_from_config(
+    credentials: dict,
+    config: dict,
+    steam_credentials: Optional[dict] = None,
+) -> BuffClient:
     cookies = credentials.get("cookies", "")
     buff_cfg = config.get("buff", {})
     pay_method = buff_cfg.get("pay_method", "alipay")
-    return BuffClient(cookies, pay_method=pay_method, timeout_sec=buff_timeout)
+    fallback_method = buff_cfg.get("balance_fallback_method", "wechat")
+    steam_id = str((steam_credentials or {}).get("steam_id") or "").strip()
+    return BuffClient(
+        cookies,
+        pay_method=pay_method,
+        balance_fallback_method=fallback_method,
+        timeout_sec=buff_timeout,
+        steam_id=steam_id,
+    )

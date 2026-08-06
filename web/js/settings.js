@@ -26,6 +26,10 @@ async function loadConfig() {
   if (gMinVolume) gMinVolume.value = i.min_volume ?? "";
   const gPay = el("cfg-pay_method");
   if (gPay) gPay.value = (b.pay_method || "wechat").toLowerCase();
+  const gBalanceFallback = el("cfg-balance-fallback-method");
+  if (gBalanceFallback) gBalanceFallback.value = (b.balance_fallback_method || "wechat").toLowerCase();
+  const gBalanceAck = el("cfg-balance-auto-pay-acknowledged");
+  if (gBalanceAck) gBalanceAck.checked = !!b.balance_auto_pay_acknowledged;
   const gTarget = el("cfg-target_balance");
   if (gTarget) gTarget.value = p.target_balance ?? "";
   const gMaxDisc = el("cfg-max_discount");
@@ -143,11 +147,11 @@ async function loadConfig() {
   if (gFx) gFx.value = sys.exchange_rate_refresh_hours ?? "";
   const gUiScale = el("cfg-ui_scale");
   if (gUiScale) {
-    gUiScale.value = sys.ui_scale || "0.7";
-    document.documentElement.style.zoom = sys.ui_scale || "0.7";
-    gUiScale.addEventListener("change", (e) => {
+    gUiScale.value = sys.ui_scale || "1.0";
+    document.documentElement.style.zoom = sys.ui_scale || "1.0";
+    gUiScale.onchange = (e) => {
       document.documentElement.style.zoom = e.target.value;
-    });
+    };
   }
   const sd = c.steam_deals || {};
   const gSdEnabled = el("cfg-steam-deals-enabled");
@@ -186,6 +190,8 @@ function formToConfig() {
     },
     buff: {
       pay_method: el("cfg-pay_method") ? el("cfg-pay_method").value : undefined,
+      balance_fallback_method: el("cfg-balance-fallback-method") ? el("cfg-balance-fallback-method").value : undefined,
+      balance_auto_pay_acknowledged: !!el("cfg-balance-auto-pay-acknowledged")?.checked,
       game: el("cfg-buff-game") ? el("cfg-buff-game").value.trim() : undefined,
       price_tolerance: el("cfg-price_tolerance") ? parseFloat(el("cfg-price_tolerance").value) || undefined : undefined,
     },
@@ -299,6 +305,12 @@ async function saveConfigFromForm() {
 }
 async function startPipeline() {
   try {
+    const payMethod = el("cfg-pay_method")?.value;
+    const balanceAcknowledged = !!el("cfg-balance-auto-pay-acknowledged")?.checked;
+    if (["balance", "balance_first"].includes(payMethod) && !balanceAcknowledged) {
+      toast("未启动", "请选择允许 BUFF 可用资金自动扣款");
+      return;
+    }
     await saveConfigFromForm();
     const d = await fetchJson(API + "/config");
     const result = await fetchJson(API + "/pipeline/start", { method: "POST", body: JSON.stringify({ config: d.config || {} }) });

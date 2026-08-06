@@ -16,6 +16,8 @@ DEFAULTS = {
     },
     "buff": {
         "pay_method": "alipay",
+        "balance_fallback_method": "wechat",
+        "balance_auto_pay_acknowledged": False,
         "game": "csgo",
         "price_tolerance": 0.5,
     },
@@ -37,6 +39,7 @@ DEFAULTS = {
     },
     "pipeline": {
         "target_balance": 100,
+        "max_unit_purchase_price": 50.0,
         "max_discount": 0.9,
         "huge_profit_offset": 0.05,
         "iflow_top_n": 30,
@@ -95,7 +98,7 @@ DEFAULTS = {
     },
     "system": {
         "exchange_rate_refresh_hours": 24,
-        "ui_scale": "0.7",
+        "ui_scale": "1.0",
     },
     "proxy_pool": {
         "enabled": False,
@@ -155,6 +158,12 @@ def _validate_ranges(cfg: dict) -> dict:
             warnings.warn(f"[config] pipeline.max_discount={v} 超出范围(0,1]，已修正为 {min(max(v, 0.001), 1.0):.4g}")
             pipe["max_discount"] = min(max(v, 0.001), 1.0)
 
+    if isinstance(pipe.get("max_unit_purchase_price"), (int, float)):
+        v = pipe["max_unit_purchase_price"]
+        if v <= 0:
+            warnings.warn("[config] pipeline.max_unit_purchase_price 必须大于0，已修正为0.01")
+            pipe["max_unit_purchase_price"] = 0.01
+
     if isinstance(stab.get("cv_threshold"), (int, float)):
         v = stab["cv_threshold"]
         if not (0 < v < 1):
@@ -184,6 +193,21 @@ def _validate_ranges(cfg: dict) -> dict:
         if v < 0:
             warnings.warn(f"[config] buff.price_tolerance={v} 不能为负数，已修正为0")
             buff["price_tolerance"] = 0.0
+
+    valid_pay_methods = {"alipay", "wechat", "balance", "balance_first"}
+    pay_method = str(buff.get("pay_method") or "alipay").strip().lower()
+    if pay_method not in valid_pay_methods:
+        warnings.warn(f"[config] buff.pay_method={pay_method} 无效，已修正为 alipay")
+        pay_method = "alipay"
+    buff["pay_method"] = pay_method
+
+    fallback_method = str(buff.get("balance_fallback_method") or "wechat").strip().lower()
+    if fallback_method not in {"alipay", "wechat"}:
+        warnings.warn(
+            f"[config] buff.balance_fallback_method={fallback_method} 无效，已修正为 wechat"
+        )
+        fallback_method = "wechat"
+    buff["balance_fallback_method"] = fallback_method
 
     if isinstance(inv.get("refresh_seconds"), (int, float)):
         v = inv["refresh_seconds"]

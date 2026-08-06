@@ -12,6 +12,7 @@ config/app.db-shm
 config/exchange_rate.json
 config/steam_userdata.json
 config/holdings_report_last.json
+config/buff_balance_cache.json
 config/transactions.json.bak
 
 # 日志

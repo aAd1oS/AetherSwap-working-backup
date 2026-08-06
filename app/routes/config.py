@@ -93,6 +93,7 @@ def api_data_init():
     files_to_remove = [
         "exchange_rate.json",
         "holdings_report_last.json",
+        "buff_balance_cache.json",
         "steam_userdata.json",
         "transactions.json.bak",
     ]

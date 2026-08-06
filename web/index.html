@@ -434,7 +434,7 @@
             </div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">已购买投入</div>
+            <div class="stat-label">总投入</div>
             <div class="stat-value" id="stat-total-purchased">0.00</div>
           </div>
           <div class="stat-card">
@@ -444,6 +444,22 @@
           <div class="stat-card">
             <div class="stat-label">实际折扣比率</div>
             <div class="stat-value" id="stat-ratio">0.0000</div>
+          </div>
+          <div class="stat-card stat-card--buff-balance">
+            <div class="stat-card-head">
+              <div class="stat-label">BUFF 可用资金</div>
+              <button type="button" class="stat-refresh-btn" id="btn-refresh-buff-balance"
+                title="手动刷新 BUFF 可用资金" aria-label="手动刷新 BUFF 可用资金">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="23 4 23 10 17 10"></polyline>
+                  <polyline points="1 20 1 14 7 14"></polyline>
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"></path>
+                  <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"></path>
+                </svg>
+              </button>
+            </div>
+            <div class="stat-value"><span class="stat-currency">¥</span><span id="stat-buff-balance">—</span></div>
+            <div class="stat-meta" id="stat-buff-balance-meta">尚未读取</div>
           </div>
         </div>
 
@@ -855,7 +871,24 @@
                 <select id="cfg-pay_method">
                   <option value="alipay">支付宝 (Alipay)</option>
                   <option value="wechat">微信 (WeChat)</option>
+                  <option value="balance">BUFF 可用资金（自动扣款）</option>
+                  <option value="balance_first">智能：余额优先，不足转手动支付</option>
                 </select>
+              </div>
+              <div class="field">
+                <label for="cfg-balance-fallback-method">智能模式备用方式</label>
+                <select id="cfg-balance-fallback-method">
+                  <option value="wechat">微信（手动确认）</option>
+                  <option value="alipay">支付宝（手动确认）</option>
+                </select>
+                <span class="field-hint">仅智能模式生效。余额不足时整笔切换，不会拆分付款。</span>
+              </div>
+              <div class="field field--switch">
+                <label class="checkbox-wrapper">
+                  <input type="checkbox" id="cfg-balance-auto-pay-acknowledged" />
+                  <span>允许 BUFF 可用资金自动扣款</span>
+                </label>
+                <span class="field-hint">余额或智能模式均需确认；余额结果不明确时不会回退锁单，并会停止或跳过等待核对。</span>
               </div>
             </div>
           </div>
@@ -1004,12 +1037,14 @@
                 <div class="field">
                   <label for="cfg-ui_scale">界面缩放比例(内部浏览器)</label>
                   <select id="cfg-ui_scale">
-                    <option value="0.7" selected>70% (默认)</option>
+                    <option value="0.7">70%</option>
                     <option value="0.8">80%</option>
                     <option value="0.9">90%</option>
-                    <option value="1.0">100%</option>
+                    <option value="1.0" selected>100% (默认)</option>
                     <option value="1.1">110%</option>
                     <option value="1.2">120%</option>
+                    <option value="1.3">130%</option>
+                    <option value="1.4">140%</option>
                   </select>
                 </div>
               </div>
@@ -1406,6 +1441,13 @@
                 </svg>
                 导出日志
               </button>
+              <button id="btn-export-round-summary" class="icon-btn" title="导出当前日志中的全部轮次关键总结">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <path d="M4 4h16v16H4z" />
+                  <path d="M8 9h8M8 13h8M8 17h5" />
+                </svg>
+                导出轮次总结
+              </button>
             </div>
           </div>
           <pre id="log-output" class="console-body" data-last-index="0"></pre>
@@ -1792,7 +1834,7 @@
   <script src="/js/settings.js"></script>
   <script src="/js/proxy.js"></script>
   <script src="/js/strategies.js"></script>
-  <script src="/js/main.js?v=3"></script>
+  <script src="/js/main.js?v=4"></script>
   <script src="/js/gift.js"></script>
   <script src="/js/steamDeals.js"></script>
   <script>

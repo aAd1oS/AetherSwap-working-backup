@@ -92,6 +92,21 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
         "description": "要求 (Buff 价格 / Steam 参考价) × 1.15 低于阈值。",
         "params_schema": {"max_discount": {"type": "number", "min": 0.001, "max": 1, "default": 0.9, "label": "最高折扣"}},
     },
+    "guard.max_unit_purchase_price": {
+        "id": "guard.max_unit_purchase_price",
+        "name": "单件最高购买价",
+        "category": "guard.purchase_limit",
+        "strategy_types": ["buy"],
+        "description": "按刷新后的 BUFF 实际最低卖单价限制单件金额，超过上限时不会锁单。",
+        "params_schema": {
+            "max_unit_purchase_price": {
+                "type": "number",
+                "min": 0.01,
+                "default": 50.0,
+                "label": "单件最高购买价（元）",
+            },
+        },
+    },
     "guard.sell_pressure": {
         "id": "guard.sell_pressure",
         "name": "卖压保护",
@@ -349,6 +364,7 @@ SYSTEM_STRATEGIES: List[Dict[str, Any]] = [
             {"module_id": "guard.volatility_cv", "enabled": True, "params": {}},
             {"module_id": "guard.trend_quality", "enabled": True, "params": {}},
             {"module_id": "guard.price_position", "enabled": True, "params": {}},
+            {"module_id": "guard.max_unit_purchase_price", "enabled": True, "params": {}},
             {"module_id": "guard.purchase_hard_cap", "enabled": True, "params": {}},
             {"module_id": "guard.purchase_liquidity_cap", "enabled": True, "params": {}},
             {"module_id": "guard.low_price_purchase_guard", "enabled": True, "params": {}},
@@ -503,6 +519,10 @@ MODULE_DATA_OUTPUTS: Dict[str, Dict[str, str]] = {
         "estimated_ratio": "Computed discount ratio.",
         "limit": "Configured max discount threshold.",
     },
+    "guard.max_unit_purchase_price": {
+        "unit_price": "Refreshed Buff unit price in CNY.",
+        "limit": "Configured maximum unit purchase price in CNY.",
+    },
     "guard.sell_pressure": {
         "sell_pressure": "Computed sell pressure.",
         "limit": "Configured sell pressure threshold.",
@@ -560,6 +580,7 @@ MODULE_SAMPLE_OUTPUTS: Dict[str, Dict[str, Any]] = {
     "guard.trend_quality": {"r_squared": 0.72, "slope": 0.001, "status": "STABLE"},
     "guard.price_position": {"price_percentile": 0.48, "ma7": 12.6, "ma30": 12.2},
     "guard.max_discount": {"estimated_ratio": 0.85, "limit": 0.9},
+    "guard.max_unit_purchase_price": {"unit_price": 9.8, "limit": 50.0},
     "guard.sell_pressure": {"sell_pressure": 1.1, "limit": 2.0},
     "guard.purchase_hard_cap": {"hard_cap": 50},
     "guard.purchase_liquidity_cap": {"liquidity_cap": 5},
@@ -1326,6 +1347,9 @@ def _current_param_values(config: dict) -> Dict[str, Dict[str, Any]]:
             "ma_deviation_ceil": stability.get("ma_deviation_ceil"),
             "last_price_ma30_ceil": stability.get("last_price_ma30_ceil"),
         },
+        "guard.max_unit_purchase_price": {
+            "max_unit_purchase_price": pipe.get("max_unit_purchase_price"),
+        },
         "guard.safe_purchase_limit": {
             "safe_purchase_hard_qty_cap": pipe.get("safe_purchase_hard_qty_cap"),
             "safe_purchase_liquidity_ratio": pipe.get("safe_purchase_liquidity_ratio"),
@@ -1458,6 +1482,10 @@ def apply_strategy_to_config(config: dict, strategy_type: str, strategy_override
                 pipe["max_discount"] = float(params.get("max_discount"))
         else:
             pipe["max_discount"] = None
+        if "guard.max_unit_purchase_price" in enabled_ids:
+            params = _step_params(strategy, "guard.max_unit_purchase_price")
+            if "max_unit_purchase_price" in params:
+                pipe["max_unit_purchase_price"] = float(params.get("max_unit_purchase_price"))
         if "guard.sell_pressure" in enabled_ids:
             params = _step_params(strategy, "guard.sell_pressure")
             if "sell_pressure_orders_n" in params:

@@ -24,6 +24,7 @@ def test_default_buy_strategy_contains_current_protection_chain():
         "guard.volatility_cv",
         "guard.trend_quality",
         "guard.price_position",
+        "guard.max_unit_purchase_price",
         "guard.purchase_hard_cap",
         "guard.purchase_liquidity_cap",
         "guard.low_price_purchase_guard",
@@ -432,6 +433,30 @@ def test_system_strategy_params_can_be_saved_to_config(monkeypatch):
     assert saved["id"] == "system.buy.default"
     assert saved["origin"] == "system"
     assert state["pipeline"]["target_balance"] == 233
+
+
+def test_system_buy_strategy_saves_max_unit_purchase_price(monkeypatch):
+    state = {
+        "strategies": {"active_buy_strategy_id": "system.buy.default"},
+        "pipeline": {"target_balance": 100, "max_unit_purchase_price": 50.0},
+        "stability": {},
+    }
+
+    monkeypatch.setattr(se, "load_app_config_validated", lambda: se.copy.deepcopy(state))
+
+    def fake_save(data):
+        state.clear()
+        state.update(se.copy.deepcopy(data))
+
+    monkeypatch.setattr(se, "save_app_config_validated", fake_save)
+    strategy = se.get_strategy("system.buy.default")
+    for step in strategy["steps"]:
+        if step["module_id"] == "guard.max_unit_purchase_price":
+            step["params"] = {"max_unit_purchase_price": 12.5}
+
+    se.save_strategy(strategy)
+
+    assert state["pipeline"]["max_unit_purchase_price"] == 12.5
 
 
 def test_system_strategy_params_can_restore_schema_defaults(monkeypatch):

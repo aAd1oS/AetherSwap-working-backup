@@ -4,6 +4,15 @@ function formatTimeHHMM(d = new Date()) {
   const mm = String(d.getMinutes()).padStart(2, "0");
   return `${hh}:${mm}`;
 }
+function formatInventoryUnlockTime(d) {
+  if (!(d instanceof Date) || Number.isNaN(d.getTime())) return "";
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const hour = String(d.getHours()).padStart(2, "0");
+  const minute = String(d.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}:${minute}`;
+}
 async function tabSwitch(name) {
   console.log("tabSwitch called with name:", name);
   const activePanel = document.querySelector(".panel.active");
@@ -189,7 +198,7 @@ async function refreshStatus() {
       const e = el(id);
       if (e) e.textContent = text;
     };
-    animateValue(el("stat-total-purchased"), s.total_purchased ?? 0);
+    animateValue(el("stat-total-purchased"), s.total_invested ?? s.total_purchased ?? 0);
     animateValue(el("stat-total-sold"), s.total_sold ?? 0);
     const diffEl = el("stat-diff");
     if (s.total_profit != null) {
@@ -206,7 +215,59 @@ async function refreshStatus() {
       if (s.discount_ratio <= targetRatio) ratioEl.classList.add("text-ok");
       else ratioEl.classList.add("text-bad");
     } else set("stat-ratio", "—");
+    const buffBalance = s.buff_balance || {};
+    const buffBalanceValue = el("stat-buff-balance");
+    const buffBalanceMeta = el("stat-buff-balance-meta");
+    if (buffBalanceValue) {
+      buffBalanceValue.textContent = buffBalance.has_value
+        ? Number(buffBalance.balance).toFixed(2)
+        : "—";
+    }
+    if (buffBalanceMeta) {
+      if (!buffBalance.has_value) {
+        buffBalanceMeta.textContent = "尚未读取";
+        buffBalanceMeta.removeAttribute("title");
+      } else {
+        const updated = buffBalance.updated_at
+          ? formatTimeHHMM(new Date(Number(buffBalance.updated_at) * 1000))
+          : "未知时间";
+        if (buffBalance.uncertain) {
+          buffBalanceMeta.textContent = `最近可信 · 本次订单通道未采信 · ${updated}`;
+          buffBalanceMeta.title = buffBalance.uncertainty_reason || "本次订单支付通道不能代表账号余额";
+        } else {
+          const kind = buffBalance.estimated ? "付款后估算" : (buffBalance.stale ? "缓存" : "已更新");
+          buffBalanceMeta.textContent = `${kind} · ${updated}`;
+          buffBalanceMeta.removeAttribute("title");
+        }
+      }
+    }
   } catch {
+  }
+}
+
+async function refreshBuffBalance() {
+  const button = el("btn-refresh-buff-balance");
+  if (button?.disabled) return;
+  if (button) {
+    button.disabled = true;
+    button.classList.add("is-loading");
+  }
+  try {
+    const result = await fetchJson(API + "/buff/balance/refresh", { method: "POST" });
+    if (!result.ok) throw new Error(result.error || "暂时无法读取 BUFF 可用资金");
+    const balance = result.buff_balance?.balance;
+    await refreshStatus();
+    toast(
+      "BUFF 可用资金已更新",
+      balance == null ? "已完成查询" : `当前 ¥${Number(balance).toFixed(2)}`,
+    );
+  } catch (e) {
+    toast("BUFF 余额刷新失败", e.message || "请稍后重试");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.classList.remove("is-loading");
+    }
   }
 }
 let reloginType = "steam";
@@ -278,10 +339,34 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
       if (it.cooldown_at_iso) {
         const d = new Date(it.cooldown_at_iso);
         if (!isNaN(d.getTime())) {
-          displayTime = d.toLocaleString();
+          displayTime = formatInventoryUnlockTime(d);
         }
       }
       const timeHtml = displayTime ? `<span class="text-bad">${escapeHtml(displayTime)}</span>` : "—";
+      const statusText = it.cooldown_text || "";
+      const cooldownAt = Number(it.cooldown_at) || 0;
+      const isCooling = cooldownAt > Date.now() / 1000
+        || (!cooldownAt && /trade-protected/i.test(statusText));
+      let statusLabel = "状态未知";
+      let statusClass = "muted";
+      if (isCooling) {
+        statusLabel = "交易冷却中";
+        statusClass = "status-cell status-pending";
+      } else if (it.can_sell) {
+        statusLabel = "可上架";
+        statusClass = "text-ok";
+      } else if (it.can_trade) {
+        statusLabel = "可交易";
+        statusClass = "text-ok";
+      } else if (!it.marketable) {
+        statusLabel = "不可上架";
+        statusClass = "text-bad";
+      } else if (!it.tradable) {
+        statusLabel = "不可交易";
+        statusClass = "text-bad";
+      }
+      const statusHtml = `<span class="${statusClass}">${escapeHtml(statusLabel)}</span>`
+        + (statusText ? `<br><span class="muted small">${escapeHtml(statusText)}</span>` : "");
       const lowest = Number(it.lowest_price) || 0;
       totalValue += lowest;
       const lowestStr = lowest > 0 ? lowest.toFixed(2) : "—";
@@ -302,7 +387,7 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
         <td>${tradeHtml}</td>
         <td>${timeHtml}</td>
         <td class="mono">${escapeHtml(lowestStr)}</td>
-        <td class="muted small">${escapeHtml(it.cooldown_text || "")}</td></tr>
+        <td>${statusHtml}</td></tr>
       `);
     }
     tbody.innerHTML = rowHtmls.join("");
@@ -560,6 +645,7 @@ function bindEvents() {
       .catch((e) => toast("保存失败", e.message || "请稍后再试"))
   );
   el("btn-refresh-inventory")?.addEventListener("click", () => refreshInventory(true, false));
+  el("btn-refresh-buff-balance")?.addEventListener("click", refreshBuffBalance);
   el("btn-sync-receipts")?.addEventListener("click", () => syncReceiptStatus(true));
   el("btn-refresh-holdings-prices")?.addEventListener("click", () => refreshMarketPrices(true));
   el("btn-refresh-all-holdings")?.addEventListener("click", refreshAllHoldings);
@@ -624,6 +710,7 @@ function bindEvents() {
   el("btn-toggle-scroll")?.addEventListener("click", toggleAutoScroll);
   el("btn-download-log")?.addEventListener("click", downloadLog);
   el("btn-export-log")?.addEventListener("click", exportLog);
+  el("btn-export-round-summary")?.addEventListener("click", exportRoundSummary);
   el("log-search")?.addEventListener("input", () => renderLogFull());
   el("log-level")?.addEventListener("change", () => renderLogFull());
   el("cfg-verbose-debug")?.addEventListener("change", async () => {

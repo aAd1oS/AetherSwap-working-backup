@@ -103,3 +103,20 @@ def test_range_inventory_refresh_seconds_too_short_is_lifted_to_ten_minutes():
         result = _validate_ranges(cfg)
     assert result["inventory"]["refresh_seconds"] == 600
     assert any("inventory.refresh_seconds" in str(w.message) for w in caught)
+
+
+def test_invalid_buff_payment_modes_are_replaced_with_safe_defaults():
+    cfg = merge(DEFAULTS, {
+        "buff": {
+            "pay_method": "unknown-auto-pay",
+            "balance_fallback_method": "crypto",
+        }
+    })
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _validate_ranges(cfg)
+
+    assert result["buff"]["pay_method"] == "alipay"
+    assert result["buff"]["balance_fallback_method"] == "wechat"
+    assert len(caught) >= 2
