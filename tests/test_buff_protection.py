@@ -175,7 +175,10 @@ def test_candidate_filter_caps_normal_and_manual_recovery_modes():
         )
         for index in range(40)
     ]
-    config = {"pipeline": {"iflow_top_n": 50, "exclude_keywords": []}, "iflow": {"sort_by": "sell"}}
+    config = {
+        "pipeline": {"iflow_top_n": 50, "exclude_keywords": []},
+        "iflow": {"sort_by": "sell", "min_volume": 0},
+    }
 
     assert len(filter_iflow_rows(rows, config)) == 30
     get_buff_request_protection().mark_manual_cookie_updated()

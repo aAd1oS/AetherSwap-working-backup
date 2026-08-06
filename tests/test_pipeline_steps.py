@@ -11,6 +11,7 @@ from app.pipeline_steps import (
     _adjust_ref_price_for_daily_high,
     _compute_sell_pressure_from_orders,
     filter_iflow_rows,
+    pick_stable_item,
 )
 
 
@@ -121,10 +122,159 @@ def test_过滤_topN限制数量():
     assert len(result) <= 5
 
 
+def test_filter_excludes_previous_round_before_candidate_cap():
+    rows = [
+        _行(
+            name=f"Item {index}",
+            platform=f"https://buff.163.com/goods/{1000 + index}",
+        )
+        for index in range(10)
+    ]
+    cfg = {
+        **_基础配置,
+        "pipeline": {**_基础配置["pipeline"], "iflow_top_n": 5},
+    }
+
+    result = filter_iflow_rows(
+        rows,
+        cfg,
+        exclude_goods_ids={1000, 1001, 1002, 1003, 1004},
+    )
+
+    assert [row["goods_id"] for row in result] == [1005, 1006, 1007, 1008, 1009]
+
+
+def test_filter_applies_local_rejections_before_candidate_cap():
+    rows = [
+        _行(
+            name=f"blocked {index}",
+            platform=f"https://buff.163.com/goods/{1100 + index}",
+        )
+        for index in range(5)
+    ] + [
+        _行(
+            name=f"Eligible {index}",
+            platform=f"https://buff.163.com/goods/{1200 + index}",
+        )
+        for index in range(5)
+    ]
+    cfg = {
+        "pipeline": {"exclude_keywords": ["blocked"], "iflow_top_n": 5},
+        "iflow": {"sort_by": "sell", "min_volume": 200},
+    }
+
+    result = filter_iflow_rows(rows, cfg)
+
+    assert [row["goods_id"] for row in result] == [1200, 1201, 1202, 1203, 1204]
+
+
 def test_过滤_goods_id从url解析():
     rows = [_行(platform="https://buff.163.com/goods/98765")]
     result = filter_iflow_rows(rows, _基础配置)
     assert result[0]["goods_id"] == 98765
+
+
+def test_过滤_本地再次执行最低成交量门槛():
+    rows = [
+        _行(name="成交量不足", volume="199"),
+        _行(name="刚好达标", volume="200"),
+        _行(name="成交量更高", volume="500"),
+    ]
+    cfg = {
+        **_基础配置,
+        "iflow": {**_基础配置["iflow"], "min_volume": 200},
+    }
+
+    result = filter_iflow_rows(rows, cfg)
+
+    assert [row["name"] for row in result] == ["刚好达标", "成交量更高"]
+
+
+def test_过滤_未显式配置成交量时使用默认门槛200():
+    rows = [
+        _行(name="默认门槛未达标", volume="199"),
+        _行(name="默认门槛达标", volume="200"),
+    ]
+
+    result = filter_iflow_rows(rows, _基础配置)
+
+    assert [row["name"] for row in result] == ["默认门槛达标"]
+
+
+def test_过滤_成交量缺失或异常时按零处理并拒绝():
+    rows = [
+        _行(name="缺失成交量", volume=None),
+        _行(name="异常成交量", volume="unknown"),
+    ]
+    cfg = {
+        **_基础配置,
+        "iflow": {**_基础配置["iflow"], "min_volume": 200},
+    }
+
+    assert filter_iflow_rows(rows, cfg) == []
+
+
+def test_过滤_最低成交量设为零时关闭本地门槛():
+    rows = [_行(name="零成交量", volume="0")]
+    cfg = {
+        **_基础配置,
+        "iflow": {**_基础配置["iflow"], "min_volume": 0},
+    }
+
+    result = filter_iflow_rows(rows, cfg)
+
+    assert [row["name"] for row in result] == ["零成交量"]
+
+
+def test_过滤_最低成交量配置异常时安全回退到200():
+    rows = [
+        _行(name="异常配置下未达标", volume="199"),
+        _行(name="异常配置下达标", volume="200"),
+    ]
+    cfg = {
+        **_基础配置,
+        "iflow": {**_基础配置["iflow"], "min_volume": "invalid"},
+    }
+
+    result = filter_iflow_rows(rows, cfg)
+
+    assert [row["name"] for row in result] == ["异常配置下达标"]
+
+
+def test_pick_records_only_candidates_that_reach_precheck(monkeypatch):
+    filtered = [
+        {"goods_id": 1, "name": "Previous round", "min_price": 2.0, "daily_volume": 500},
+        {"goods_id": 2, "name": "Rejected now", "min_price": 2.1, "daily_volume": 500},
+        {"goods_id": 3, "name": "Selected now", "min_price": 2.2, "daily_volume": 500},
+    ]
+    attempted = set()
+
+    monkeypatch.setattr(
+        "app.pipeline_steps.is_strategy_module_enabled",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        "app.pipeline_steps._fetch_steam_sell_data",
+        lambda *_args, **_kwargs: {"smart_price": 3.0, "sell_orders": []},
+    )
+    monkeypatch.setattr(
+        "app.pipeline_steps._passes_custom_buy_modules",
+        lambda item, *_args, **_kwargs: item["goods_id"] == 3,
+    )
+
+    chosen, failed = pick_stable_item(
+        filtered,
+        {"stability": {"request_interval_seconds": 0}},
+        object(),
+        object(),
+        lambda: False,
+        exclude_goods_ids={1},
+        attempted_goods_ids=attempted,
+    )
+
+    assert chosen["goods_id"] == 3
+    assert failed == {2}
+    assert attempted == {2, 3}
 
 
 def _steam_history_rows(prices):

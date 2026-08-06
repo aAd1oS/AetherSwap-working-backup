@@ -107,6 +107,8 @@ def reconcile_orders_from_local_records() -> dict:
 
     changed = 0
     for order in db_get_purchase_orders():
+        if order.get("status") in {"cancelled", "refunded", "failed"}:
+            continue
         order_id = str(order.get("external_order_id") or "")
         records = grouped.get(order_id) or []
         if not records:

@@ -11,7 +11,7 @@ def send_pushplus(token: str, title: str, content: str, template: str = "html") 
         return False
     try:
         r = requests.post(
-            "http://www.pushplus.plus/send",
+            "https://www.pushplus.plus/send",
             json={"token": token.strip(), "title": title, "content": content, "template": template},
             timeout=10,
         )

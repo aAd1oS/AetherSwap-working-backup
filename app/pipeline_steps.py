@@ -302,21 +302,28 @@ def filter_iflow_rows(
     rows: List[Any],
     config: dict,
     log_fn: Optional[Callable[[str, str], None]] = None,
+    exclude_goods_ids: Optional[Set[int]] = None,
 ) -> List[Dict[str, Any]]:
     pipeline_cfg = config.get("pipeline", {})
     iflow_cfg = config.get("steamdt") or config.get("iflow", {})
     exclude = pipeline_cfg.get("exclude_keywords", [])
+    try:
+        min_volume = max(0, int(float(iflow_cfg.get("min_volume", 200) or 0)))
+    except (TypeError, ValueError):
+        min_volume = 200
     configured_top_n = int(pipeline_cfg.get("iflow_top_n", 0) or 0)
     safety_cap = get_buff_request_protection().effective_candidate_cap()
     top_n = min(configured_top_n, safety_cap) if configured_top_n > 0 else safety_cap
-    rows = rows[:top_n]
+    excluded = exclude_goods_ids or set()
     sort_by = (iflow_cfg.get("sort_by") or "sell").strip()
     ratio_attr = _RATIO_ATTR.get(sort_by, "sell_ratio")
     steam_client = SteamClient()
     filtered = []
     skipped_keyword = 0
     skipped_price = 0
+    skipped_low_volume = 0
     skipped_no_buff = 0
+    skipped_cooldown = 0
     for r in rows:
         name = (getattr(r, "name", None) or "").lower()
         name_cn = (getattr(r, "name_cn", None) or "").lower()
@@ -339,6 +346,9 @@ def filter_iflow_rows(
         if gid <= 0:
             skipped_no_buff += 1
             continue
+        if gid in excluded:
+            skipped_cooldown += 1
+            continue
         steam_link = getattr(r, "steam_link", None) or ""
         steam_market_name = steam_client.market_hash_name_from_listing_url(
             steam_link
@@ -347,6 +357,9 @@ def filter_iflow_rows(
             vol = int(getattr(r, "volume", "0") or 0)
         except (ValueError, TypeError):
             vol = 0
+        if min_volume > 0 and vol < min_volume:
+            skipped_low_volume += 1
+            continue
         filtered.append({
             "name": getattr(r, "name", ""),
             "min_price": price,
@@ -357,9 +370,17 @@ def filter_iflow_rows(
             "ratio": ratio_val,
             "daily_volume": vol,
         })
+    eligible_count = len(filtered)
+    if top_n > 0:
+        filtered = filtered[:top_n]
     if log_fn:
-        parts = [f"排除关键词={skipped_keyword}", f"价格无效={skipped_price}"]
-        parts.append(f"取前{top_n}条")
+        parts = [
+            f"排除关键词={skipped_keyword}",
+            f"价格无效={skipped_price}",
+            f"成交量不足(<{min_volume})={skipped_low_volume}" if min_volume > 0 else "成交量门槛=关闭",
+            f"轮冷却排除={skipped_cooldown}",
+        ]
+        parts.append(f"合格{eligible_count}条后取前{top_n}条")
         parts.extend([f"非Buff链接={skipped_no_buff}", f"→ 通过 {len(filtered)} 条"])
         log_fn(f"[筛选] {' '.join(parts)}", "info")
     return filtered
@@ -508,6 +529,7 @@ def pick_stable_item(
     log_fn: Optional[Callable[[str, str], None]] = None,
     exclude_goods_ids: Optional[set] = None,
     buff_client: Optional[Any] = None,
+    attempted_goods_ids: Optional[Set[int]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Set[int]]:
     # 遍历候选饰品，返回第一个通过所有检测的
     # 检测顺序: Buff价格预检 → Steam卖单 → 卖压 → 最高折扣 → 历史稳定性
@@ -540,6 +562,8 @@ def pick_stable_item(
         gid = item.get("goods_id")
         if gid is not None and gid in excluded:
             continue
+        if attempted_goods_ids is not None and gid is not None:
+            attempted_goods_ids.add(gid)
         if i > 0 and request_interval > 0:
             jittered_sleep(request_interval)
         name = item.get("name", "")
@@ -878,12 +902,12 @@ def _do_payment_notify_and_wait(
             "status": "user_confirmed",
             "user_confirmed_at": time.time(),
             "error": None,
-        })
+        }, expected_statuses={"awaiting_payment"})
     else:
         db_update_purchase_order(order_id, {
             "status": "payment_unconfirmed",
             "error": "用户取消、等待超时或程序停止，需人工核对平台订单",
-        })
+        }, expected_statuses={"awaiting_payment"})
     if log_fn:
         log_fn(f"[Buff]   → 用户确认={'成功' if ok else '取消/失败'}", "info")
     return ok
@@ -1218,7 +1242,7 @@ def _execute_balance_purchase(
         db_update_purchase_order(order_id, {
             "status": "payment_unconfirmed",
             "error": reason,
-        })
+        }, expected_statuses={"awaiting_payment"})
         if log_fn:
             log_fn(f"[Buff余额] {reason}", "error")
         return PAYMENT_REVIEW_REQUIRED
@@ -1248,7 +1272,7 @@ def _execute_balance_purchase(
         "status": "awaiting_ship",
         "paid_at": time.time(),
         "error": None,
-    })
+    }, expected_statuses={"awaiting_payment"})
     from app.services.buff_balance import record_confirmed_buff_spend
     record_confirmed_buff_spend(unit_price)
     if log_fn:
@@ -1297,6 +1321,10 @@ def lock_and_confirm_payment(
             log_fn(f"[Buff]   → 无法获取 Buff 卖单信息：{reason}，跳过本件", "warn")
         return None
     lowest_price, count_at_lowest = count_lowest_price_orders(orders)
+    if lowest_price <= 0 or count_at_lowest <= 0:
+        if log_fn:
+            log_fn("[Buff]   → 卖单价格无效或缺失，跳过本件", "warn")
+        return None
     if log_fn:
         log_fn(f"[Buff]   → 最低价={lowest_price:.2f} 同价数量={count_at_lowest} 参考价={plan_price} 容忍={tolerance} 累计={acc:.2f} 目标={target_balance}", "info")
     if acc + lowest_price > target_balance:

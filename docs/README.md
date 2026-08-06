@@ -4,7 +4,7 @@
 
 适用项目目录：`D:\Vibe Coding\steam`
 
-最后整理：2026-08-05
+最后整理：2026-08-06
 
 > 本目录只保存说明文档。Steam Cookie、BUFF Cookie、PushPlus Token、邮箱授权码、`shared_secret`、`identity_secret` 和 `.maFile` 都不得写进文档或提交到 GitHub。
 
@@ -46,6 +46,7 @@
 - 日志：`log/`
 - PushPlus：本项目引导要求配置，Token 只保存在本地配置中
 - 代理池：默认可关闭，实际 Steam 路由由当前网络环境和项目路由逻辑决定
+- 当前完整测试：`245 passed`
 
 ## 当前主要操作流程
 

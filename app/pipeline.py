@@ -275,7 +275,12 @@ def _emit_round_summary(
     )
 
 
-def _fetch_and_filter_deals(ctx: PipelineContext, cfg: dict, retry_interval: int):
+def _fetch_and_filter_deals(
+    ctx: PipelineContext,
+    cfg: dict,
+    retry_interval: int,
+    exclude_goods_ids=None,
+):
     ctx.set_status("running", "FETCHING_DEALS", progress_total=0, progress_done=0, progress_item="")
     ctx.log("正在拉取 SteamDT 数据…", "info", category="steamdt")
     try:
@@ -301,7 +306,12 @@ def _fetch_and_filter_deals(ctx: PipelineContext, cfg: dict, retry_interval: int
         for i, r in enumerate(rows[:20]):
             nm = (getattr(r, "name", None) or "")[:42]
             ctx.debug(f"  {i+1:2}. {nm} | sell={getattr(r, 'sell_ratio', '')} buy={getattr(r, 'buy_ratio', '')}")
-    filtered = filter_iflow_rows(rows, cfg, log_fn=lambda msg, lvl="info": ctx.log(msg, lvl))
+    filtered = filter_iflow_rows(
+        rows,
+        cfg,
+        log_fn=lambda msg, lvl="info": ctx.log(msg, lvl),
+        exclude_goods_ids=exclude_goods_ids,
+    )
     ctx.log(f"筛选后剩余 {len(filtered)} 条", "info")
     if ctx.verbose and filtered:
         ctx.debug(f"[详细流程] 筛选后共 {len(filtered)} 条，顺序不变（前20条）:")
@@ -325,6 +335,7 @@ def _process_deals_for_target(
     skipped_this_round: set,
     stability_failed_this_round: set,
     round_summary: dict,
+    attempted_goods_ids=None,
 ):
     acc = current_acc
     bought = total_bought
@@ -345,6 +356,7 @@ def _process_deals_for_target(
             log_fn=ctx.log,
             exclude_goods_ids=failed_goods_ids | skipped_this_round | stability_failed_this_round,
             buff_client=buyer,
+            attempted_goods_ids=attempted_goods_ids,
         )
         round_summary["scan_attempts"] = int(round_summary.get("scan_attempts") or 0) + len(new_stability_failed)
         _add_round_failure(
@@ -528,6 +540,7 @@ def _run_pipeline(config: dict) -> None:
     analyzer = StabilityAnalyzer(usd_to_cny=USD_TO_CNY_DEFAULT)
     buyer = create_buff_client_from_config(cred_buff, cfg, steam_credentials=steam_credentials)
     failed_goods_ids_ttl: dict = {}
+    previous_round_checked_ids: set = set()
     round_number = 0
 
     while True:
@@ -545,8 +558,31 @@ def _run_pipeline(config: dict) -> None:
 
         round_number += 1
         round_summary = _new_round_summary(round_number, acc)
+        current_round_checked_ids: set = set()
+        advance_round_cooldown = False
         try:
-            filtered, fetch_failed = _fetch_and_filter_deals(ctx, cfg, retry_interval)
+            now_ts = time.time()
+            expired_ids = [gid for gid, exp in failed_goods_ids_ttl.items() if now_ts >= exp]
+            for gid in expired_ids:
+                del failed_goods_ids_ttl[gid]
+            if expired_ids:
+                ctx.log(f"Unblocked {len(expired_ids)} expired failed goods_id", "info", category="pipeline")
+            failed_goods_ids = set(failed_goods_ids_ttl.keys())
+            candidate_exclusions = failed_goods_ids | previous_round_checked_ids
+            if previous_round_checked_ids:
+                ctx.log(
+                    f"[候选轮换] 上一轮实际检查 {len(previous_round_checked_ids)} 件，本轮先行排除",
+                    "info",
+                    category="pipeline",
+                )
+
+            filtered, fetch_failed = _fetch_and_filter_deals(
+                ctx,
+                cfg,
+                retry_interval,
+                exclude_goods_ids=candidate_exclusions,
+            )
+            advance_round_cooldown = not fetch_failed
             round_summary["candidate_count"] = len(filtered or [])
             net = get_network_checker()
             if fetch_failed:
@@ -597,13 +633,6 @@ def _run_pipeline(config: dict) -> None:
                 continue
 
             ctx.log("支付方式与 Buff 客户端已就绪", "info", category="buff")
-            now_ts = time.time()
-            expired_ids = [gid for gid, exp in failed_goods_ids_ttl.items() if now_ts >= exp]
-            for gid in expired_ids:
-                del failed_goods_ids_ttl[gid]
-            if expired_ids:
-                ctx.log(f"Unblocked {len(expired_ids)} expired failed goods_id", "info", category="pipeline")
-            failed_goods_ids = set(failed_goods_ids_ttl.keys())
 
             acc, total_bought, stopped = _process_deals_for_target(
                 ctx, filtered, cfg, target, acc, total_bought,
@@ -612,6 +641,7 @@ def _run_pipeline(config: dict) -> None:
                 set(),
                 set(),
                 round_summary,
+                attempted_goods_ids=current_round_checked_ids,
             )
             if stopped:
                 _emit_round_summary(
@@ -685,6 +715,9 @@ def _run_pipeline(config: dict) -> None:
             ctx.log(f"Buff 需要刷新页面状态或完成人机验证: {reason}", "error", category="buff")
             ctx.set_status("error", "BUFF_VERIFICATION_REQUIRED")
             return
+        finally:
+            if advance_round_cooldown:
+                previous_round_checked_ids = set(current_round_checked_ids)
 
     ctx.set_status("running", "STEAM_COOLDOWN")
     ctx.log("买入阶段完成", "info")

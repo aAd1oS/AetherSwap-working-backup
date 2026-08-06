@@ -61,3 +61,25 @@ def test_purchase_status_prefers_terminal_and_inventory_states():
         "order_status": "awaiting_trade",
     }) == "awaiting_trade"
     assert order_state.derive_purchase_status({"assetid": "1"}) == "received"
+
+
+def test_reconcile_does_not_revive_terminal_order(monkeypatch):
+    updates = []
+    monkeypatch.setattr(order_state, "db_get_purchases", lambda: [{
+        "external_order_id": "cancelled-1",
+        "assetid": "123",
+    }])
+    monkeypatch.setattr(order_state, "db_get_purchase_orders", lambda: [{
+        "external_order_id": "cancelled-1",
+        "status": "cancelled",
+    }])
+    monkeypatch.setattr(
+        order_state,
+        "db_update_purchase_order",
+        lambda *args, **kwargs: updates.append((args, kwargs)) or True,
+    )
+
+    result = order_state.reconcile_orders_from_local_records()
+
+    assert result["changed"] == 0
+    assert updates == []

@@ -230,11 +230,19 @@ def api_cancel_unresolved_order(external_order_id: str):
         return {"ok": False, "error": "订单不存在"}
     if order.get("status") not in BLOCKING_PAYMENT_STATUSES:
         return {"ok": False, "error": "该订单当前不是待支付或待核对状态"}
+    if order.get("status") == "user_confirmed":
+        return {"ok": False, "error": "该订单已确认付款，不能直接取消；请先核对 BUFF 订单状态"}
+    if order.get("source") == "buff_balance" and order.get("status") == "awaiting_payment":
+        return {"ok": False, "error": "余额订单正在自动扣款，当前不能取消；请等待结果明确后再处理"}
+    expected_status = str(order.get("status") or "")
     ok = db_update_purchase_order(external_order_id, {
         "status": "cancelled",
         "error": "用户在确认平台订单已取消后手动解除阻断",
-    })
-    return {"ok": ok}
+    }, expected_statuses={expected_status})
+    return {
+        "ok": ok,
+        "error": None if ok else "订单状态刚刚发生变化，请刷新后重新核对",
+    }
 
 @router.post("/api/order/{external_order_id}/replace-paid")
 def api_replace_cancelled_order_with_paid_order(

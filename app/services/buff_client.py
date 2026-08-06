@@ -14,20 +14,18 @@ buff_retry_attempts = 2
 def count_lowest_price_orders(orders: List[dict]) -> Tuple[float, int]:
     if not orders:
         return 0.0, 0
-    lowest = float(orders[0].get("price", 0))
-    if lowest <= 0:
-        return 0.0, 0
-    count = 0
+    valid_prices = []
     for o in orders:
         try:
             p = float(o.get("price", 0))
         except (ValueError, TypeError):
             continue
-        if abs(p - lowest) < 1e-6:
-            count += 1
-        elif p < lowest:
-            lowest = p
-            count = 1
+        if p > 0:
+            valid_prices.append(p)
+    if not valid_prices:
+        return 0.0, 0
+    lowest = min(valid_prices)
+    count = sum(1 for price in valid_prices if abs(price - lowest) < 1e-6)
     return lowest, count
 def first_order_at_price(orders: List[dict], price: float) -> Optional[dict]:
     for o in orders:

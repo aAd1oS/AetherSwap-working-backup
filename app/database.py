@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 from sqlmodel import Field, Session, SQLModel, create_engine, select
+from sqlalchemy import update as sql_update
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 _DB_PATH = _CONFIG_DIR / "app.db"
 _TRANSACTIONS_JSON = _CONFIG_DIR / "transactions.json"
@@ -321,21 +322,30 @@ def db_upsert_purchase_order(order: dict) -> dict:
             "total_price": row.total_price,
         }
 
-def db_update_purchase_order(external_order_id: str, data: dict) -> bool:
+def db_update_purchase_order(
+    external_order_id: str,
+    data: dict,
+    expected_statuses: Optional[set[str]] = None,
+) -> bool:
     import time
     with get_session() as session:
-        row = session.exec(
-            select(PurchaseOrder).where(PurchaseOrder.external_order_id == str(external_order_id))
-        ).first()
-        if row is None:
-            return False
-        for key in ("status", "user_confirmed_at", "paid_at", "received_at", "error"):
-            if key in data:
-                setattr(row, key, data[key])
-        row.updated_at = time.time()
-        session.add(row)
+        values = {
+            key: data[key]
+            for key in ("status", "user_confirmed_at", "paid_at", "received_at", "error")
+            if key in data
+        }
+        values["updated_at"] = time.time()
+        statement = sql_update(PurchaseOrder).where(
+            PurchaseOrder.external_order_id == str(external_order_id)
+        )
+        if expected_statuses is not None:
+            normalized = {str(status) for status in expected_statuses}
+            if not normalized:
+                return False
+            statement = statement.where(PurchaseOrder.status.in_(normalized))
+        result = session.exec(statement.values(**values))
         session.commit()
-        return True
+        return bool(result.rowcount)
 
 def db_replace_cancelled_order_with_paid_purchase(
     old_external_order_id: str,

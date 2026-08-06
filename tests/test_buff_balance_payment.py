@@ -475,7 +475,9 @@ def _run_balance_helper(monkeypatch, client):
     monkeypatch.setattr(
         pipeline_steps,
         "db_update_purchase_order",
-        lambda order_id, data: updates.append((order_id, dict(data))) or True,
+        lambda order_id, data, expected_statuses=None: updates.append(
+            (order_id, dict(data), expected_statuses)
+        ) or True,
     )
     result = pipeline_steps._execute_balance_purchase(
         client,
@@ -503,6 +505,7 @@ def test_balance_payment_persists_order_before_single_payment(monkeypatch):
     assert upserts[0]["external_order_id"] == "bill-1"
     assert upserts[0]["source"] == "buff_balance"
     assert updates[-1][1]["status"] == "awaiting_ship"
+    assert updates[-1][2] == {"awaiting_payment"}
     assert len(purchases) == 1
     assert purchases[0]["price"] == pytest.approx(2.27)
     assert purchases[0]["market_price"] == pytest.approx(3.75)
