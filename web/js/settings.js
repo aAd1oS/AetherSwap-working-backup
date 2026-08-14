@@ -4,8 +4,18 @@ let inventoryTimer = null;
 let currentPriceRefreshMinutes = 10;
 let currentPriceTimer = null;
 async function loadConfig() {
-  const d = await fetchJson(API + "/config");
+  const [d, accountsData] = await Promise.all([
+    fetchJson(API + "/config"),
+    fetchJson(API + "/accounts").catch(() => ({ accounts: [], current_id: null })),
+  ]);
   const c = d.config || {};
+  const currentAccount = (accountsData.accounts || []).find((item) => item.id === accountsData.current_id);
+  const accountLabel = el("cfg-steam-account-label");
+  if (accountLabel) {
+    const name = currentAccount?.display_name || currentAccount?.username || currentAccount?.steam_id || "未选择账号";
+    const steamId = currentAccount?.steam_id ? ` · ${currentAccount.steam_id}` : "";
+    accountLabel.textContent = `当前账号：${name}${steamId}（下方令牌仅属于此账号）`;
+  }
   const i = c.iflow || {};
   const b = c.buff || {};
   const p = c.pipeline || {};

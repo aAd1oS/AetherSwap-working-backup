@@ -93,6 +93,8 @@ def derive_purchase_status(purchase: dict) -> str:
         tradable_at = float(purchase.get("tradable_at") or 0)
         if tradable_at > datetime.now().timestamp():
             return "trade_locked"
+        if not tradable_at and purchase.get("order_status") == "trade_locked":
+            return "trade_locked"
         return "received"
     return purchase.get("order_status") or "needs_review"
 

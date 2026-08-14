@@ -29,3 +29,12 @@ def test_browser_relogin_defers_inventory_and_profile_requests():
     browser_worker = auth_source[start:end]
     assert "fetch_steam_profile_via_api" not in browser_worker
     assert "steamcommunity.com/my/" in browser_worker
+
+
+def test_current_account_has_explicit_steam_relogin_entry():
+    source = (ROOT / "web" / "js" / "accounts.js").read_text(encoding="utf-8")
+
+    assert 'id="btn-acc-relogin"' in source
+    assert "更新 Steam 信息" in source
+    assert 'showReloginModal("steam")' in source
+    assert 'el("relogin-btn-open")' in source

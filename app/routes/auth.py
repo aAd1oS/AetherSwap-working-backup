@@ -85,6 +85,28 @@ def _cookie_header_from_browser(cookies: list) -> str:
         if name:
             pieces.append(f"{name}={value}")
     return "; ".join(pieces)
+
+
+def _select_steam_browser_cookies(cookies: list) -> list:
+    """Merge Steam domains while preferring Community values for duplicate names."""
+    steam_cookies = [
+        cookie for cookie in (cookies or [])
+        if "steamcommunity" in str(cookie.get("domain") or "").lower()
+        or "steampowered" in str(cookie.get("domain") or "").lower()
+    ]
+    selected = {}
+    for cookie in steam_cookies:
+        name = str(cookie.get("name") or "").strip().lower()
+        if name:
+            selected.setdefault(name, cookie)
+    for cookie in steam_cookies:
+        domain = str(cookie.get("domain") or "").lower()
+        name = str(cookie.get("name") or "").strip().lower()
+        if name and "steamcommunity" in domain:
+            selected[name] = cookie
+    return list(selected.values())
+
+
 def _has_browser_cookie(cookies: list, name: str) -> bool:
     wanted = name.lower()
     return any(
@@ -212,7 +234,7 @@ def _maybe_resume_after_buff_cookie_update() -> None:
                 log(f"自动恢复流水线失败: {resume_err}", "warn", category="system")
     except Exception as resume_err:
         log(f"Buff Cookie 更新后的恢复检查失败: {resume_err}", "warn", category="system")
-def _relogin_worker(relogin_type: str) -> None:
+def _relogin_worker(relogin_type: str, steam_account_id: Optional[str] = None) -> None:
     global _relogin_playwright, _relogin_browser, _relogin_context, _relogin_error, _relogin_success
     p = None
     context = None
@@ -222,7 +244,7 @@ def _relogin_worker(relogin_type: str) -> None:
         p = sync_playwright().start()
         if relogin_type == "steam":
             cur = get_current_account()
-            profile_dir = get_profile_dir(cur.get("id") if cur else None)
+            profile_dir = get_profile_dir(steam_account_id or (cur.get("id") if cur else None))
         else:
             profile_dir = Path(__file__).resolve().parent.parent.parent / "config" / "playwright_buff"
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -253,12 +275,7 @@ def _relogin_worker(relogin_type: str) -> None:
                     pass
             cookies = context.cookies()
             if relogin_type == "steam":
-                community_cookies = [
-                    c for c in cookies
-                    if "steamcommunity.com" in (c.get("domain") or "")
-                ]
-                steam_cookies = [c for c in cookies if "steamcommunity" in (c.get("domain") or "") or "steampowered" in (c.get("domain") or "")]
-                selected = community_cookies or steam_cookies or cookies
+                selected = _select_steam_browser_cookies(cookies) or cookies
                 has_secure = _has_browser_cookie(selected, "steamLoginSecure")
                 cookie_str = _cookie_header_from_browser(selected)
                 session_id = next((c["value"] for c in selected if c.get("name") == "sessionid"), None) or next((c["value"] for c in cookies if c.get("name") == "sessionid"), None)
@@ -276,10 +293,15 @@ def _relogin_worker(relogin_type: str) -> None:
                             elif "||" in v:
                                 steam_id = v.split("||")[0].strip()
                             break
-                    update_steam_creds(cookie_str, session_id, steam_id or None)
-                    cur = get_current_account()
-                    if cur and steam_id:
-                        update_account(cur["id"], steam_id=steam_id)
+                    target_account_id = steam_account_id or ((get_current_account() or {}).get("id"))
+                    update_steam_creds(
+                        cookie_str,
+                        session_id,
+                        steam_id or None,
+                        account_id=target_account_id,
+                    )
+                    if target_account_id and steam_id:
+                        update_account(target_account_id, steam_id=steam_id)
             else:
                 cookie_str = _cookie_header_from_browser(cookies)
                 if not _has_browser_cookie(cookies, "session"):
@@ -353,7 +375,14 @@ def _relogin_start(relogin_type: str):
     _relogin_ready.clear()
     _relogin_done.clear()
     _relogin_wake.clear()
-    t = threading.Thread(target=_relogin_worker, args=(relogin_type,), daemon=True)
+    steam_account_id = None
+    if relogin_type == "steam":
+        steam_account_id = str((get_current_account() or {}).get("id") or "") or None
+    t = threading.Thread(
+        target=_relogin_worker,
+        args=(relogin_type, steam_account_id),
+        daemon=True,
+    )
     t.start()
     if not _relogin_ready.wait(timeout=60):
         return {"ok": False, "error": "打开浏览器超时"}

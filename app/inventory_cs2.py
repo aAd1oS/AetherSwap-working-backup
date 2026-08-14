@@ -2,7 +2,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from config import get_steam
+from app.config_loader import get_steam_credentials
 from steam.inventory import CS2_APP_ID, fetch_cs2_inventory
 from steam.session import create_market_session
 def _safe_iso(ts: float) -> Optional[str]:
@@ -17,7 +17,14 @@ def _parse_cooldown(owner_descriptions: List[dict]) -> Tuple[str, float]:
     ts = 0.0
     for d in owner_descriptions or []:
         val = d.get("value") or ""
-        if "trade-protected" not in val:
+        lowered = val.lower()
+        if not any(marker in lowered for marker in (
+            "trade-protected",
+            "tradable after",
+            "cannot be traded until",
+            "cannot be transferred until",
+            "[date]",
+        )):
             continue
         text = val
         date_tag = re.search(r"\[date\]\s*(\d{9,13})\s*\[/date\]", val, re.IGNORECASE)
@@ -30,7 +37,7 @@ def _parse_cooldown(owner_descriptions: List[dict]) -> Tuple[str, float]:
             except (OSError, OverflowError, TypeError, ValueError):
                 ts = 0.0
             break
-        m = re.search(r"until (.+?) GMT", val)
+        m = re.search(r"(?:until|tradable after)\s+(.+?)\s+GMT", val, re.IGNORECASE)
         if not m:
             break
         raw = m.group(1)
@@ -42,8 +49,21 @@ def _parse_cooldown(owner_descriptions: List[dict]) -> Tuple[str, float]:
             ts = 0.0
         break
     return text, ts
+
+
+def _parse_wear(description: dict, market_hash_name: str) -> str:
+    for row in description.get("descriptions") or []:
+        if row.get("name") != "exterior_wear":
+            continue
+        value = re.sub(r"<[^>]+>", "", str(row.get("value") or "")).strip()
+        if ":" in value:
+            value = value.split(":", 1)[1].strip()
+        if value:
+            return value
+    match = re.search(r"\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)\s*$", market_hash_name)
+    return match.group(1) if match else ""
 def scan_cs2_inventory() -> Tuple[bool, List[Dict[str, Any]], str]:
-    cred = get_steam()
+    cred = get_steam_credentials()
     steam_id = cred.get("steam_id")
     cookies = cred.get("cookies")
     if not steam_id or not cookies:
@@ -74,12 +94,14 @@ def scan_cs2_inventory() -> Tuple[bool, List[Dict[str, Any]], str]:
         tradable = int(desc.get("tradable", 0))
         owner_desc = desc.get("owner_descriptions") or []
         cd_text, cd_ts = _parse_cooldown(owner_desc)
+        wear = _parse_wear(desc, market_hash_name)
         can_trade = tradable == 1 and (not cd_ts or now >= cd_ts)
         can_sell = marketable == 1 and can_trade
         items.append(
             {
                 "name": name,
                 "market_hash_name": market_hash_name,
+                "wear": wear,
                 "assetid": str(asset.get("assetid", "")),
                 "appid": int(asset.get("appid", CS2_APP_ID)),
                 "contextid": str(asset.get("contextid", "")),

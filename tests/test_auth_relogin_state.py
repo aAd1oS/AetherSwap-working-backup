@@ -1,6 +1,7 @@
 import sys
 import types
 import threading
+import requests
 
 
 def test_manual_buff_cookie_requires_session(monkeypatch):
@@ -61,6 +62,72 @@ def test_manual_steam_cookie_saves_locally_without_profile_fetch(monkeypatch):
     assert account_updates == [
         ("account-1", {"steam_id": "76561198000000000"})
     ]
+
+
+def test_steam_browser_cookie_selection_keeps_refresh_and_prefers_community_login():
+    from app.routes import auth
+
+    selected = auth._select_steam_browser_cookies([
+        {
+            "name": "steamLoginSecure",
+            "value": "store-token",
+            "domain": ".steampowered.com",
+        },
+        {
+            "name": "steamRefresh_steam",
+            "value": "refresh-token",
+            "domain": "login.steampowered.com",
+        },
+        {
+            "name": "steamLoginSecure",
+            "value": "community-token",
+            "domain": "steamcommunity.com",
+        },
+        {
+            "name": "sessionid",
+            "value": "community-session",
+            "domain": "steamcommunity.com",
+        },
+        {"name": "unrelated", "value": "ignored", "domain": "example.com"},
+    ])
+    values = {cookie["name"]: cookie["value"] for cookie in selected}
+
+    assert values["steamLoginSecure"] == "community-token"
+    assert values["steamRefresh_steam"] == "refresh-token"
+    assert values["sessionid"] == "community-session"
+    assert "unrelated" not in values
+
+
+def test_steam_auth_cookie_scope_allows_jwt_cookie_replacement():
+    from app.services import steam_auth
+
+    session = requests.Session()
+    steam_auth._load_steam_auth_cookies(
+        session,
+        {
+            "steamLoginSecure": "old-token",
+            "sessionid": "session-value",
+            "steamRefresh_steam": "refresh-value",
+        },
+    )
+    session.cookies.set(
+        "steamLoginSecure",
+        "new-token",
+        domain=".steamcommunity.com",
+        path="/",
+    )
+
+    community_request = session.prepare_request(
+        requests.Request("GET", "https://steamcommunity.com/my/profile")
+    )
+    login_request = session.prepare_request(
+        requests.Request("GET", "https://login.steampowered.com/jwt/refresh")
+    )
+
+    assert community_request.headers["Cookie"].count("steamLoginSecure=") == 1
+    assert "steamLoginSecure=new-token" in community_request.headers["Cookie"]
+    assert "steamRefresh_steam=refresh-value" in login_request.headers["Cookie"]
+    assert "steamLoginSecure=" not in login_request.headers["Cookie"]
 
 
 def test_relogin_finish_surfaces_worker_error(monkeypatch):
@@ -187,10 +254,11 @@ def test_steam_cookie_verification_uses_community_as_source_of_truth(monkeypatch
     sessions = []
 
     class FakeResponse:
-        def __init__(self, status_code=200, url="", text=""):
+        def __init__(self, status_code=200, url="", text="", headers=None):
             self.status_code = status_code
             self.url = url
             self.text = text
+            self.headers = headers or {}
 
     class FakeSession:
         def __init__(self, community_result):
@@ -235,6 +303,252 @@ def test_steam_cookie_verification_uses_community_as_source_of_truth(monkeypatch
         assert reason
         assert steam_auth._verify_steam_cookies_valid("steamLoginSecure=token") is expected_valid
         assert sessions[-1].trust_env is True
+
+
+def test_steam_cookie_verification_accepts_profile_redirect_without_following(monkeypatch):
+    from app.services import steam_auth
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 302
+        url = "https://steamcommunity.com/my/profile"
+        text = ""
+        headers = {"Location": "/profiles/76561198000000000/"}
+
+    class FakeSession:
+        verify = True
+        trust_env = None
+        proxies = {}
+        cookies = {}
+        headers = {}
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setattr(steam_auth, "_configure_steam_session", lambda session: None)
+    monkeypatch.setattr(steam_auth._req, "Session", FakeSession)
+
+    status, reason = steam_auth._check_steam_cookies(
+        "steamLoginSecure=token",
+        "76561198000000000",
+    )
+
+    assert status == "valid"
+    assert "账号主页" in reason
+    assert len(calls) == 1
+    assert calls[0][1]["allow_redirects"] is False
+
+
+def test_steam_cookie_verification_rejects_login_and_unsafe_redirects(monkeypatch):
+    from app.services import steam_auth
+
+    class FakeResponse:
+        status_code = 302
+        url = "https://steamcommunity.com/my/profile"
+        text = ""
+
+        def __init__(self, location):
+            self.headers = {"Location": location}
+
+    class FakeSession:
+        verify = True
+        trust_env = None
+        proxies = {}
+        cookies = {}
+        headers = {}
+
+        def __init__(self, location):
+            self.location = location
+
+        def get(self, url, **kwargs):
+            return FakeResponse(self.location)
+
+    monkeypatch.setattr(steam_auth, "_configure_steam_session", lambda session: None)
+
+    for location, expected in (
+        ("/login/home/", "invalid"),
+        ("https://store.steampowered.com/login/", "invalid"),
+        ("https://example.com/profiles/76561198000000000/", "unavailable"),
+        ("/profiles/76561198000000001/", "invalid"),
+    ):
+        monkeypatch.setattr(steam_auth._req, "Session", lambda target=location: FakeSession(target))
+        status, reason = steam_auth._check_steam_cookies(
+            "steamLoginSecure=token",
+            "76561198000000000",
+        )
+        assert status == expected
+        assert reason
+
+
+def test_steam_cookie_verification_accepts_same_host_http_profile_redirect(monkeypatch):
+    from app.services import steam_auth
+
+    class FakeResponse:
+        status_code = 302
+        url = "https://steamcommunity.com/my/profile"
+        text = ""
+        headers = {"Location": "http://steamcommunity.com/profiles/76561198000000000/"}
+
+    class FakeSession:
+        verify = True
+        trust_env = None
+        proxies = {}
+        cookies = {}
+        headers = {}
+
+        def get(self, url, **kwargs):
+            assert kwargs["allow_redirects"] is False
+            return FakeResponse()
+
+    monkeypatch.setattr(steam_auth, "_configure_steam_session", lambda session: None)
+    monkeypatch.setattr(steam_auth._req, "Session", FakeSession)
+
+    status, reason = steam_auth._check_steam_cookies(
+        "steamLoginSecure=token",
+        "76561198000000000",
+    )
+
+    assert status == "valid"
+    assert "账号主页" in reason
+
+
+def test_steam_cookie_verification_allows_one_bounded_jwt_refresh(monkeypatch):
+    from app.services import steam_auth
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 302
+        text = ""
+
+        def __init__(self, url, location):
+            self.url = url
+            self.headers = {"Location": location}
+
+    class FakeSession:
+        verify = True
+        trust_env = None
+        proxies = {}
+        cookies = {}
+        headers = {}
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            if len(calls) == 1:
+                return FakeResponse(
+                    "https://steamcommunity.com/my/profile",
+                    "https://login.steampowered.com/jwt/refresh?redir=hidden",
+                )
+            if len(calls) == 2:
+                return FakeResponse(
+                    "https://login.steampowered.com/jwt/refresh?redir=hidden",
+                    "https://steamcommunity.com/my/profile",
+                )
+            return FakeResponse(
+                "https://steamcommunity.com/my/profile",
+                "https://steamcommunity.com/profiles/76561198000000000/",
+            )
+
+    monkeypatch.setattr(steam_auth, "_configure_steam_session", lambda session: None)
+    monkeypatch.setattr(steam_auth._req, "Session", FakeSession)
+
+    status, reason = steam_auth._check_steam_cookies(
+        "steamLoginSecure=token",
+        "76561198000000000",
+    )
+
+    assert status == "valid"
+    assert "刷新并验证成功" in reason
+    assert len(calls) == 3
+    assert all(kwargs["allow_redirects"] is False for _, kwargs in calls)
+
+
+def test_steam_cookie_verification_stops_repeated_jwt_refresh(monkeypatch):
+    from app.services import steam_auth
+
+    calls = []
+
+    class FakeResponse:
+        status_code = 302
+        text = ""
+
+        def __init__(self, url):
+            self.url = url
+            self.headers = {"Location": "https://login.steampowered.com/jwt/refresh?redir=hidden"}
+
+    class FakeSession:
+        verify = True
+        trust_env = None
+        proxies = {}
+        cookies = {}
+        headers = {}
+
+        def get(self, url, **kwargs):
+            calls.append(url)
+            if "/market/" in url:
+                response = FakeResponse(url)
+                response.status_code = 200
+                response.headers = {}
+                response.text = 'var g_steamID = "76561198000000000";'
+                return response
+            return FakeResponse(url)
+
+    monkeypatch.setattr(steam_auth, "_configure_steam_session", lambda session: None)
+    monkeypatch.setattr(steam_auth._req, "Session", FakeSession)
+
+    status, reason = steam_auth._check_steam_cookies(
+        "steamLoginSecure=token",
+        "76561198000000000",
+    )
+
+    assert status == "valid"
+    assert "Market 登录态验证通过" in reason
+    assert len(calls) == 3
+
+
+def test_steam_cookie_verification_keeps_loop_unavailable_when_market_is_ambiguous(monkeypatch):
+    from app.services import steam_auth
+
+    calls = []
+
+    class FakeResponse:
+        text = ""
+
+        def __init__(self, url, status_code=302, location=""):
+            self.url = url
+            self.status_code = status_code
+            self.headers = {"Location": location} if location else {}
+
+    class FakeSession:
+        verify = True
+        trust_env = None
+        proxies = {}
+        cookies = {}
+        headers = {}
+
+        def get(self, url, **kwargs):
+            calls.append(url)
+            if "/market/" in url:
+                return FakeResponse(url, status_code=200)
+            return FakeResponse(
+                url,
+                location="https://login.steampowered.com/jwt/refresh?redir=hidden",
+            )
+
+    monkeypatch.setattr(steam_auth, "_configure_steam_session", lambda session: None)
+    monkeypatch.setattr(steam_auth._req, "Session", FakeSession)
+
+    status, reason = steam_auth._check_steam_cookies(
+        "steamLoginSecure=token",
+        "76561198000000000",
+    )
+
+    assert status == "unavailable"
+    assert "刷新出现循环" in reason
+    assert "未返回明确登录状态" in reason
+    assert len(calls) == 3
 
 
 def test_steam_cookie_verification_uses_configured_project_proxy(monkeypatch):

@@ -204,7 +204,17 @@ def api_transactions(enrich_current_price: bool = False):
     resell_ratio = float(cfg.get("resell_ratio", 0.85))
     if resell_ratio <= 0:
         resell_ratio = 0.85
-    return {"transactions": out, "resell_ratio": resell_ratio}
+    from app.accounts import get_current_account
+    account = get_current_account() or {}
+    return {
+        "transactions": out,
+        "resell_ratio": resell_ratio,
+        "account": {
+            "id": account.get("id") or "",
+            "name": account.get("display_name") or account.get("username") or account.get("steam_id") or "未选择账号",
+            "steam_id": account.get("steam_id") or "",
+        },
+    }
 
 @router.get("/api/orders")
 def api_orders():

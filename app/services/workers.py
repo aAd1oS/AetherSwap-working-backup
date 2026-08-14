@@ -239,6 +239,10 @@ def receive_worker() -> None:
             purchases = get_purchases()
             if not any(p.get("pending_receipt") and not p.get("assetid") for p in purchases):
                 continue
+            from app.account_scope import validate_current_account_identity
+            identity_ok, _ = validate_current_account_identity()
+            if not identity_ok:
+                continue
             n = try_receive_once(
                 get_purchases,
                 update_purchase,

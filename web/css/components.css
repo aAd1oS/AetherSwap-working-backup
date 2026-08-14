@@ -1314,7 +1314,33 @@ tr:hover td:first-child {
   height: 3px;
   background: var(--gradient-accent);
   transform-origin: left;
-  animation: progressShrink 3.5s linear forwards;
+  animation: progressShrink var(--toast-duration, 6000ms) linear forwards;
+}
+
+.toast-content {
+  padding-right: 24px;
+}
+
+.toast-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.toast-close:hover {
+  color: var(--text-main);
+  background: var(--bg-hover);
 }
 
 .toast .t {
@@ -1738,6 +1764,30 @@ textarea.app-modal-input {
 .badge.badge-current {
   background: var(--text-main);
   color: var(--text-inverse);
+}
+
+.inventory-ownership-select {
+  min-width: 132px;
+  max-width: 100%;
+  padding: 5px 28px 5px 8px;
+  border: 1px solid var(--border, #303238);
+  border-radius: 6px;
+  background: var(--surface, #17181c);
+  color: inherit;
+  font: inherit;
+}
+
+.inventory-ownership-select:disabled {
+  opacity: 0.65;
+}
+
+.analytics-group-row td {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  background: var(--surface, #17181c);
+  color: var(--text-strong, #f2f3f5);
+  font-weight: 700;
+  border-top: 1px solid var(--border, #303238);
 }
 
 .account-detail {

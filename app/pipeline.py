@@ -485,6 +485,12 @@ def _run_pipeline(config: dict) -> None:
         return
     buff_payment_mode = str((cfg.get("buff") or {}).get("pay_method") or "alipay").strip().lower()
     steam_credentials = get_steam_credentials()
+    from app.account_scope import validate_current_account_identity
+    identity_ok, identity_error = validate_current_account_identity()
+    if not identity_ok:
+        ctx.log(f"账号身份保护: {identity_error}，任务未启动", "error", category="account")
+        ctx.set_status("error", "STEAM_ACCOUNT_IDENTITY_MISMATCH")
+        return
     if buff_payment_mode in {"balance", "balance_first"}:
         if not bool((cfg.get("buff") or {}).get("balance_auto_pay_acknowledged", False)):
             ctx.log("已选择余额自动支付模式，但尚未勾选自动扣款确认；任务未启动", "error", category="config")

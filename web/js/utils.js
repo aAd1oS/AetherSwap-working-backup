@@ -5,18 +5,32 @@ window.RUNTIME_PROFILE = null;
 function el(id) {
   return document.getElementById(id);
 }
-function toast(title, detail = "") {
+function toast(title, detail = "", duration = 6000) {
   const host = el("toast-host");
   if (!host) return;
   const node = document.createElement("div");
   node.className = "toast";
-  node.innerHTML = `<div class="t">${escapeHtml(title)}</div>${detail ? `<div class="d">${escapeHtml(compactErrorText(detail, 220))}</div>` : ""}`;
+  const ttl = Math.max(1200, Number(duration) || 6000);
+  node.style.setProperty("--toast-duration", `${ttl}ms`);
+  node.innerHTML = `
+    <div class="toast-content">
+      <div class="t">${escapeHtml(title)}</div>
+      ${detail ? `<div class="d">${escapeHtml(compactErrorText(detail, 220))}</div>` : ""}
+    </div>
+    <button type="button" class="toast-close" aria-label="关闭提示" title="关闭">×</button>`;
   host.appendChild(node);
-  const ttl = 3500;
-  setTimeout(() => {
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
     node.classList.add("toast-exit");
-  }, ttl - 400);
-  setTimeout(() => node.remove(), ttl);
+    setTimeout(() => node.remove(), 350);
+  };
+  const exitTimer = setTimeout(dismiss, ttl - 350);
+  node.querySelector(".toast-close")?.addEventListener("click", () => {
+    clearTimeout(exitTimer);
+    dismiss();
+  });
 }
 function appModal(options = {}) {
   const {

@@ -52,6 +52,7 @@ class State:
         self._stop_requested = False
         self._plan = []
         self._inventory = []
+        self._inventory_account_id = ""
         self._buff_auth_expired = False
         self._buff_verification_required = False
         self._buff_verification_reason = ""
@@ -198,11 +199,29 @@ class State:
         with self._lock:
             return list(self._plan)
     def set_inventory(self, items: list) -> None:
+        from app.accounts import get_current_id
         with self._lock:
             self._inventory = list(items)
+            self._inventory_account_id = get_current_id() or ""
     def get_inventory(self) -> list:
+        from app.accounts import get_current_id
+        current_account_id = get_current_id() or ""
         with self._lock:
+            if self._inventory_account_id != current_account_id:
+                return []
             return list(self._inventory)
+    def reset_account_view(self) -> None:
+        with self._lock:
+            self._pending_payment = None
+            self._plan = []
+            self._inventory = []
+            self._inventory_account_id = ""
+            self._progress_total = 0
+            self._progress_done = 0
+            self._progress_item = ""
+            self._next_progress_item = ""
+            self._status = "idle"
+            self._step = ""
     def clear_log(self) -> None:
         with self._lock:
             self._log.clear()
@@ -304,6 +323,8 @@ def set_inventory(items: list) -> None:
     get_state().set_inventory(items)
 def get_inventory() -> list:
     return get_state().get_inventory()
+def reset_account_view() -> None:
+    get_state().reset_account_view()
 def clear_log() -> None:
     get_state().clear_log()
 def replace_log(lines: list) -> None:

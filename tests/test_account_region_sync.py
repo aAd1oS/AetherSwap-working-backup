@@ -200,6 +200,7 @@ def test_refresh_account_region_currency_rejects_cookie_for_different_account(mo
 def test_verify_account_triggers_region_currency_refresh(monkeypatch):
     from app.routes import accounts
 
+    monkeypatch.setattr(accounts, "_activate_account", lambda account_id: {"ok": True})
     monkeypatch.setattr(
         accounts,
         "verify_steam_auto_login",

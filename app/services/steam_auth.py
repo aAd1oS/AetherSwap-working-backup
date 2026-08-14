@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from typing import Optional, Tuple
+from urllib.parse import urljoin, urlparse
 import urllib3
 import requests as _req
 from app.state import log
@@ -42,6 +43,49 @@ _STEAM_RATE_LIMITED_MESSAGE = (
 )
 
 
+def _load_steam_auth_cookies(session, cookie_dict: dict) -> None:
+    """Scope saved cookies so JWT Set-Cookie can replace the old Community value."""
+    cookie_setter = getattr(session.cookies, "set", None)
+    if not callable(cookie_setter):
+        session.cookies.update(cookie_dict)
+        return
+    for name, value in cookie_dict.items():
+        domain = ".steampowered.com" if name.lower().startswith("steamrefresh") else ".steamcommunity.com"
+        cookie_setter(name, value, domain=domain, path="/")
+
+
+def _check_steam_market_session(session, steam_id: str = "") -> Tuple[str, str]:
+    """Use the actual downstream market page when the profile JWT flow loops."""
+    try:
+        response = session.get(
+            "https://steamcommunity.com/market/",
+            timeout=12,
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        return "unavailable", f"Steam 市场登录态请求失败: {type(exc).__name__}"
+    if response.status_code == 429:
+        return "rate_limited", "Steam Community Market HTTP 429"
+    if response.status_code in (401, 403):
+        return "invalid", f"Steam Community Market HTTP {response.status_code}"
+    if response.status_code < 200 or response.status_code >= 300:
+        return "unavailable", f"Steam Community Market HTTP {response.status_code}"
+
+    body = (getattr(response, "text", "") or "")[:500000]
+    body_lower = body.lower()
+    if "g_steamid = false" in body_lower or 'id="login_form"' in body_lower:
+        return "invalid", "Steam Community Market 页面显示未登录"
+    steam_id_match = re.search(r'g_steamID\s*=\s*"(\d+)"', body, flags=re.IGNORECASE)
+    if steam_id_match:
+        market_steam_id = steam_id_match.group(1)
+        if steam_id and market_steam_id != str(steam_id):
+            return "invalid", "Steam Community Market 登录账号与当前账号不一致"
+        return "valid", "Steam Community Market 登录态验证通过"
+    if re.search(r"g_rgWalletInfo\s*=\s*\{", body, flags=re.IGNORECASE):
+        return "valid", "Steam Community Market 钱包登录态验证通过"
+    return "unavailable", "Steam Community Market 未返回明确登录状态"
+
+
 def _check_steam_cookies(cookie_str: str, steam_id: str = "") -> Tuple[str, str]:
     """Validate the Community session used by inventory and market operations."""
     cookie_dict = {}
@@ -55,7 +99,7 @@ def _check_steam_cookies(cookie_str: str, steam_id: str = "") -> Tuple[str, str]
 
     session = _req.Session()
     _configure_steam_session(session)
-    session.cookies.update(cookie_dict)
+    _load_steam_auth_cookies(session, cookie_dict)
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -65,12 +109,135 @@ def _check_steam_cookies(cookie_str: str, steam_id: str = "") -> Tuple[str, str]
         response = session.get(
             "https://steamcommunity.com/my/profile",
             timeout=12,
-            allow_redirects=True,
+            allow_redirects=False,
         )
         final_url = (response.url or "").lower()
         body_head = (getattr(response, "text", "") or "")[:20000].lower()
         if response.status_code == 429:
             return "rate_limited", "Steam Community HTTP 429"
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = (getattr(response, "headers", {}) or {}).get("Location", "")
+            redirect_url = urljoin(response.url or "https://steamcommunity.com/my/profile", location)
+            parsed = urlparse(redirect_url)
+            host = (parsed.hostname or "").lower()
+            path = parsed.path or "/"
+            target_label = f"{parsed.scheme or '?'}://{host or '?'}{path}"
+            community_hosts = {"steamcommunity.com", "www.steamcommunity.com"}
+            steam_login_hosts = community_hosts | {
+                "store.steampowered.com",
+                "login.steampowered.com",
+            }
+            if (
+                parsed.scheme == "https"
+                and host == "login.steampowered.com"
+                and path.rstrip("/").lower() == "/jwt/refresh"
+            ):
+                refresh_response = session.get(
+                    redirect_url,
+                    timeout=12,
+                    allow_redirects=False,
+                )
+                if refresh_response.status_code == 429:
+                    return "rate_limited", "Steam 登录令牌刷新 HTTP 429"
+                if refresh_response.status_code in (401, 403):
+                    return "invalid", f"Steam 登录令牌刷新 HTTP {refresh_response.status_code}"
+                if refresh_response.status_code not in (301, 302, 303, 307, 308):
+                    return "unavailable", f"Steam 登录令牌刷新 HTTP {refresh_response.status_code}"
+
+                refreshed_location = (getattr(refresh_response, "headers", {}) or {}).get("Location", "")
+                refreshed_url = urljoin(refresh_response.url or redirect_url, refreshed_location)
+                refreshed = urlparse(refreshed_url)
+                refreshed_host = (refreshed.hostname or "").lower()
+                refreshed_path = refreshed.path or "/"
+                refreshed_label = f"{refreshed.scheme or '?'}://{refreshed_host or '?'}{refreshed_path}"
+                if (
+                    refreshed_host == "login.steampowered.com"
+                    and refreshed_path.rstrip("/").lower() == "/jwt/refresh"
+                ):
+                    market_status, market_reason = _check_steam_market_session(session, steam_id)
+                    if market_status != "unavailable":
+                        return market_status, market_reason
+                    return "unavailable", f"Steam 登录令牌刷新出现循环；{market_reason}"
+                if "login" in refreshed_path.lower() and refreshed_host in steam_login_hosts:
+                    return "invalid", "Steam Community 跳转登录页"
+                if refreshed_host not in community_hosts or refreshed.scheme not in {"http", "https"}:
+                    return "unavailable", f"Steam 登录令牌刷新返回异常目标（目标={refreshed_label}）"
+                if refreshed_path.rstrip("/").lower() == "/my/profile":
+                    confirm_response = session.get(
+                        refreshed_url,
+                        timeout=12,
+                        allow_redirects=False,
+                    )
+                    if confirm_response.status_code == 429:
+                        return "rate_limited", "Steam 登录令牌刷新确认 HTTP 429"
+                    if confirm_response.status_code in (401, 403):
+                        return "invalid", f"Steam 登录令牌刷新确认 HTTP {confirm_response.status_code}"
+                    if 200 <= confirm_response.status_code < 300:
+                        confirm_url = (confirm_response.url or "").lower()
+                        confirm_body = (getattr(confirm_response, "text", "") or "")[:20000].lower()
+                        if "login" in confirm_url or 'id="login_form"' in confirm_body:
+                            return "invalid", "Steam Community 跳转登录页"
+                        return "valid", "Steam Community 登录令牌刷新并验证成功"
+                    if confirm_response.status_code not in (301, 302, 303, 307, 308):
+                        return "unavailable", f"Steam 登录令牌刷新确认 HTTP {confirm_response.status_code}"
+
+                    confirm_location = (getattr(confirm_response, "headers", {}) or {}).get("Location", "")
+                    confirm_url = urljoin(confirm_response.url or refreshed_url, confirm_location)
+                    confirmed = urlparse(confirm_url)
+                    confirmed_host = (confirmed.hostname or "").lower()
+                    confirmed_path = confirmed.path or "/"
+                    confirmed_label = f"{confirmed.scheme or '?'}://{confirmed_host or '?'}{confirmed_path}"
+                    if (
+                        confirmed_host == "login.steampowered.com"
+                        and confirmed_path.rstrip("/").lower() == "/jwt/refresh"
+                    ):
+                        market_status, market_reason = _check_steam_market_session(session, steam_id)
+                        if market_status != "unavailable":
+                            return market_status, market_reason
+                        return "unavailable", f"Steam 登录令牌刷新出现循环；{market_reason}"
+                    if "login" in confirmed_path.lower() and confirmed_host in steam_login_hosts:
+                        return "invalid", "Steam Community 跳转登录页"
+                    if confirmed_host not in community_hosts or confirmed.scheme not in {"http", "https"}:
+                        return "unavailable", f"Steam 登录令牌刷新确认返回异常目标（目标={confirmed_label}）"
+                    confirmed_profile = re.fullmatch(
+                        r"/profiles/(\d+)/?",
+                        confirmed_path,
+                        flags=re.IGNORECASE,
+                    )
+                    if confirmed_profile:
+                        redirected_steam_id = confirmed_profile.group(1)
+                        if steam_id and redirected_steam_id != str(steam_id):
+                            return "invalid", "Steam Community 登录账号与当前账号不一致"
+                        return "valid", "Steam Community 登录令牌刷新并验证成功"
+                    if re.fullmatch(r"/id/[^/]+/?", confirmed_path, flags=re.IGNORECASE):
+                        return "valid", "Steam Community 登录令牌刷新并验证成功"
+                    return "unavailable", f"Steam 登录令牌刷新确认返回无法识别的目标（目标={confirmed_label}）"
+                refreshed_profile = re.fullmatch(
+                    r"/profiles/(\d+)/?",
+                    refreshed_path,
+                    flags=re.IGNORECASE,
+                )
+                if refreshed_profile:
+                    redirected_steam_id = refreshed_profile.group(1)
+                    if steam_id and redirected_steam_id != str(steam_id):
+                        return "invalid", "Steam Community 登录账号与当前账号不一致"
+                    return "valid", "Steam Community 登录令牌刷新并验证成功"
+                if re.fullmatch(r"/id/[^/]+/?", refreshed_path, flags=re.IGNORECASE):
+                    return "valid", "Steam Community 登录令牌刷新并验证成功"
+                return "unavailable", f"Steam 登录令牌刷新返回无法识别的目标（目标={refreshed_label}）"
+            if "login" in path.lower() and host in steam_login_hosts:
+                return "invalid", "Steam Community 跳转登录页"
+            if host not in community_hosts or parsed.scheme not in {"http", "https"}:
+                return "unavailable", f"Steam Community 返回异常跨站重定向（目标={target_label}）"
+            profile_match = re.fullmatch(r"/profiles/(\d+)/?", path, flags=re.IGNORECASE)
+            if profile_match:
+                redirected_steam_id = profile_match.group(1)
+                if steam_id and redirected_steam_id != str(steam_id):
+                    return "invalid", "Steam Community 登录账号与当前账号不一致"
+                return "valid", "Steam Community 已重定向到当前账号主页"
+            if re.fullmatch(r"/id/[^/]+/?", path, flags=re.IGNORECASE):
+                return "valid", "Steam Community 已重定向到当前账号主页"
+            return "unavailable", "Steam Community 返回无法识别的重定向"
         if "login" in final_url or 'id="login_form"' in body_head:
             return "invalid", "Steam Community 跳转登录页"
         if response.status_code in (401, 403):

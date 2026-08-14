@@ -198,8 +198,17 @@ def _build_listing_plan(
             continue
         
         buy_record = _find_buy_record(purchases_snapshot, aid, market_hash_name)
-        if not buy_record:
-            ctx.log(f"[出售] {name} assetid={aid} 不在本地购买记录中（非倒余额库>存），为保护个人物品跳过出售", "info", category="steam")
+        ownership_mode = str(it.get("ownership_mode") or "").strip().lower()
+        if ownership_mode == "personal" or (ownership_mode != "managed" and not buy_record):
+            ctx.log(f"[出售] {name} assetid={aid} 属于个人保护库存，跳过出售", "info", category="steam")
+            continue
+        if ownership_mode == "managed" and not buy_record and sell_strategy == 3:
+            ctx.log(
+                f"[出售] {name} assetid={aid} 已手动托管，但缺少购入记录，"
+                "策略3无法核算购入比例，跳过出售",
+                "warn",
+                category="steam",
+            )
             continue
 
         # Same-name in-steam cap check
@@ -377,13 +386,11 @@ def _build_listing_plan(
 
 
 def _find_buy_record(purchases_snapshot: list, aid: str, market_hash_name: str) -> Optional[dict]:
-    """Return the most relevant purchase record for a given asset."""
-    if aid:
-        for p in purchases_snapshot:
-            if str(p.get("assetid") or "") == aid:
-                return p
+    """Return only an exact tracked asset; names must never authorize a sale."""
+    if not aid:
+        return None
     for p in purchases_snapshot:
-        if ((p.get("market_hash_name") or p.get("name") or "").strip() == market_hash_name):
+        if str(p.get("assetid") or "").strip() == aid:
             return p
     return None
 
@@ -504,6 +511,20 @@ def _run_sell_phase_impl(cfg: dict, state, flow_id: str, items: Optional[list] =
         ctx.log("策略4 暂停自动出售，跳过", "info")
         return
 
+    from app.account_scope import validate_current_account_identity
+    identity_ok, identity_error = validate_current_account_identity()
+    if not identity_ok:
+        ctx.log(f"[出售] 账号身份保护: {identity_error}，已跳过", "error", category="account")
+        return
+    account = get_current_account()
+    if account is None:
+        ctx.log("[出售] 无有效账号（可能刚执行了出厂重置），跳过本次出售", "warn", category="steam")
+        return
+    from app.account_scope import get_account_runtime_status
+    account_runtime = get_account_runtime_status(str(account.get("id") or ""))
+    if not account_runtime.get("auto_sell_enabled", False):
+        ctx.log("[出售] 当前账号已启用个人库存保护，自动出售未开启", "info", category="account")
+        return
     cred_steam = get_steam_credentials()
     session_result = _resolve_steam_session(ctx, cred_steam)
     if session_result is None:
@@ -532,11 +553,8 @@ def _run_sell_phase_impl(cfg: dict, state, flow_id: str, items: Optional[list] =
         ctx.log(f"[出售] Steam 在售列表拉取失败: {err_listings or '未知'}，同名在售校验将按本地购买记录", "warn", category="steam")
 
     purchases_snapshot = ctx.state.get_purchases()
-    account = get_current_account()
-    if account is None:
-        # 工厂重置后账号列表为空，直接跳过出售避免以错误币种上架
-        ctx.log("[出售] 无有效账号（可能刚执行了出厂重置），跳过本次出售", "warn", category="steam")
-        return
+    from app.inventory_ownership import annotate_inventory_ownership
+    annotate_inventory_ownership(items, purchases_snapshot)
     account_currency_cached = (account.get("currency_code") or "").strip().upper()
     region_check = refresh_account_region_currency(
         account.get("id"),

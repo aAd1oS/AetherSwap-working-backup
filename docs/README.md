@@ -4,7 +4,7 @@
 
 适用项目目录：`D:\Vibe Coding\steam`
 
-最后整理：2026-08-06
+最后整理：2026-08-10
 
 > 本目录只保存说明文档。Steam Cookie、BUFF Cookie、PushPlus Token、邮箱授权码、`shared_secret`、`identity_secret` 和 `.maFile` 都不得写进文档或提交到 GitHub。
 
@@ -34,6 +34,26 @@
 
    解释购入价、Steam 市场价、税后价格、折扣比率和收益口径，并记录 BUFF 可用资金调查与安全改进方案。
 
+7. [07_双Agent协作与审查规范.md](07_双Agent协作与审查规范.md)
+
+   规定Codex、DeepSeek、脚本和用户之间的长期任务分工、复核流程与安全边界。
+
+8. [DeepSeek_接力上下文_2026-08-09.md](DeepSeek_接力上下文_2026-08-09.md)
+
+   提供给Claude CLI中DeepSeek的精简项目快照、当前风险、阅读顺序和可直接使用的启动Prompt。
+
+9. [DeepSeek_CLI主Prompt.md](DeepSeek_CLI主Prompt.md)
+
+   在Steam项目目录打开Claude CLI后直接使用的只读主Prompt，包含任务范围、安全边界、工作流程和统一报告格式。
+
+10. [08_多账号运行方案对比.md](08_多账号运行方案对比.md)
+
+   对比应用内完整账号切换与Windows、Docker双实例隔离，记录账号归属、Docker安全改进、登录辅助App及推荐实施顺序。
+
+11. [09_全面测试记录_2026-08-10.md](09_全面测试记录_2026-08-10.md)
+
+   记录多账号改造完成后的全量离线回归、数据库副本迁移、关键只读接口、前端脚本和备份完整性检查结果。
+
 ## 当前本机状态
 
 - 项目目录：`D:\Vibe Coding\steam`
@@ -46,7 +66,7 @@
 - 日志：`log/`
 - PushPlus：本项目引导要求配置，Token 只保存在本地配置中
 - 代理池：默认可关闭，实际 Steam 路由由当前网络环境和项目路由逻辑决定
-- 当前完整测试：`245 passed`
+- 当前完整测试：`288 passed`
 
 ## 当前主要操作流程
 

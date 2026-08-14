@@ -39,7 +39,7 @@ async function tabSwitch(name) {
   if (name === "debug") refreshLog();
   if (name === "inventory") refreshInventory(false);
   if (name === "purchases" || name === "sales" || name === "purchase-history") refreshTransactions();
-  if (name === "analytics") refreshAnalytics();
+  if (name === "analytics") refreshTransactions();
   if (name === "accounts") refreshAccounts();
   if (name === "steam-guard") initSteamGuardPanel();
   if (name !== "steam-guard") stopSteamGuardTimer();
@@ -323,17 +323,26 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
       return;
     }
     const items = d.items || [];
+    const accountName = d.account?.name || d.account?.steam_id || "未选择账号";
+    const accountEl = el("inv-account-name");
+    if (accountEl) accountEl.textContent = accountName;
     const tbody = document.querySelector("#inv-table tbody");
     if (!tbody) return;
     let totalValue = 0;
     const rowHtmls = [];
     for (const it of items) {
-      const sellHtml =
-        `<span class="${it.can_sell ? "text-ok" : "text-bad"}">${it.can_sell ? "是" : "否"}</span>` +
-        (it.marketable ? "" : ' <span class="text-bad">(不可上架)</span>');
-      const tradeHtml =
-        `<span class="${it.can_trade ? "text-ok" : "text-bad"}">${it.can_trade ? "是" : "否"}</span>` +
-        (it.tradable ? "" : ' <span class="text-bad">(不可交易)</span>');
+      const fullName = (it.market_hash_name || it.name || "").trim();
+      const wearMatch = fullName.match(/\((Factory New|Minimal Wear|Field-Tested|Well-Worn|Battle-Scarred)\)\s*$/);
+      const wear = (it.wear || wearMatch?.[1] || "—").toString();
+      const isListed = Boolean(it.listing);
+      const sellHtml = isListed
+        ? '<span class="text-ok">已上架</span>'
+        : `<span class="${it.can_sell ? "text-ok" : "text-bad"}">${it.can_sell ? "是" : "否"}</span>` +
+          (it.marketable ? "" : ' <span class="text-bad">(不可上架)</span>');
+      const tradeHtml = isListed
+        ? '<span class="status-cell status-pending">市场托管中</span>'
+        : `<span class="${it.can_trade ? "text-ok" : "text-bad"}">${it.can_trade ? "是" : "否"}</span>` +
+          (it.tradable ? "" : ' <span class="text-bad">(不可交易)</span>');
       const rawTime = it.cooldown_at_iso || it.cooldown_text || "";
       let displayTime = rawTime;
       if (it.cooldown_at_iso) {
@@ -342,14 +351,17 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
           displayTime = formatInventoryUnlockTime(d);
         }
       }
-      const timeHtml = displayTime ? `<span class="text-bad">${escapeHtml(displayTime)}</span>` : "—";
+      const timeHtml = !isListed && displayTime ? `<span class="text-bad">${escapeHtml(displayTime)}</span>` : "—";
       const statusText = it.cooldown_text || "";
       const cooldownAt = Number(it.cooldown_at) || 0;
       const isCooling = cooldownAt > Date.now() / 1000
-        || (!cooldownAt && /trade-protected/i.test(statusText));
+        || (!cooldownAt && !it.can_trade && statusText.length > 0);
       let statusLabel = "状态未知";
       let statusClass = "muted";
-      if (isCooling) {
+      if (isListed) {
+        statusLabel = "已上架出售中";
+        statusClass = "text-ok";
+      } else if (isCooling) {
         statusLabel = "交易冷却中";
         statusClass = "status-cell status-pending";
       } else if (it.can_sell) {
@@ -370,7 +382,7 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
       const lowest = Number(it.lowest_price) || 0;
       totalValue += lowest;
       const lowestStr = lowest > 0 ? lowest.toFixed(2) : "—";
-      const mhn = (it.market_hash_name || it.name || "").trim();
+      const mhn = fullName;
       const steamUrl = mhn
         ? "https://steamcommunity.com/market/listings/730/" + encodeURIComponent(mhn)
         : "";
@@ -380,8 +392,18 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
       const linksHtml = mhn
         ? `<a href="${steamUrl}" target="_blank" rel="noopener" class="link-steam">Steam</a> <a href="${buffUrl}" target="_blank" rel="noopener" class="link-buff">Buff</a>`
         : "—";
+      const ownershipMode = it.ownership_source === "manual" ? it.ownership_mode : "auto";
+      const autoOwnershipLabel = it.managed_by_aetherswap ? "自动判断：托管" : "自动判断：个人";
+      const ownershipHtml = `
+        <select class="inventory-ownership-select" data-assetid="${escapeHtml(String(it.assetid || ""))}" data-current="${escapeHtml(ownershipMode)}" title="设置该物品是否允许自动出售">
+          <option value="auto" ${ownershipMode === "auto" ? "selected" : ""}>${autoOwnershipLabel}</option>
+          <option value="personal" ${ownershipMode === "personal" ? "selected" : ""}>个人保护</option>
+          <option value="managed" ${ownershipMode === "managed" ? "selected" : ""}>自动托管</option>
+        </select>`;
       rowHtmls.push(`
-        <tr><td>${escapeHtml(it.name || "")}</td>
+        <tr><td>${escapeHtml(fullName)}</td>
+        <td>${ownershipHtml}</td>
+        <td>${escapeHtml(wear)}</td>
         <td class="inv-links">${linksHtml}</td>
         <td>${sellHtml}</td>
         <td>${tradeHtml}</td>
@@ -391,6 +413,42 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
       `);
     }
     tbody.innerHTML = rowHtmls.join("");
+    tbody.querySelectorAll(".inventory-ownership-select").forEach((select) => {
+      select.addEventListener("change", async () => {
+        const previous = select.dataset.current || "auto";
+        const mode = select.value;
+        const assetid = select.dataset.assetid || "";
+        if (mode === "managed") {
+          const confirmed = await appConfirm(
+            "设为自动托管后，该物品会进入当前账号的自动出售候选。出售仍受账号开关和出售策略限制，确定继续？",
+            { title: "确认自动托管", confirmText: "确认托管" },
+          );
+          if (!confirmed) {
+            select.value = previous;
+            return;
+          }
+        }
+        select.disabled = true;
+        try {
+          const result = await fetchJson(API + "/inventory/" + encodeURIComponent(assetid) + "/ownership", {
+            method: "POST",
+            body: JSON.stringify({ mode }),
+          });
+          if (!result.ok) throw new Error(result.error || "保存失败");
+          select.dataset.current = mode;
+          toast(
+            mode === "managed" ? "已设为自动托管" : (mode === "personal" ? "已设为个人保护" : "已恢复自动判断"),
+            result.warning || "仅对当前账号和该 assetid 生效",
+          );
+          setTimeout(() => refreshInventory(false, false), 0);
+        } catch (error) {
+          select.value = previous;
+          toast("库存归属保存失败", error.message || "");
+        } finally {
+          select.disabled = false;
+        }
+      });
+    });
     const c = el("inv-count");
     if (c) c.textContent = items.length;
     const v = el("inv-total-value");
@@ -413,6 +471,9 @@ async function refreshMarketPrices(showResult = false) {
       if (showResult) toast("没有可刷新的商品价格");
       return false;
     }
+    const updatedAt = Number(d.updated_at) > 0 ? new Date(Number(d.updated_at) * 1000) : new Date();
+    const updatedEl = el("holdings-price-updated-at");
+    if (updatedEl) updatedEl.textContent = `现价更新：${updatedAt.toLocaleString()}`;
     const invItems = getInventoryCache();
     if (invItems && invItems.length > 0) {
       let totalValue = 0;
@@ -421,7 +482,7 @@ async function refreshMarketPrices(showResult = false) {
         const rows = tbody.querySelectorAll("tr");
         rows.forEach((row) => {
           const nameTd = row.querySelector("td:first-child");
-          const priceTd = row.querySelectorAll("td")[5];
+          const priceTd = row.querySelectorAll("td")[7];
           if (!nameTd || !priceTd) return;
           const name = nameTd.textContent.trim();
           const price = prices[name];
@@ -430,7 +491,7 @@ async function refreshMarketPrices(showResult = false) {
           }
         });
         rows.forEach((row) => {
-          const priceTd = row.querySelectorAll("td")[5];
+          const priceTd = row.querySelectorAll("td")[7];
           const v = parseFloat(priceTd?.textContent);
           if (!isNaN(v)) totalValue += v;
         });
@@ -510,9 +571,13 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
   const byName = new Map();
   for (const t of purchases) {
     const name = (t.name || "—").toString();
-    if (!byName.has(name)) {
-      byName.set(name, {
+    const sold = t.sale_price != null && Number(t.sale_price) > 0;
+    const status = sold ? "sold" : "unsold";
+    const key = status + "\u0000" + name;
+    if (!byName.has(key)) {
+      byName.set(key, {
         name,
+        status,
         count: 0,
         totalPrice: 0,
         totalMp: 0,
@@ -526,14 +591,13 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
         deviationCount: 0,
       });
     }
-    const r = byName.get(name);
+    const r = byName.get(key);
     r.count += 1;
     r.totalPrice += Number(t.price) || 0;
     if (t.market_price != null) {
       r.totalMp += Number(t.market_price);
       r.mpCount += 1;
     }
-    const sold = t.sale_price != null && Number(t.sale_price) > 0;
     if (sold) {
       const saleP = Number(t.sale_price);
       const cost = Number(t.price) || 0;
@@ -553,6 +617,7 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
   return Array.from(byName.values())
     .map((r) => ({
       name: r.name,
+      status: r.status,
       count: r.count,
       avgPrice: r.count > 0 ? r.totalPrice / r.count : 0,
       avgMp: r.mpCount > 0 ? r.totalMp / r.mpCount : null,
@@ -563,14 +628,15 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
       avgDeviation: r.deviationCount > 0 ? r.totalDeviation / r.deviationCount : null,
       avgDeviationPct: r.deviationCount > 0 && r.totalSoldMp > 0 ? (r.totalDeviation / r.totalSoldMp) * 100 : null,
     }))
-    .sort((a, b) => b.count - a.count);
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 }
 function refreshAnalytics(purchases, resellRatio) {
   const tbody = document.querySelector("#analytics-table tbody");
-  if (!tbody) return;
+  const soldTbody = document.querySelector("#analytics-sold-table tbody");
+  if (!tbody && !soldTbody) return;
   const render = (list, ratio) => {
     const rows = aggregateByItemName(list, ratio);
-    const rowHtmls = rows.map((r) => {
+    const renderSummaryRow = (r) => {
       const avgPriceStr = r.avgPrice > 0 ? r.avgPrice.toFixed(2) : "—";
       const avgMpStr = r.avgMp != null ? r.avgMp.toFixed(2) : "—";
       const totalSaleStr = r.totalSaleAmount != null ? r.totalSaleAmount.toFixed(2) : "—";
@@ -583,8 +649,52 @@ function refreshAnalytics(purchases, resellRatio) {
       const avgDevStr = r.avgDeviation != null ? (r.avgDeviation >= 0 ? "+" : "") + r.avgDeviation.toFixed(2) + (avgDevPctStr ? " (" + avgDevPctStr + ")" : "") : "—";
       const devClass = r.avgDeviation != null ? (r.avgDeviation > 0 ? "text-ok" : r.avgDeviation < 0 ? "text-bad" : "") : "";
       return `<tr><td>${escapeHtml(r.name)}</td><td class="mono">${r.count}</td><td class="mono">${avgPriceStr}</td><td class="mono">${avgMpStr}</td><td class="mono">${totalSaleStr}</td><td class="mono">${avgSaleStr}</td><td class="mono ${discountRatioClass}">${avgDiscountStr}</td><td class="mono ${cashClass}">${cashProfitStr}</td><td class="mono ${devClass}">${avgDevStr}</td></tr>`;
-    });
-    tbody.innerHTML = rowHtmls.length ? rowHtmls.join("") : "<tr><td colspan='9' class='text-muted'>暂无数据</td></tr>";
+    };
+    const unsoldRows = rows.filter((row) => row.status === "unsold");
+    const soldSummaryRows = rows.filter((row) => row.status === "sold");
+    const unsoldCount = list.filter((item) => !(Number(item.sale_price) > 0)).length;
+    const soldCount = list.filter((item) => Number(item.sale_price) > 0).length;
+    const summaryCounts = el("analytics-summary-counts");
+    if (summaryCounts) summaryCounts.textContent = `未出售 ${unsoldCount} 件 · 已出售 ${soldCount} 件`;
+    const renderGroup = (label, groupRows, emptyText) => [
+      `<tr class="analytics-group-row"><td colspan="9">${label}</td></tr>`,
+      groupRows.length
+        ? groupRows.map(renderSummaryRow).join("")
+        : `<tr><td colspan="9" class="text-muted">${emptyText}</td></tr>`,
+    ].join("");
+    if (tbody) {
+      tbody.innerHTML = renderGroup("未出售", unsoldRows, "暂无未出售商品")
+        + renderGroup("已出售", soldSummaryRows, "暂无已出售商品");
+    }
+    if (soldTbody) {
+      const soldRows = list
+        .filter((item) => Number(item.sale_price) > 0)
+        .sort((a, b) => Number(b.sold_at || b.at || 0) - Number(a.sold_at || a.at || 0))
+        .map((item) => {
+          const cost = Number(item.price) || 0;
+          const salePrice = Number(item.sale_price) || 0;
+          const afterTax = salePrice / 1.15;
+          const discount = cost > 0 && afterTax > 0 ? cost / afterTax : null;
+          const cashProfit = afterTax * ratio - cost;
+          const discountClass = discount != null ? (discount > ratio ? "text-bad" : "text-ok") : "";
+          const profitClass = cashProfit > 0 ? "text-ok" : cashProfit < 0 ? "text-bad" : "";
+          const soldAt = Number(item.sold_at || 0);
+          const soldAtText = soldAt > 0 ? new Date(soldAt * 1000).toLocaleString() : "—";
+          return `<tr>
+            <td class="mono">${escapeHtml(soldAtText)}</td>
+            <td>${escapeHtml(item.name || "—")}</td>
+            <td class="mono">${escapeHtml(item.assetid || "—")}</td>
+            <td class="mono">${cost > 0 ? cost.toFixed(2) : "—"}</td>
+            <td class="mono">${salePrice.toFixed(2)}</td>
+            <td class="mono">${afterTax.toFixed(2)}</td>
+            <td class="mono ${discountClass}">${discount != null ? discount.toFixed(4) : "—"}</td>
+            <td class="mono ${profitClass}">${cashProfit >= 0 ? "+" : ""}${cashProfit.toFixed(2)}</td>
+          </tr>`;
+        });
+      soldTbody.innerHTML = soldRows.length
+        ? soldRows.join("")
+        : "<tr><td colspan='8' class='text-muted'>暂无已出售商品</td></tr>";
+    }
   };
   if (purchases != null && resellRatio != null) {
     render(purchases, resellRatio);
@@ -597,7 +707,10 @@ function refreshAnalytics(purchases, resellRatio) {
       })
       .catch((e) => {
         toast("加载数据分析失败", e.message || "");
-        tbody.innerHTML = "<tr><td colspan='9' class='text-muted'>加载失败</td></tr>";
+        if (tbody) tbody.innerHTML = "<tr><td colspan='9' class='text-muted'>加载失败</td></tr>";
+        const summaryCounts = el("analytics-summary-counts");
+        if (summaryCounts) summaryCounts.textContent = "分类统计加载失败";
+        if (soldTbody) soldTbody.innerHTML = "<tr><td colspan='8' class='text-muted'>加载失败</td></tr>";
       });
   }
 }

@@ -146,7 +146,9 @@ def test_missing_currency_code_aborts_sell_phase():
     logged = []
     def _log(msg, level="info", **kw):
         logged.append((level, msg))
-    with patch("app.sell_pipeline.get_steam_credentials", return_value={"steam_id": "x", "session_id": "y", "cookies": "z=v"}), \
+    with patch("app.account_scope.validate_current_account_identity", return_value=(True, "")), \
+         patch("app.account_scope.get_account_runtime_status", return_value={"auto_sell_enabled": True}), \
+         patch("app.sell_pipeline.get_steam_credentials", return_value={"steam_id": "x", "session_id": "y", "cookies": "z=v"}), \
          patch("app.sell_pipeline._resolve_steam_session", return_value=(MagicMock(), "sid")), \
          patch("app.sell_pipeline._get_inventory", return_value=[{"can_sell": True, "assetid": "1", "name": "Knife", "appid": 730}]), \
          patch("app.sell_pipeline.fetch_my_listings", return_value=(True, set(), "", {})), \
@@ -174,7 +176,9 @@ def test_sell_phase_uses_realtime_currency_instead_of_stale_cache():
     logged = []
     def _log(msg, level="info", **kw):
         logged.append((level, msg))
-    with patch("app.sell_pipeline.get_steam_credentials", return_value={"steam_id": "x", "session_id": "y", "cookies": "steamLoginSecure=v"}), \
+    with patch("app.account_scope.validate_current_account_identity", return_value=(True, "")), \
+         patch("app.account_scope.get_account_runtime_status", return_value={"auto_sell_enabled": True}), \
+         patch("app.sell_pipeline.get_steam_credentials", return_value={"steam_id": "x", "session_id": "y", "cookies": "steamLoginSecure=v"}), \
          patch("app.sell_pipeline._resolve_steam_session", return_value=(MagicMock(), "sid")), \
          patch("app.sell_pipeline._get_inventory", return_value=[{"can_sell": True, "assetid": "1", "name": "Knife", "appid": 730}]), \
          patch("app.sell_pipeline.fetch_my_listings", return_value=(True, set(), "", {})), \
@@ -201,7 +205,9 @@ def test_sell_phase_does_not_require_region_when_currency_is_confirmed():
     state = MagicMock()
     state.get_purchases.return_value = []
     account = {"id": "1", "currency_code": "CNY", "region_code": "IN"}
-    with patch("app.sell_pipeline.get_steam_credentials", return_value={"steam_id": "x", "session_id": "y", "cookies": "steamLoginSecure=v"}), \
+    with patch("app.account_scope.validate_current_account_identity", return_value=(True, "")), \
+         patch("app.account_scope.get_account_runtime_status", return_value={"auto_sell_enabled": True}), \
+         patch("app.sell_pipeline.get_steam_credentials", return_value={"steam_id": "x", "session_id": "y", "cookies": "steamLoginSecure=v"}), \
          patch("app.sell_pipeline._resolve_steam_session", return_value=(MagicMock(), "sid")), \
          patch("app.sell_pipeline._get_inventory", return_value=[{"can_sell": True, "assetid": "1", "name": "Knife", "appid": 730}]), \
          patch("app.sell_pipeline.fetch_my_listings", return_value=(True, set(), "", {})), \
@@ -218,4 +224,59 @@ def test_sell_phase_does_not_require_region_when_currency_is_confirmed():
 
     mock_plan.assert_called_once()
     assert mock_plan.call_args.args[11] == "CNY"
+
+
+def test_buy_record_matching_never_falls_back_to_same_name():
+    from app.sell_pipeline import _find_buy_record
+
+    purchases = [{"assetid": "tracked-asset", "market_hash_name": "AK-47 | Redline"}]
+
+    assert _find_buy_record(purchases, "tracked-asset", "AK-47 | Redline") is purchases[0]
+    assert _find_buy_record(purchases, "personal-asset", "AK-47 | Redline") is None
+    assert _find_buy_record(purchases, "", "AK-47 | Redline") is None
+
+
+def test_manual_personal_override_blocks_exact_tracked_asset():
+    from app.sell_pipeline import _build_listing_plan
+
+    item = _make_sellable()[0]
+    item["ownership_mode"] = "personal"
+    result = _build_listing_plan(
+        ctx=_build_ctx([]), cfg={"pipeline": {}}, session=MagicMock(),
+        sellable=[item], sell_strategy=1, pipeline_cfg={},
+        purchases_snapshot=[{"assetid": "12345678", "market_hash_name": "AK-47 | Redline"}],
+        ok_listings=False, active_listing_ids=set(), listing_assetid_to_name={},
+        assetid_to_name_map={}, account_currency="CNY", rate_map={},
+    )
+    assert result == []
+
+
+def test_manual_managed_untracked_asset_works_for_non_profit_strategy():
+    from app.sell_pipeline import _build_listing_plan
+
+    item = _make_sellable()[0]
+    item["ownership_mode"] = "managed"
+    with patch("app.sell_pipeline.get_sell_orders_cny", return_value={"sell_orders": [{"price": 3000, "quantity": 2}]}), \
+         patch("app.sell_pipeline.compute_smart_list_price", return_value=(30.0, "wall")):
+        result = _build_listing_plan(
+            ctx=_build_ctx([]), cfg={"pipeline": {}}, session=MagicMock(),
+            sellable=[item], sell_strategy=1, pipeline_cfg={}, purchases_snapshot=[],
+            ok_listings=False, active_listing_ids=set(), listing_assetid_to_name={},
+            assetid_to_name_map={}, account_currency="CNY", rate_map={},
+        )
+    assert len(result) == 1
+
+
+def test_manual_managed_untracked_asset_is_blocked_by_profit_strategy():
+    from app.sell_pipeline import _build_listing_plan
+
+    item = _make_sellable()[0]
+    item["ownership_mode"] = "managed"
+    result = _build_listing_plan(
+        ctx=_build_ctx([]), cfg={"pipeline": {}}, session=MagicMock(),
+        sellable=[item], sell_strategy=3, pipeline_cfg={}, purchases_snapshot=[],
+        ok_listings=False, active_listing_ids=set(), listing_assetid_to_name={},
+        assetid_to_name_map={}, account_currency="CNY", rate_map={},
+    )
+    assert result == []
 

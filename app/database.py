@@ -7,7 +7,7 @@ from typing import List, Optional
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlalchemy import update as sql_update
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
-_DB_PATH = _CONFIG_DIR / "app.db"
+_DB_PATH = Path(os.environ.get("AETHERSWAP_DB_PATH") or (_CONFIG_DIR / "app.db"))
 _TRANSACTIONS_JSON = _CONFIG_DIR / "transactions.json"
 _TRANSACTIONS_BAK = _CONFIG_DIR / "transactions.json.bak"
 _WILSON_Z = 1.96
@@ -43,6 +43,7 @@ class Purchase(SQLModel, table=True):
     current_price_updated_at: Optional[float] = None
     received_at: Optional[float] = None
     tradable_at: Optional[float] = None
+    account_id: str = Field(default="", index=True)
 
 class PurchaseOrder(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -60,6 +61,7 @@ class PurchaseOrder(SQLModel, table=True):
     paid_at: Optional[float] = None
     received_at: Optional[float] = None
     error: Optional[str] = None
+    account_id: str = Field(default="", index=True)
 class Sale(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = ""
@@ -67,6 +69,26 @@ class Sale(SQLModel, table=True):
     price: float = 0.0
     at: float = 0.0
     assetid: Optional[str] = None
+    account_id: str = Field(default="", index=True)
+
+class SteamAccountRuntime(SQLModel, table=True):
+    account_id: str = Field(primary_key=True)
+    cookies: str = ""
+    session_id: str = ""
+    steam_id: str = ""
+    shared_secret: str = ""
+    identity_secret: str = ""
+    device_id: str = ""
+    auto_confirm_enabled: bool = False
+    auto_sell_enabled: bool = False
+    updated_at: float = 0.0
+
+class InventoryOwnershipOverride(SQLModel, table=True):
+    account_id: str = Field(primary_key=True)
+    assetid: str = Field(primary_key=True)
+    mode: str = "personal"
+    market_hash_name: str = ""
+    updated_at: float = 0.0
 class ItemNameId(SQLModel, table=True):
     market_hash_name: str = Field(primary_key=True)
     item_nameid: str
@@ -133,6 +155,15 @@ def get_engine():
         return _engine
 def get_session() -> Session:
     return Session(get_engine())
+
+def _current_account_id(account_id: Optional[str] = None) -> str:
+    if account_id is not None:
+        return str(account_id).strip()
+    try:
+        from app.accounts import get_current_id
+        return str(get_current_id() or "").strip()
+    except Exception:
+        return ""
 def init_db() -> None:
     """Create all tables if they don't exist, and run lightweight migrations."""
     from sqlalchemy import text as sa_text
@@ -144,6 +175,24 @@ def init_db() -> None:
             conn.commit()
         except Exception:
             pass  
+    with engine.connect() as conn:
+        try:
+            conn.execute(sa_text(
+                "ALTER TABLE steamaccountruntime "
+                "ADD COLUMN auto_sell_enabled BOOLEAN DEFAULT 0"
+            ))
+            # Existing accounts with tracked purchases keep their prior selling behavior.
+            # Empty/new accounts remain protected until the user explicitly opts in.
+            conn.execute(sa_text(
+                "UPDATE steamaccountruntime SET auto_sell_enabled = 1 "
+                "WHERE account_id IN ("
+                "SELECT DISTINCT account_id FROM purchase "
+                "WHERE account_id IS NOT NULL AND account_id != ''"
+                ")"
+            ))
+            conn.commit()
+        except Exception:
+            pass
     purchase_columns = {
         "external_order_id": "TEXT",
         "source": "TEXT DEFAULT 'legacy'",
@@ -152,6 +201,7 @@ def init_db() -> None:
         "current_price_updated_at": "REAL",
         "received_at": "REAL",
         "tradable_at": "REAL",
+        "account_id": "TEXT DEFAULT ''",
     }
     with engine.connect() as conn:
         for column, sql_type in purchase_columns.items():
@@ -160,6 +210,25 @@ def init_db() -> None:
                 conn.commit()
             except Exception:
                 pass
+    for table_name in ("purchaseorder", "sale"):
+        with engine.connect() as conn:
+            try:
+                conn.execute(sa_text(f"ALTER TABLE {table_name} ADD COLUMN account_id TEXT DEFAULT ''"))
+                conn.commit()
+            except Exception:
+                pass
+    current_account_id = _current_account_id()
+    if current_account_id:
+        with engine.connect() as conn:
+            for table_name in ("purchase", "purchaseorder", "sale"):
+                conn.execute(
+                    sa_text(f"UPDATE {table_name} SET account_id = :account_id WHERE account_id IS NULL OR account_id = ''"),
+                    {"account_id": current_account_id},
+                )
+                conn.execute(sa_text(
+                    f"CREATE INDEX IF NOT EXISTS ix_{table_name}_account_id ON {table_name} (account_id)"
+                ))
+            conn.commit()
     with engine.connect() as conn:
         rows = conn.execute(
             sa_text("SELECT id, positive_rate, total_reviews FROM steamdealgame WHERE wilson_score IS NULL")
@@ -192,6 +261,7 @@ def _purchase_from_dict(d: dict) -> Purchase:
         current_price_updated_at=float(d["current_price_updated_at"]) if d.get("current_price_updated_at") is not None else None,
         received_at=float(d["received_at"]) if d.get("received_at") is not None else None,
         tradable_at=float(d["tradable_at"]) if d.get("tradable_at") is not None else None,
+        account_id=_current_account_id(d.get("account_id") or None),
     )
 def _sale_from_dict(d: dict) -> Sale:
     return Sale(
@@ -200,6 +270,7 @@ def _sale_from_dict(d: dict) -> Sale:
         price=float(d.get("price", 0)),
         at=float(d.get("at", 0)),
         assetid=str(d["assetid"]) if d.get("assetid") is not None else None,
+        account_id=_current_account_id(d.get("account_id") or None),
     )
 def _purchase_to_dict(p: Purchase) -> dict:
     d = {
@@ -208,6 +279,7 @@ def _purchase_to_dict(p: Purchase) -> dict:
         "goods_id": p.goods_id,
         "price": p.price,
         "at": p.at,
+        "account_id": p.account_id,
     }
     if p.market_price is not None:
         d["market_price"] = p.market_price
@@ -243,6 +315,7 @@ def _sale_to_dict(s: Sale) -> dict:
         "goods_id": s.goods_id,
         "price": s.price,
         "at": s.at,
+        "account_id": s.account_id,
     }
     if s.assetid is not None:
         d["assetid"] = s.assetid
@@ -285,7 +358,122 @@ _PURCHASE_UPDATABLE = frozenset({
     "current_price_updated_at", "received_at", "tradable_at",
 })
 _SALE_UPDATABLE = frozenset({"name", "price", "goods_id", "assetid", "at"})
+
+def db_get_account_runtime(account_id: str) -> Optional[dict]:
+    aid = _current_account_id(account_id)
+    if not aid:
+        return None
+    with get_session() as session:
+        row = session.get(SteamAccountRuntime, aid)
+        if row is None:
+            return None
+        return {
+            "account_id": row.account_id,
+            "cookies": row.cookies or "",
+            "session_id": row.session_id or "",
+            "steam_id": row.steam_id or "",
+            "shared_secret": row.shared_secret or "",
+            "identity_secret": row.identity_secret or "",
+            "device_id": row.device_id or "",
+            "auto_confirm_enabled": bool(row.auto_confirm_enabled),
+            "auto_sell_enabled": bool(row.auto_sell_enabled),
+            "updated_at": float(row.updated_at or 0),
+        }
+
+def db_has_any_account_runtime() -> bool:
+    with get_session() as session:
+        return session.exec(select(SteamAccountRuntime.account_id).limit(1)).first() is not None
+
+def db_upsert_account_runtime(account_id: str, data: dict) -> dict:
+    import time
+    aid = _current_account_id(account_id)
+    if not aid:
+        raise ValueError("account_id is required")
+    allowed = {
+        "cookies", "session_id", "steam_id", "shared_secret",
+        "identity_secret", "device_id", "auto_confirm_enabled", "auto_sell_enabled",
+    }
+    with get_session() as session:
+        row = session.get(SteamAccountRuntime, aid) or SteamAccountRuntime(account_id=aid)
+        for key in allowed:
+            if key in data:
+                value = data[key]
+                if key in {"auto_confirm_enabled", "auto_sell_enabled"}:
+                    value = bool(value)
+                else:
+                    value = str(value or "").strip()
+                setattr(row, key, value)
+        row.updated_at = time.time()
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return db_get_account_runtime(aid) or {"account_id": aid}
+
+def db_account_record_counts(account_id: str) -> dict:
+    from sqlalchemy import func
+    aid = _current_account_id(account_id)
+    with get_session() as session:
+        return {
+            "purchases": int(session.exec(select(func.count()).select_from(Purchase).where(Purchase.account_id == aid)).one()),
+            "orders": int(session.exec(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.account_id == aid)).one()),
+            "sales": int(session.exec(select(func.count()).select_from(Sale).where(Sale.account_id == aid)).one()),
+        }
+
+def db_get_inventory_ownership_overrides(account_id: Optional[str] = None) -> dict[str, str]:
+    aid = _current_account_id(account_id)
+    if not aid:
+        return {}
+    with get_session() as session:
+        rows = session.exec(
+            select(InventoryOwnershipOverride).where(
+                InventoryOwnershipOverride.account_id == aid
+            )
+        ).all()
+        return {str(row.assetid): str(row.mode) for row in rows}
+
+def db_set_inventory_ownership_override(
+    assetid: str,
+    mode: str,
+    market_hash_name: str = "",
+    account_id: Optional[str] = None,
+) -> Optional[dict]:
+    import time
+
+    aid = _current_account_id(account_id)
+    asset = str(assetid or "").strip()
+    normalized = str(mode or "").strip().lower()
+    if not aid:
+        raise ValueError("未选择当前账号")
+    if not asset:
+        raise ValueError("assetid 不能为空")
+    if normalized not in {"auto", "personal", "managed"}:
+        raise ValueError("库存归属须为 auto、personal 或 managed")
+    with get_session() as session:
+        row = session.get(InventoryOwnershipOverride, (aid, asset))
+        if normalized == "auto":
+            if row is not None:
+                session.delete(row)
+                session.commit()
+            return None
+        if row is None:
+            row = InventoryOwnershipOverride(account_id=aid, assetid=asset)
+        row.mode = normalized
+        row.market_hash_name = str(market_hash_name or "").strip()
+        row.updated_at = time.time()
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return {
+            "account_id": row.account_id,
+            "assetid": row.assetid,
+            "mode": row.mode,
+            "market_hash_name": row.market_hash_name,
+            "updated_at": row.updated_at,
+        }
+
 def db_append_purchase(p: dict) -> None:
+    if not _current_account_id(p.get("account_id") or None):
+        raise ValueError("未选择当前账号")
     with get_session() as session:
         session.add(_purchase_from_dict(p))
         session.commit()
@@ -296,14 +484,21 @@ def db_upsert_purchase_order(order: dict) -> dict:
     if not external_order_id:
         raise ValueError("external_order_id is required")
     now = time.time()
+    account_id = _current_account_id(order.get("account_id"))
+    if not account_id:
+        raise ValueError("current account is required")
     with get_session() as session:
         row = session.exec(
-            select(PurchaseOrder).where(PurchaseOrder.external_order_id == external_order_id)
+            select(PurchaseOrder).where(
+                PurchaseOrder.external_order_id == external_order_id,
+                PurchaseOrder.account_id == account_id,
+            )
         ).first()
         if row is None:
             row = PurchaseOrder(
                 external_order_id=external_order_id,
                 created_at=float(order.get("created_at") or now),
+                account_id=account_id,
             )
         for key in (
             "name", "goods_id", "quantity", "unit_price", "total_price",
@@ -320,6 +515,7 @@ def db_upsert_purchase_order(order: dict) -> dict:
             "external_order_id": row.external_order_id,
             "status": row.status,
             "total_price": row.total_price,
+            "account_id": row.account_id,
         }
 
 def db_update_purchase_order(
@@ -328,6 +524,9 @@ def db_update_purchase_order(
     expected_statuses: Optional[set[str]] = None,
 ) -> bool:
     import time
+    account_id = _current_account_id()
+    if not account_id:
+        return False
     with get_session() as session:
         values = {
             key: data[key]
@@ -336,7 +535,8 @@ def db_update_purchase_order(
         }
         values["updated_at"] = time.time()
         statement = sql_update(PurchaseOrder).where(
-            PurchaseOrder.external_order_id == str(external_order_id)
+            PurchaseOrder.external_order_id == str(external_order_id),
+            PurchaseOrder.account_id == account_id,
         )
         if expected_statuses is not None:
             normalized = {str(status) for status in expected_statuses}
@@ -372,10 +572,25 @@ def db_replace_cancelled_order_with_paid_purchase(
             raise ValueError("购入市场价须大于 0")
 
     now = time.time()
+    account_id = _current_account_id()
+    if not account_id:
+        raise ValueError("未选择当前账号")
     with get_session() as session:
         old_order = session.exec(
-            select(PurchaseOrder).where(PurchaseOrder.external_order_id == old_order_id)
+            select(PurchaseOrder).where(
+                PurchaseOrder.external_order_id == old_order_id,
+                PurchaseOrder.account_id == account_id,
+            )
         ).first()
+        if old_order is None:
+            old_order = session.exec(
+                select(PurchaseOrder).where(
+                    PurchaseOrder.external_order_id == old_order_id,
+                    (PurchaseOrder.account_id == "") | PurchaseOrder.account_id.is_(None),
+                )
+            ).first()
+            if old_order is not None:
+                old_order.account_id = account_id
         if old_order is None:
             raise ValueError("旧订单不存在")
         if old_order.status not in {
@@ -412,6 +627,7 @@ def db_replace_cancelled_order_with_paid_purchase(
             user_confirmed_at=now,
             paid_at=now,
             error=f"手工重新下单并付款，替代已取消订单 {old_order_id}",
+            account_id=account_id,
         )
         session.add(replacement)
         for _ in range(quantity):
@@ -425,6 +641,7 @@ def db_replace_cancelled_order_with_paid_purchase(
                 external_order_id=new_order_id,
                 source="manual_replacement",
                 order_status="awaiting_ship",
+                account_id=account_id,
             ))
         session.commit()
         return {
@@ -437,9 +654,14 @@ def db_replace_cancelled_order_with_paid_purchase(
             "status": "awaiting_ship",
         }
 
-def db_get_purchase_orders() -> list:
+def db_get_purchase_orders(account_id: Optional[str] = None) -> list:
+    aid = _current_account_id(account_id)
+    if not aid:
+        return []
     with get_session() as session:
-        rows = session.exec(select(PurchaseOrder).order_by(PurchaseOrder.id)).all()
+        rows = session.exec(
+            select(PurchaseOrder).where(PurchaseOrder.account_id == aid).order_by(PurchaseOrder.id)
+        ).all()
         return [
             {
                 "id": row.id,
@@ -457,14 +679,18 @@ def db_get_purchase_orders() -> list:
                 "paid_at": row.paid_at,
                 "received_at": row.received_at,
                 "error": row.error,
+                "account_id": row.account_id,
             }
             for row in rows
         ]
 
 def db_update_current_prices(prices: dict, updated_at: float) -> int:
     changed = 0
+    account_id = _current_account_id()
+    if not account_id:
+        return 0
     with get_session() as session:
-        rows = session.exec(select(Purchase)).all()
+        rows = session.exec(select(Purchase).where(Purchase.account_id == account_id)).all()
         for row in rows:
             if row.sale_price is not None and float(row.sale_price or 0) > 0:
                 continue
@@ -478,29 +704,43 @@ def db_update_current_prices(prices: dict, updated_at: float) -> int:
         if changed:
             session.commit()
     return changed
-def db_get_purchases() -> list:
+def db_get_purchases(account_id: Optional[str] = None) -> list:
+    aid = _current_account_id(account_id)
+    if not aid:
+        return []
     with get_session() as session:
-        rows = session.exec(select(Purchase).order_by(Purchase.id)).all()
+        rows = session.exec(select(Purchase).where(Purchase.account_id == aid).order_by(Purchase.id)).all()
         return [_purchase_to_dict(r) for r in rows]
 def db_append_sale(s: dict) -> None:
+    if not _current_account_id(s.get("account_id") or None):
+        raise ValueError("未选择当前账号")
     with get_session() as session:
         session.add(_sale_from_dict(s))
         session.commit()
-def db_get_sales() -> list:
+def db_get_sales(account_id: Optional[str] = None) -> list:
+    aid = _current_account_id(account_id)
+    if not aid:
+        return []
     with get_session() as session:
-        rows = session.exec(select(Sale).order_by(Sale.id)).all()
+        rows = session.exec(select(Sale).where(Sale.account_id == aid).order_by(Sale.id)).all()
         return [_sale_to_dict(r) for r in rows]
 def db_clear_transactions() -> None:
     from sqlmodel import delete as sql_delete
+    account_id = _current_account_id()
+    if not account_id:
+        return
     with get_session() as session:
-        session.exec(sql_delete(Purchase))
-        session.exec(sql_delete(Sale))
+        session.exec(sql_delete(Purchase).where(Purchase.account_id == account_id))
+        session.exec(sql_delete(Sale).where(Sale.account_id == account_id))
         session.commit()
 def db_replace_transactions(purchases: list, sales: list) -> None:
     from sqlmodel import delete as sql_delete
+    account_id = _current_account_id()
+    if not account_id:
+        raise ValueError("未选择当前账号")
     with get_session() as session:
-        session.exec(sql_delete(Purchase))
-        session.exec(sql_delete(Sale))
+        session.exec(sql_delete(Purchase).where(Purchase.account_id == account_id))
+        session.exec(sql_delete(Sale).where(Sale.account_id == account_id))
         for p in purchases:
             session.add(_purchase_from_dict(p))
         for s in sales:
@@ -508,16 +748,18 @@ def db_replace_transactions(purchases: list, sales: list) -> None:
         session.commit()
 def db_delete_purchase(idx: int) -> bool:
     """Delete purchase by positional index (0-based, ordered by id)."""
+    account_id = _current_account_id()
     with get_session() as session:
-        rows = session.exec(select(Purchase).order_by(Purchase.id)).all()
+        rows = session.exec(select(Purchase).where(Purchase.account_id == account_id).order_by(Purchase.id)).all()
         if 0 <= idx < len(rows):
             session.delete(rows[idx])
             session.commit()
             return True
     return False
 def db_delete_sale(idx: int) -> bool:
+    account_id = _current_account_id()
     with get_session() as session:
-        rows = session.exec(select(Sale).order_by(Sale.id)).all()
+        rows = session.exec(select(Sale).where(Sale.account_id == account_id).order_by(Sale.id)).all()
         if 0 <= idx < len(rows):
             session.delete(rows[idx])
             session.commit()
@@ -525,8 +767,9 @@ def db_delete_sale(idx: int) -> bool:
     return False
 def db_update_purchase(idx: int, data: dict) -> bool:
     """按位置索引更新（兼容旧接口，UI 路由使用）。"""
+    account_id = _current_account_id()
     with get_session() as session:
-        rows = session.exec(select(Purchase).order_by(Purchase.id)).all()
+        rows = session.exec(select(Purchase).where(Purchase.account_id == account_id).order_by(Purchase.id)).all()
         if 0 <= idx < len(rows):
             row = rows[idx]
             for k, v in data.items():
@@ -542,7 +785,7 @@ def db_update_purchase_by_id(db_id: int, data: dict) -> bool:
         return False
     with get_session() as session:
         row = session.get(Purchase, db_id)
-        if row is None:
+        if row is None or row.account_id != _current_account_id():
             return False
         for k, v in data.items():
             if k in _PURCHASE_UPDATABLE:
@@ -556,14 +799,15 @@ def db_delete_purchase_by_id(db_id: int) -> bool:
         return False
     with get_session() as session:
         row = session.get(Purchase, db_id)
-        if row is None:
+        if row is None or row.account_id != _current_account_id():
             return False
         session.delete(row)
         session.commit()
         return True
 def db_update_sale(idx: int, data: dict) -> bool:
+    account_id = _current_account_id()
     with get_session() as session:
-        rows = session.exec(select(Sale).order_by(Sale.id)).all()
+        rows = session.exec(select(Sale).where(Sale.account_id == account_id).order_by(Sale.id)).all()
         if 0 <= idx < len(rows):
             row = rows[idx]
             for k, v in data.items():
@@ -579,7 +823,7 @@ def db_delete_sale_by_id(db_id: int) -> bool:
         return False
     with get_session() as session:
         row = session.get(Sale, db_id)
-        if row is None:
+        if row is None or row.account_id != _current_account_id():
             return False
         session.delete(row)
         session.commit()

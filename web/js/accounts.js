@@ -33,6 +33,7 @@ function renderAccountDetail(acc, currentId) {
   else if (currency === "RUB") currencyLabel = "卢布 (RUB)";
   else if (currency === "EUR") currencyLabel = "欧元 (EUR)";
   const region = (acc.region_code || "").toUpperCase();
+  const runtime = acc.runtime || {};
   let regionLabel = region || "—";
   if (region === "CN") regionLabel = "中国 (CN)";
   else if (region === "HK") regionLabel = "中国香港 (HK)";
@@ -51,6 +52,7 @@ function renderAccountDetail(acc, currentId) {
       </div>
       <div class="account-detail-actions">
         <button type="button" class="btn btn-secondary btn-sm" id="btn-acc-verify" data-id="${escapeHtml(acc.id)}">验证</button>
+        ${isCurrent ? `<button type="button" class="btn btn-secondary btn-sm" id="btn-acc-relogin">更新 Steam 信息</button>` : ""}
         ${!isCurrent ? `<button type="button" class="btn btn-primary btn-sm" id="btn-acc-set-current" data-id="${escapeHtml(acc.id)}">设为当前</button>` : ""}
         <button type="button" class="btn btn-edit btn-sm" id="btn-acc-edit" data-id="${escapeHtml(acc.id)}">编辑</button>
         <button type="button" class="btn btn-danger-outline btn-sm" id="btn-acc-del" data-id="${escapeHtml(acc.id)}">删除</button>
@@ -64,6 +66,14 @@ function renderAccountDetail(acc, currentId) {
         <div class="kv"><div class="k">头像</div><div class="v">${acc.avatar_url ? "已获取" : "未获取"}</div></div>
         <div class="kv"><div class="k">结算币种</div><div class="v mono">${escapeHtml(currencyLabel)}</div></div>
         <div class="kv"><div class="k">地区</div><div class="v mono">${escapeHtml(regionLabel)}</div></div>
+        <div class="kv"><div class="k">Steam Cookie</div><div class="v">${runtime.has_cookie ? "已配置" : "未配置"}</div></div>
+        <div class="kv"><div class="k">令牌配置</div><div class="v">${runtime.has_shared_secret && runtime.has_identity_secret ? "已配置" : "未完整配置"}</div></div>
+        <div class="kv"><div class="k">自动出售</div><div class="v ${runtime.auto_sell_enabled ? "text-ok" : "text-bad"}">${runtime.auto_sell_enabled ? "已开启（仅托管商品）" : "已关闭（个人库存保护）"}</div></div>
+        <div class="kv"><div class="k">身份一致性</div><div class="v">${runtime.identity_matches === false ? "SteamID不一致" : "正常"}</div></div>
+        <div class="kv"><div class="k">本地记录</div><div class="v">购入 ${runtime.records?.purchases || 0} · 订单 ${runtime.records?.orders || 0} · 售出 ${runtime.records?.sales || 0}</div></div>
+      </div>
+      <div class="account-detail-actions" style="margin-top:12px">
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-acc-auto-sell" data-id="${escapeHtml(acc.id)}" data-enabled="${runtime.auto_sell_enabled ? "1" : "0"}">${runtime.auto_sell_enabled ? "关闭自动出售" : "开启自动出售"}</button>
       </div>
       <div class="callout">
         <svg class="callout-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
@@ -98,13 +108,39 @@ function renderAccountDetail(acc, currentId) {
     try {
       const r = await fetchJson(API + "/accounts/" + id + "/set_current", { method: "POST" });
       if (r.ok) {
-        toast("已切换当前账号");
+        toast("已切换当前账号", "正在载入该账号的凭据、库存和交易记录");
         accountsCurrentId = id;
-        refreshAccounts();
+        setTimeout(() => window.location.reload(), 500);
       } else toast("失败", r.error || "");
     } catch (err) {
       toast("失败", err.message || "");
     }
+  });
+  detail.querySelector("#btn-acc-auto-sell")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const id = btn?.dataset?.id;
+    if (!id) return;
+    const enabled = btn.dataset.enabled !== "1";
+    if (enabled && !(await appConfirm(
+      "开启后只会自动出售该账号中具有完全匹配 assetid 的 AetherSwap 购入商品；原有个人库存仍受保护。确定开启？",
+      { title: "开启自动出售", confirmText: "确认开启" },
+    ))) return;
+    try {
+      const r = await fetchJson(API + "/accounts/" + id + "/auto_sell", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
+      });
+      if (!r.ok) throw new Error(r.error || "保存失败");
+      toast(enabled ? "自动出售已开启" : "自动出售已关闭", enabled ? "仅完全匹配 assetid 的托管商品可自动上架" : "该账号的库存不会自动上架");
+      await refreshAccounts();
+    } catch (err) {
+      toast("保存失败", err.message || "");
+    }
+  });
+  detail.querySelector("#btn-acc-relogin")?.addEventListener("click", () => {
+    showReloginModal("steam");
+    const btnOpen = el("relogin-btn-open");
+    if (btnOpen) btnOpen.click();
   });
   detail.querySelector("#btn-acc-verify")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
@@ -117,19 +153,20 @@ function renderAccountDetail(acc, currentId) {
       const r = await fetchJson(API + "/accounts/" + id + "/verify", { method: "POST" });
       if (r.ok) {
         toast("验证通过", r.message || "可自动登录");
-        refreshAccounts();
+        accountsCurrentId = id;
+        await refreshAccounts();
       } else if (r.status === "rate_limited" || r.status === "temporarily_unavailable") {
-        toast("Steam 暂时无法验证", r.message || "Cookie 已保留，请稍后再试");
+        toast("Steam 暂时无法验证", r.message || "Cookie 已保留，请稍后再试", 12000);
       } else if (r.status === "need_2fa" || r.status === "wrong_creds") {
         toast(r.message || "自动登录未通过，改用浏览器登录");
         showReloginModal("steam");
         const btnOpen = el("relogin-btn-open");
         if (btnOpen) btnOpen.click();
       } else {
-        toast("验证未通过", r.message || "请检查账号密码");
+        toast("验证未通过", r.message || "请检查账号密码", 12000);
       }
     } catch (err) {
-      toast("验证失败", err.message || "");
+      toast("验证失败", err.message || "", 12000);
     } finally {
       btn.disabled = false;
       btn.textContent = origText || "验证";

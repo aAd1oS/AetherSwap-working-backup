@@ -495,6 +495,8 @@ async function refreshTransactions() {
   if (!tbodyP && !tbodyS && !tbodyHistory) return;
   try {
     const d = await fetchJson(API + "/transactions?enrich_current_price=0");
+    const historyAccountEl = el("history-account-name");
+    if (historyAccountEl) historyAccountEl.textContent = d.account?.name || d.account?.steam_id || "未选择账号";
     const all = d.transactions || [];
     const byKey = (t) => `${t.type}:${t.idx}`;
     const enrichedMap = new Map((lastEnrichData || []).map((t) => [byKey(t), t]));

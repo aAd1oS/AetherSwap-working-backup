@@ -12,6 +12,8 @@ from fastapi import FastAPI, BackgroundTasks
 from app.database import init_db, migrate_from_json
 init_db()
 migrate_from_json()
+from app.account_scope import ensure_account_runtime
+ensure_account_runtime()
 from app.services.workers import (
     exchange_rate_worker,
     holdings_report_worker,

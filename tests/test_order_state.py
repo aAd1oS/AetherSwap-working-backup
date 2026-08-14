@@ -61,6 +61,10 @@ def test_purchase_status_prefers_terminal_and_inventory_states():
         "order_status": "awaiting_trade",
     }) == "awaiting_trade"
     assert order_state.derive_purchase_status({"assetid": "1"}) == "received"
+    assert order_state.derive_purchase_status({
+        "assetid": "2",
+        "order_status": "trade_locked",
+    }) == "trade_locked"
 
 
 def test_reconcile_does_not_revive_terminal_order(monkeypatch):
