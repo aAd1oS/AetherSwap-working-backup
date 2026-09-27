@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import time
 from typing import Optional
 
 from app.accounts import get_account, get_current_id, list_accounts, update_account
 from app.database import (
     db_account_record_counts,
     db_get_account_runtime,
+    db_has_any_account_buff_credentials,
     db_has_any_account_runtime,
     db_upsert_account_runtime,
 )
@@ -60,11 +62,12 @@ def _migrate_legacy_account_runtimes() -> None:
     """Split the old global Cookie and token settings without guessing identity."""
     if db_has_any_account_runtime():
         return
-    from config import get_steam, load_app_config
+    from config import get_buff, get_steam, load_app_config
 
     accounts = list_accounts()
     current_id = _account_id()
     legacy_steam = get_steam() or {}
+    legacy_buff = get_buff() or {}
     legacy_config = load_app_config() or {}
     guard = legacy_config.get("steam_guard") or {}
     confirm = legacy_config.get("steam_confirm") or {}
@@ -85,13 +88,18 @@ def _migrate_legacy_account_runtimes() -> None:
     # global Cookie can be proven to belong to another account by SteamID.
     if current_id:
         current = get_account(current_id) or {}
-        db_upsert_account_runtime(current_id, {
+        current_data = {
             "steam_id": current.get("steam_id") or "",
             "shared_secret": guard.get("shared_secret") or "",
             "identity_secret": confirm.get("identity_secret") or "",
             "device_id": confirm.get("device_id") or "",
             "auto_confirm_enabled": bool(confirm.get("enabled", False)),
-        })
+        }
+        # A global BUFF session cannot be matched to a Steam account. It is
+        # only safe to migrate automatically when exactly one account exists.
+        if len(accounts) == 1:
+            current_data["buff_cookies"] = legacy_buff.get("cookies") or ""
+        db_upsert_account_runtime(current_id, current_data)
     if credential_account_id:
         credential_account = get_account(credential_account_id) or {}
         db_upsert_account_runtime(credential_account_id, {
@@ -110,6 +118,49 @@ def get_account_steam_credentials(account_id: Optional[str] = None) -> dict:
         "session_id": runtime.get("session_id", ""),
         "steam_id": runtime.get("steam_id", ""),
     }
+
+
+def get_account_buff_credentials(account_id: Optional[str] = None) -> dict:
+    aid = _account_id(account_id)
+    runtime = ensure_account_runtime(aid)
+    if runtime is None:
+        from config import get_buff
+        return get_buff() or {}
+    cookies = str(runtime.get("buff_cookies") or "").strip()
+    if not cookies and len(list_accounts()) == 1 and not db_has_any_account_buff_credentials():
+        from config import get_buff
+        legacy_cookies = str((get_buff() or {}).get("cookies") or "").strip()
+        if legacy_cookies:
+            runtime = db_upsert_account_runtime(aid, {"buff_cookies": legacy_cookies})
+            cookies = str(runtime.get("buff_cookies") or "").strip()
+    return {"cookies": cookies}
+
+
+def update_account_buff_credentials(
+    cookies: str,
+    account_id: Optional[str] = None,
+) -> None:
+    aid = _account_id(account_id)
+    if not aid:
+        raise ValueError("未选择当前 Steam 账号")
+    ensure_account_runtime(aid)
+    db_upsert_account_runtime(aid, {"buff_cookies": cookies})
+
+
+def get_account_c5_credentials(account_id: Optional[str] = None) -> dict:
+    runtime = ensure_account_runtime(account_id) or {}
+    return {"app_key": str(runtime.get("c5_app_key") or "").strip()}
+
+
+def update_account_c5_credentials(
+    app_key: str,
+    account_id: Optional[str] = None,
+) -> None:
+    aid = _account_id(account_id)
+    if not aid:
+        raise ValueError("未选择当前 Steam 账号")
+    ensure_account_runtime(aid)
+    db_upsert_account_runtime(aid, {"c5_app_key": app_key})
 
 
 def update_account_steam_credentials(
@@ -148,6 +199,9 @@ def overlay_account_config(config: dict, account_id: Optional[str] = None) -> di
     })
     result["steam_guard"] = guard
     result["steam_confirm"] = confirm
+    c5 = dict(result.get("c5") or {})
+    c5["app_key"] = runtime.get("c5_app_key", "")
+    result["c5"] = c5
     return result
 
 
@@ -157,26 +211,48 @@ def save_account_config(config: dict, account_id: Optional[str] = None) -> None:
         return
     guard = config.get("steam_guard") or {}
     confirm = config.get("steam_confirm") or {}
+    c5 = config.get("c5") or {}
     ensure_account_runtime(aid)
     db_upsert_account_runtime(aid, {
         "shared_secret": guard.get("shared_secret") or "",
         "identity_secret": confirm.get("identity_secret") or "",
         "device_id": confirm.get("device_id") or "",
         "auto_confirm_enabled": bool(confirm.get("enabled", False)),
+        "c5_app_key": c5.get("app_key") or "",
     })
 
 
 def get_account_runtime_status(account_id: str) -> dict:
     aid = _account_id(account_id)
     account = get_account(aid) or {}
+    buff_credentials = get_account_buff_credentials(aid)
     runtime = ensure_account_runtime(aid) or {}
     expected_steam_id = str(account.get("steam_id") or runtime.get("steam_id") or "").strip()
     cookie_steam_id = _steam_id_from_cookies(runtime.get("cookies", ""))
     identity_matches = not expected_steam_id or not cookie_steam_id or expected_steam_id == cookie_steam_id
+    last_ok_at = float(account.get("steam_session_last_ok_at") or 0)
+    last_issue_at = float(account.get("steam_session_last_issue_at") or 0)
+    last_issue_status = str(account.get("steam_session_last_issue_status") or "").strip()
+    if not runtime.get("cookies"):
+        session_status = "unconfigured"
+    elif not identity_matches:
+        session_status = "invalid"
+    elif last_issue_status == "invalid" and last_issue_at >= last_ok_at:
+        session_status = "invalid"
+    elif last_ok_at > 0 and time.time() - last_ok_at <= 24 * 3600:
+        session_status = "valid"
+    elif last_ok_at > 0:
+        session_status = "stale"
+    elif last_issue_status in {"rate_limited", "unavailable"}:
+        session_status = last_issue_status
+    else:
+        session_status = "pending"
     return {
         "account_id": aid,
         "has_cookie": bool(runtime.get("cookies")),
         "has_session_id": bool(runtime.get("session_id")),
+        "has_buff_cookie": bool(buff_credentials.get("cookies")),
+        "has_c5_app_key": bool(runtime.get("c5_app_key")),
         "has_shared_secret": bool(runtime.get("shared_secret")),
         "has_identity_secret": bool(runtime.get("identity_secret")),
         "has_device_id": bool(runtime.get("device_id")),
@@ -185,6 +261,14 @@ def get_account_runtime_status(account_id: str) -> dict:
         "expected_steam_id": expected_steam_id,
         "cookie_steam_id": cookie_steam_id,
         "identity_matches": identity_matches,
+        "steam_session": {
+            "status": session_status,
+            "last_ok_at": last_ok_at,
+            "last_ok_source": str(account.get("steam_session_last_ok_source") or ""),
+            "last_issue_at": last_issue_at,
+            "last_issue_status": last_issue_status,
+            "last_issue": str(account.get("steam_session_last_issue") or ""),
+        },
         "records": db_account_record_counts(aid),
     }
 

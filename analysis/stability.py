@@ -28,7 +28,7 @@ def _percentile(sorted_arr: List[float], p: float) -> float:
     hi = min(lo + 1, n - 1)
     frac = pos - lo
     return sorted_arr[lo] * (1 - frac) + sorted_arr[hi] * frac
-def _iqr_bounds(prices: List[float]) -> Tuple[float, float]:
+def _iqr_bounds(prices: List[float], multiplier: float = 1.5) -> Tuple[float, float]:
     if not prices or len(prices) < 3:
         return float("-inf"), float("inf")
     sorted_prices = sorted(prices)
@@ -39,22 +39,22 @@ def _iqr_bounds(prices: List[float]) -> Tuple[float, float]:
     mean_p = statistics.mean(sorted_prices)
     min_buffer = max(0.5, mean_p * 0.05)
     effective_iqr = max(iqr, min_buffer)
-    return q1 - 1.5 * effective_iqr, q3 + 1.5 * effective_iqr
-def clean_prices_iqr(prices: List[float]) -> List[float]:
+    return q1 - multiplier * effective_iqr, q3 + multiplier * effective_iqr
+def clean_prices_iqr(prices: List[float], multiplier: float = 1.5) -> List[float]:
     if not prices or len(prices) < 3:
         return list(prices)
     sorted_prices = sorted(prices)
-    lower_bound, upper_bound = _iqr_bounds(prices)
+    lower_bound, upper_bound = _iqr_bounds(prices, multiplier)
     clean = [p for p in sorted_prices if lower_bound <= p <= upper_bound]
     if len(clean) == 0:
         trim_count = max(1, int(len(sorted_prices) * 0.1))
         n = len(sorted_prices)
         return sorted_prices[trim_count : n - trim_count] if trim_count * 2 < n else sorted_prices
     return clean
-def _vwap_iqr(prices: List[float], volumes: List[int]) -> Optional[float]:
+def _vwap_iqr(prices: List[float], volumes: List[int], multiplier: float = 1.5) -> Optional[float]:
     if not prices or len(prices) != len(volumes):
         return None
-    lower, upper = _iqr_bounds(prices)
+    lower, upper = _iqr_bounds(prices, multiplier)
     sum_pv = 0.0
     sum_v = 0
     for p, v in zip(prices, volumes):
@@ -64,6 +64,58 @@ def _vwap_iqr(prices: List[float], volumes: List[int]) -> Optional[float]:
     if sum_v <= 0:
         return None
     return sum_pv / sum_v
+def _clean_timed_prices_iqr(
+    rows: List[Tuple[datetime, float, int]],
+    multiplier: float = 1.5,
+    max_removed_ratio: float = 0.2,
+    protect_persistent_recent: bool = True,
+) -> Tuple[List[Tuple[datetime, float, int]], dict]:
+    """Remove isolated IQR outliers while failing closed on a recent regime shift."""
+    raw_count = len(rows)
+    if not rows:
+        return [], {
+            "status": "UNAVAILABLE", "reason": "no_data", "raw_count": 0,
+            "clean_count": 0, "outlier_count": 0, "removed_count": 0,
+            "removed_ratio": 0.0, "lower_bound": None, "upper_bound": None,
+            "persistent_shift_detected": False, "applied": False,
+        }
+    multiplier = max(0.1, float(multiplier))
+    max_removed_ratio = min(max(float(max_removed_ratio), 0.0), 1.0)
+    lower, upper = _iqr_bounds([row[1] for row in rows], multiplier)
+    outlier_count = sum(not (lower <= row[1] <= upper) for row in rows)
+    removed_ratio = outlier_count / raw_count
+
+    by_day: dict = defaultdict(list)
+    for dt, price, _volume in rows:
+        by_day[dt.date()].append(price)
+    daily = [statistics.mean(values) for _day, values in sorted(by_day.items())]
+    recent = daily[-3:]
+    persistent_shift = bool(
+        protect_persistent_recent
+        and len(daily) >= 6
+        and (all(value > upper for value in recent) or all(value < lower for value in recent))
+    )
+    audit = {
+        "status": "PASS", "reason": "no_outliers", "raw_count": raw_count,
+        "clean_count": raw_count, "outlier_count": outlier_count,
+        "removed_count": 0, "removed_ratio": round(removed_ratio, 4),
+        "lower_bound": round(lower, 4), "upper_bound": round(upper, 4),
+        "persistent_shift_detected": persistent_shift, "applied": False,
+    }
+    if persistent_shift:
+        audit.update(status="REJECT", reason="persistent_shift")
+        return list(rows), audit
+    if removed_ratio > max_removed_ratio:
+        audit.update(status="REJECT", reason="excessive_outliers")
+        return list(rows), audit
+    if outlier_count:
+        cleaned = [row for row in rows if lower <= row[1] <= upper]
+        audit.update(
+            reason="cleaned", clean_count=len(cleaned),
+            removed_count=outlier_count, applied=True,
+        )
+        return cleaned, audit
+    return list(rows), audit
 def _apply_currency(prices: list, currency: Optional[str], usd_to_cny: float) -> tuple:
     from utils.money import apply_currency
     return apply_currency(prices, currency, usd_to_cny)
@@ -110,6 +162,76 @@ def _linear_regression_r_squared(ys: List[float]) -> Optional[float]:
         return 0.0
     ss_res = sum((y - yp) ** 2 for y, yp in zip(ys, y_pred))
     return 1.0 - ss_res / ss_tot
+def _theil_sen_slope(ys: List[float]) -> Optional[float]:
+    """Return the median pairwise slope without adding a SciPy dependency."""
+    if len(ys) < 2:
+        return None
+    slopes = [
+        (ys[j] - ys[i]) / (j - i)
+        for i in range(len(ys) - 1)
+        for j in range(i + 1, len(ys))
+    ]
+    return statistics.median(slopes) if slopes else None
+def _average_ranks(values: List[float]) -> List[float]:
+    indexed = sorted(enumerate(values), key=lambda pair: pair[1])
+    ranks = [0.0] * len(values)
+    pos = 0
+    while pos < len(indexed):
+        end = pos + 1
+        while end < len(indexed) and indexed[end][1] == indexed[pos][1]:
+            end += 1
+        average_rank = (pos + 1 + end) / 2.0
+        for original_index, _value in indexed[pos:end]:
+            ranks[original_index] = average_rank
+        pos = end
+    return ranks
+def _spearman_rho(ys: List[float]) -> Optional[float]:
+    if len(ys) < 2:
+        return None
+    x_ranks = _average_ranks([float(i) for i in range(len(ys))])
+    y_ranks = _average_ranks(ys)
+    mean_x = statistics.mean(x_ranks)
+    mean_y = statistics.mean(y_ranks)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_ranks, y_ranks))
+    denominator = (
+        sum((x - mean_x) ** 2 for x in x_ranks)
+        * sum((y - mean_y) ** 2 for y in y_ranks)
+    ) ** 0.5
+    return numerator / denominator if denominator > 0 else 0.0
+def _robust_shadow_metrics(values: List[float], recent_points: int = 3) -> dict:
+    """Diagnostics only: callers must not use these fields to accept/reject trades."""
+    if not values:
+        return {
+            "mad": None,
+            "robust_cv": None,
+            "theil_sen_slope": None,
+            "spearman_rho": None,
+            "spike_persistence": None,
+            "spike_threshold": None,
+        }
+    median_value = statistics.median(values)
+    mad = statistics.median(abs(value - median_value) for value in values)
+    robust_cv = (
+        (1.4826 * mad) / abs(median_value)
+        if median_value != 0
+        else None
+    )
+    recent_count = min(max(1, recent_points), len(values))
+    baseline = values[:-recent_count] if len(values) >= recent_count + 3 else values
+    baseline_median = statistics.median(baseline)
+    baseline_mad = statistics.median(abs(value - baseline_median) for value in baseline)
+    robust_sigma = 1.4826 * baseline_mad
+    min_gap = max(abs(baseline_median) * 0.03, 0.05)
+    spike_threshold = baseline_median + max(3.0 * robust_sigma, min_gap)
+    persistence = sum(value > spike_threshold for value in values[-recent_count:]) / recent_count
+    return {
+        "mad": round(mad, 4),
+        "robust_cv": round(robust_cv, 4) if robust_cv is not None else None,
+        "theil_sen_slope": round(_theil_sen_slope(values) or 0.0, 4),
+        "spearman_rho": round(_spearman_rho(values) or 0.0, 4),
+        "spike_persistence": round(persistence, 4),
+        "spike_threshold": round(spike_threshold, 2),
+    }
 def _ema(values: List[float], span: int) -> float:
     if not values:
         return 0.0
@@ -143,6 +265,7 @@ def analyze_by_time(
     history: Optional[list],
     days: int = 30,
     *,
+    as_of: Optional[datetime] = None,
     currency: Optional[str] = None,
     usd_to_cny: float = USD_TO_CNY,
     cv_threshold: float = CV_STABLE_LOW,
@@ -160,17 +283,22 @@ def analyze_by_time(
     slope_stable_floor: float = -0.005,
     price_percentile_ceil_rising: float = 0.5,
     use_vwap: bool = True,
+    outlier_filter_enabled: bool = False,
+    outlier_iqr_multiplier: float = 1.5,
+    outlier_max_removed_ratio: float = 0.2,
+    outlier_protect_persistent_recent: bool = True,
 ) -> dict:
     if not history:
         return {"valid": False, "msg": "无历史数据"}
-    cutoff = datetime.now() - timedelta(days=days)
+    reference_time = as_of or datetime.now()
+    cutoff = reference_time - timedelta(days=days)
     dt_prices: List[Tuple[datetime, float]] = []
     volumes = []
     for item in history:
         if len(item) < 2:
             continue
         dt = _parse_item_date(str(item[0]))
-        if dt is None or dt < cutoff:
+        if dt is None or dt < cutoff or dt > reference_time:
             continue
         try:
             p = float(item[1])
@@ -183,21 +311,49 @@ def analyze_by_time(
     raw_prices = [p for _, p in dt_prices]
     prices, out_currency = _apply_currency(raw_prices, currency, usd_to_cny)
     dt_prices_cny = [(dt, prices[i]) for i, (dt, _) in enumerate(dt_prices)]
-    count = len(prices)
-    if count < MIN_TRADES:
-        return {"valid": False, "msg": f"最近 {days} 天内成交过少 ({count} 单)"}
-    clean_prices = clean_prices_iqr(prices)
-    last_price = max(dt_prices_cny, key=lambda x: x[0])[1] if dt_prices_cny else None
+    raw_count = len(prices)
+    if raw_count < MIN_TRADES:
+        return {"valid": False, "msg": f"最近 {days} 天内成交过少 ({raw_count} 单)"}
+    timed_rows = [(dt, price, volumes[i]) for i, (dt, price) in enumerate(dt_prices_cny)]
+    outlier_audit = {
+        "status": "DISABLED", "reason": "disabled", "raw_count": raw_count,
+        "clean_count": raw_count, "outlier_count": 0, "removed_count": 0,
+        "removed_ratio": 0.0, "lower_bound": None, "upper_bound": None,
+        "persistent_shift_detected": False, "applied": False,
+    }
+    analysis_rows = timed_rows
+    if outlier_filter_enabled:
+        analysis_rows, outlier_audit = _clean_timed_prices_iqr(
+            timed_rows,
+            multiplier=outlier_iqr_multiplier,
+            max_removed_ratio=outlier_max_removed_ratio,
+            protect_persistent_recent=outlier_protect_persistent_recent,
+        )
+    analysis_dt_prices = [(dt, price) for dt, price, _volume in analysis_rows]
+    analysis_prices = [price for _dt, price, _volume in analysis_rows]
+    analysis_volumes = [volume for _dt, _price, volume in analysis_rows]
+    count = len(analysis_prices)
+    clean_prices = (
+        analysis_prices
+        if outlier_filter_enabled and outlier_audit["status"] == "PASS"
+        else clean_prices_iqr(prices)
+    )
+    last_price = max(analysis_dt_prices, key=lambda x: x[0])[1] if analysis_dt_prices else None
     if current_price is None and last_price is not None:
         current_price = last_price
     avg = statistics.mean(clean_prices)
-    vwap = _vwap_iqr(prices, volumes) if use_vwap else None
+    vwap = _vwap_iqr(
+        analysis_prices,
+        analysis_volumes,
+        outlier_iqr_multiplier if outlier_filter_enabled else 1.5,
+    ) if use_vwap else None
     ref_price = vwap if (use_vwap and vwap is not None) else avg
     stdev = statistics.stdev(clean_prices) if len(clean_prices) > 1 else 0
     cv = stdev / avg if avg > 0 else 0
-    total_volume = sum(volumes)
-    daily_last = _daily_avg_prices_last_n(dt_prices_cny, n=slope_days)
-    daily_30 = _daily_avg_prices_last_n(dt_prices_cny, n=min(30, days))
+    total_volume = sum(analysis_volumes)
+    daily_last = _daily_avg_prices_last_n(analysis_dt_prices, n=slope_days)
+    daily_30 = _daily_avg_prices_last_n(analysis_dt_prices, n=min(30, days))
+    robust_shadow = _robust_shadow_metrics(daily_last)
     ma7 = _ema(daily_last, span=slope_days) if daily_last else 0.0
     ma30 = _ema(daily_30, span=min(30, days)) if daily_30 else 0.0
     bb_stdev = statistics.stdev(daily_30) if len(daily_30) > 1 else 0.0
@@ -257,6 +413,16 @@ def analyze_by_time(
             is_stable = False
             reasons.append(f"趋势异常({status})")
 
+    if outlier_filter_enabled and outlier_audit["status"] == "REJECT":
+        is_stable = False
+        if outlier_audit["reason"] == "persistent_shift":
+            reasons.append("近期连续异常价格可能代表市场换挡，暂停购入")
+        else:
+            reasons.append(
+                "历史异常点占比"
+                f"{outlier_audit['removed_ratio']:.1%}超过上限{outlier_max_removed_ratio:.1%}"
+            )
+
     price_min = min(clean_prices)
     price_max = max(clean_prices)
     percentile_ceil = price_percentile_ceil_rising if status == STATUS_RISING else price_percentile_ceil
@@ -270,10 +436,14 @@ def analyze_by_time(
         price_percentile = 0.5
 
     recent_percentile: Optional[float] = None
-    cutoff_14 = datetime.now() - timedelta(days=14)
-    recent_prices_cny = [p for dt, p in dt_prices_cny if dt >= cutoff_14]
+    cutoff_14 = reference_time - timedelta(days=14)
+    recent_prices_cny = [p for dt, p in analysis_dt_prices if dt >= cutoff_14]
     if recent_prices_cny:
-        recent_clean = clean_prices_iqr(recent_prices_cny)
+        recent_clean = (
+            recent_prices_cny
+            if outlier_filter_enabled and outlier_audit["status"] == "PASS"
+            else clean_prices_iqr(recent_prices_cny)
+        )
         if recent_clean:
             recent_min = min(recent_clean)
             recent_max = max(recent_clean)
@@ -311,6 +481,8 @@ def analyze_by_time(
         "valid": True,
         "days": days,
         "count": count,
+        "raw_count": raw_count,
+        "clean_count": count,
         "total_volume": total_volume,
         "avg_daily_volume": round(total_volume / days, 1),
         "avg": round(avg, 2),
@@ -318,6 +490,7 @@ def analyze_by_time(
         "min": min(clean_prices),
         "max": max(clean_prices),
         "cv": round(cv, 4),
+        **robust_shadow,
         "slope": round(slope, 4),
         "r_squared": round(r_squared, 4),
         "trend": trend,
@@ -336,6 +509,15 @@ def analyze_by_time(
         "percentile_ceil": percentile_ceil,
         "bb_upper": round(bb_upper, 2) if 'bb_upper' in locals() else None,
         "bb_lower": round(bb_lower, 2) if 'bb_lower' in locals() else None,
+        "outlier_filter_status": outlier_audit["status"],
+        "outlier_filter_reason": outlier_audit["reason"],
+        "outlier_count": outlier_audit["outlier_count"],
+        "outlier_removed_count": outlier_audit["removed_count"],
+        "outlier_removed_ratio": outlier_audit["removed_ratio"],
+        "outlier_lower_bound": outlier_audit["lower_bound"],
+        "outlier_upper_bound": outlier_audit["upper_bound"],
+        "persistent_shift_detected": outlier_audit["persistent_shift_detected"],
+        "outlier_filter_applied": outlier_audit["applied"],
     }
 def calculate_stability(
     history: Optional[list],

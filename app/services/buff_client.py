@@ -6,6 +6,7 @@ from buff.buyer import (
     BuffVerificationRequired,
     PAY_METHOD_ALIPAY,
     PAY_METHOD_WECHAT,
+    BuffOrderOutcomeUnknown,
 )
 from utils.buff_protection import BuffProtectionError
 from app.services.buff_balance import record_buff_balance_preview
@@ -66,6 +67,8 @@ class BuffClient:
         return self._buyer.get_sell_orders(goods_id, game)
     def get_goods_steam_price_cny(self, search_name: str, game: str = "csgo") -> Optional[float]:
         return self._buyer.get_goods_steam_price_cny(search_name, game)
+    def get_available_funds_once(self) -> Dict[str, Any]:
+        return self._buyer.get_available_funds(timeout=self._timeout)
     def ask_seller_to_send(self, bill_order_id_or_ids: Union[str, List[str]], game: str = "csgo") -> bool:
         return self._buyer.ask_seller_to_send(bill_order_id_or_ids, game)
     @with_retry(max_attempts=buff_retry_attempts, fatal_exceptions=(BuffAuthExpired, BuffVerificationRequired, BuffProtectionError))
@@ -77,6 +80,35 @@ class BuffClient:
         price: str,
     ) -> Dict[str, Any]:
         return self._buyer.lock_and_get_pay_url(game, goods_id, sell_order_id, price)
+
+    def lock_manual_order_once(self, game: str, goods_id: int, sell_order_id: str, price: str) -> Dict[str, Any]:
+        result = self._buyer.lock_order_once(
+            game, goods_id, sell_order_id, price, self._buyer.pay_method,
+            self._steam_id, timeout=self._timeout,
+        )
+        if not result.get("success"):
+            return result
+        order_id = str(result.get("order_id") or "")
+        try:
+            pay = self._buyer.get_manual_pay_url_once(game, order_id, timeout=self._timeout)
+        except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+            raise
+        except Exception as exc:
+            return {
+                "success": True, "order_id": order_id, "outcome_unknown": True,
+                "msg": f"订单已创建但支付链接请求未知: {type(exc).__name__}: {exc}",
+            }
+        if not pay.get("success"):
+            return {
+                "success": True, "order_id": order_id, "outcome_unknown": True,
+                "msg": f"订单已创建但支付链接不可用: {pay.get('msg') or '未返回链接'}",
+            }
+        return {
+            "success": True,
+            "order_id": order_id,
+            "pay_url": pay.get("pay_url") or "",
+            "pay_type": "wechat" if self._buyer.pay_method == PAY_METHOD_WECHAT else "alipay",
+        }
     def preview_balance_payment_once(
         self,
         game: str,
@@ -161,6 +193,27 @@ class BuffClient:
             "num": num,
             "total_price": unit_price * num,
         }
+
+    def try_batch_buy_once(
+        self, goods_id: int, game: str, orders: List[dict], unit_price: float, num: int
+    ) -> Optional[Dict[str, Any]]:
+        if num < 1 or self._buyer.pay_method != PAY_METHOD_WECHAT:
+            return None
+        created = self._buyer.batch_buy_create_once(goods_id, unit_price, num, game)
+        if not created.get("success"):
+            return created
+        batch_id = created["batch_id"]
+        pay_url = self._buyer.batch_buy_wx_qrcode(batch_id, game)
+        if not pay_url:
+            return {
+                "success": True, "batch_id": batch_id, "outcome_unknown": True,
+                "msg": f"批量订单 {batch_id} 已创建，但支付链接不可用",
+            }
+        return {
+            "success": True, "pay_url": pay_url, "pay_type": "wechat",
+            "batch_id": batch_id, "unit_price": unit_price, "num": num,
+            "total_price": unit_price * num,
+        }
     @with_retry(max_attempts=buff_retry_attempts, fatal_exceptions=(BuffAuthExpired, BuffVerificationRequired, BuffProtectionError))
     def batch_buy_find_and_finalize(
         self,
@@ -187,6 +240,32 @@ class BuffClient:
                 )
                 if bill_order_id:
                     matched.append({"id": o.get("id"), "price": p, "bill_order_id": bill_order_id})
+        return matched
+
+    def batch_buy_find_and_finalize_once(
+        self, goods_id: int, game: str, max_price: float, num: int, batch_id: str
+    ) -> List[Dict[str, Any]]:
+        orders = self.get_sell_orders(goods_id, game) or []
+        matched = []
+        attempted = set()
+        for order in orders:
+            if len(matched) >= num:
+                break
+            sell_order_id = str(order.get("id") or "").strip()
+            if not sell_order_id or sell_order_id in attempted:
+                continue
+            try:
+                price = float(order.get("price") or 0)
+            except (TypeError, ValueError):
+                continue
+            if price > max_price:
+                continue
+            attempted.add(sell_order_id)
+            result = self._buyer.batch_buy_finalize_once(
+                game, goods_id, sell_order_id, str(order.get("price") or ""), batch_id
+            )
+            if result.get("success"):
+                matched.append({"id": sell_order_id, "price": price, "bill_order_id": result["order_id"]})
         return matched
 def create_buff_client_from_config(
     credentials: dict,

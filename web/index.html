@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="/css/variables.css" />
   <link rel="stylesheet" href="/css/base.css" />
   <link rel="stylesheet" href="/css/layout.css?v=2" />
-  <link rel="stylesheet" href="/css/components.css" />
+  <link rel="stylesheet" href="/css/components.css?v=3" />
   <link rel="stylesheet" href="/css/animations.css" />
   <style>
     /* Nav badge */
@@ -273,14 +273,14 @@
             <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
             <line x1="7" y1="7" x2="7.01" y2="7"></line>
           </svg>
-          <span>库存管理</span>
+          <span>Steam 库存</span>
         </button>
         <button class="nav-item" data-tab="purchases">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
             <line x1="7" y1="7" x2="7.01" y2="7"></line>
           </svg>
-          <span>持有饰品</span>
+          <span>交易持仓</span>
         </button>
         <button class="nav-item" data-tab="purchase-history">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -423,15 +423,16 @@
       <section id="panel-auto" class="panel active">
         <div class="stats-grid">
           <div class="stat-card primary">
-            <div class="stat-label">总出售金额</div>
+            <div class="stat-label">总出售金额（含税）</div>
             <div class="stat-value" id="stat-total-sold">0.00</div>
-            <div class="stat-trend positive">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
-                <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline>
-                <polyline points="17 6 23 6 23 12"></polyline>
-              </svg>
-              <span>营收</span>
+            <div class="stat-tax-line">
+              <span>税后</span>
+              <span id="stat-total-sold-after-tax">0.00</span>
             </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">已出售商品购入价</div>
+            <div class="stat-value" id="stat-total-sold-cost">0.00</div>
           </div>
           <div class="stat-card">
             <div class="stat-label">总投入</div>
@@ -439,7 +440,16 @@
           </div>
           <div class="stat-card">
             <div class="stat-label">总收益</div>
-            <div class="stat-value" id="stat-diff">0.00</div>
+            <div class="stat-profit-list">
+              <div class="stat-profit-line">
+                <span class="stat-profit-name">折换收益</span>
+                <span class="stat-profit-value" id="stat-conversion-profit">0.00</span>
+              </div>
+              <div class="stat-profit-line">
+                <span class="stat-profit-name">自用收益</span>
+                <span class="stat-profit-value" id="stat-diff">0.00</span>
+              </div>
+            </div>
           </div>
           <div class="stat-card">
             <div class="stat-label">实际折扣比率</div>
@@ -514,11 +524,12 @@
       <section id="panel-purchases" class="panel">
         <div class="panel-toolbar panel-toolbar--purchases">
           <div class="panel-toolbar-row">
-            <span class="label">持有饰品</span>
+            <span class="label">AetherSwap 交易持仓</span>
+            <span class="hint">当前账号：<strong id="holdings-account-name">—</strong></span>
             <button id="btn-sync-receipts" class="btn btn-sm btn-secondary">同步入库状态</button>
             <button id="btn-refresh-holdings-prices" class="btn btn-sm btn-secondary">刷新商品现价</button>
             <span id="holdings-price-updated-at" class="hint">现价更新：尚未刷新</span>
-            <button id="btn-refresh-all-holdings" class="btn btn-sm btn-primary">刷新全部持有信息</button>
+            <button id="btn-refresh-all-holdings" class="btn btn-sm btn-primary">刷新全部持仓信息</button>
             <button id="btn-holdings-multiselect" class="btn btn-sm btn-secondary">多选</button>
             <div id="holdings-batch-actions" class="hidden" style="display:none;gap:8px;align-items:center;">
               <button id="btn-holdings-batch-sell" class="btn btn-sm btn-primary">批量出售</button>
@@ -547,6 +558,7 @@
                 <th>购入价</th>
                 <th>购入市场价</th>
                 <th>现市场价</th>
+                <th title="价差为上架价减去现市场价">上架价 / 较现价</th>
                 <th>税后价格</th>
                 <th>实际折扣比率</th>
                 <th>变现收益</th>
@@ -563,8 +575,9 @@
       <section id="panel-purchase-history" class="panel">
         <div class="panel-toolbar panel-toolbar--purchase-history">
           <div class="panel-toolbar-row">
-            <span class="label">订单台账</span>
+            <span class="label">订单台账 / 待人工处理</span>
             <div id="order-budget-summary" class="purchases-summary"></div>
+            <button id="btn-order-reconcile" class="btn btn-sm btn-secondary" type="button">平台复核</button>
           </div>
         </div>
         <div class="table-container">
@@ -883,6 +896,39 @@
                   <input type="number" id="cfg-min_volume" step="1" title="仅筛选中日成交数大于此值的物品" />
                 </div>
               </div>
+              <div class="field field--switch">
+                <label class="checkbox-wrapper">
+                  <input type="checkbox" id="cfg-c5-price-compare-enabled" />
+                  <span>启用 C5 只读比价</span>
+                </label>
+                <span class="field-hint">默认关闭。先读取 SteamDT 参考价；配置 app-key 后还会读取 C5 当前真实卖单。所有 C5 请求均为只读。</span>
+              </div>
+              <div class="field">
+                <label for="cfg-c5-app-key">C5 OpenAPI app-key</label>
+                <input type="password" id="cfg-c5-app-key" placeholder="仅保存到当前 Steam 账号" autocomplete="off" />
+                <span class="field-hint">在 C5 API 管理中申请，并按平台要求配置 IP 白名单。切换 Steam 账号时会随账号切换。</span>
+              </div>
+              <div class="field">
+                <button type="button" class="btn btn-sm btn-secondary" id="btn-check-c5">检查 C5 只读连接</button>
+                <span class="field-hint">只查询账户余额，不创建订单、不付款、不触发 Steam 交易。</span>
+              </div>
+              <div class="field field--switch">
+                <label class="checkbox-wrapper">
+                  <input type="checkbox" id="cfg-c5-manual-recommendation-enabled" />
+                  <span>C5 明显更低时转为人工购买建议</span>
+                </label>
+                <span class="field-hint">满足下方价差且原 BUFF 候选已通过现有安全检查时，发送 Lark/备用通知并跳过本件 BUFF 锁单；不会自动在 C5 下单。</span>
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="cfg-c5-min-savings-percent">最低节省比例（%）</label>
+                  <input type="number" id="cfg-c5-min-savings-percent" min="0" step="0.1" />
+                </div>
+                <div class="field">
+                  <label for="cfg-c5-min-savings-amount">最低节省金额（元）</label>
+                  <input type="number" id="cfg-c5-min-savings-amount" min="0" step="0.01" />
+                </div>
+              </div>
             </div>
           </div>
 
@@ -976,10 +1022,17 @@
             <div class="form-grid">
               <div class="field-row">
                 <div class="field">
-                  <label for="cfg-pushplus_token">PushPlus Token</label>
-                  <input type="password" id="cfg-pushplus_token" placeholder="* 必填 — 微信推送 Token"
+                  <label for="cfg-lark_webhook">Lark Webhook（推荐）</label>
+                  <input type="password" id="cfg-lark_webhook" placeholder="Lark 自定义机器人 Webhook"
                     autocomplete="new-password" />
                 </div>
+                <div class="field">
+                  <label for="cfg-pushplus_token">PushPlus Token</label>
+                  <input type="password" id="cfg-pushplus_token" placeholder="可选 — Lark 不可用时兜底"
+                    autocomplete="new-password" />
+                </div>
+              </div>
+              <div class="field-row">
                 <div class="field">
                   <label for="cfg-holdings_report_interval_hours">定时回报间隔（小时）</label>
                   <input type="number" id="cfg-holdings_report_interval_hours" min="0" max="720" placeholder="0"
@@ -1010,7 +1063,7 @@
               <div class="field-row">
                 <div class="field">
                   <label for="cfg-target_sender">指令发件人(含昵称)</label>
-                  <input type="text" id="cfg-target_sender" placeholder="VexedWilson" title="邮件发件人需包含此字符串" />
+                  <input type="text" id="cfg-target_sender" placeholder="付款通知发件人关键字（可选）" title="邮件发件人需包含此字符串" />
                 </div>
                 <div class="field">
                   <label for="cfg-allowed_sender">允许的发件人邮箱</label>
@@ -1042,6 +1095,40 @@
                   <label>无符合时重试间隔（秒）</label>
                   <input type="number" id="cfg-retry_interval_seconds" min="60" placeholder="300"
                     title="暂无符合条件或本轮回无稳定品时，等待多少秒后重新拉取判定" />
+                </div>
+                <div class="field">
+                  <label for="cfg-max-run-rounds">运行轮次</label>
+                  <input type="number" id="cfg-max-run-rounds" min="0" max="1000" step="1" placeholder="0"
+                    title="完成多少个 SteamDT 拉取、筛选和等待轮次后自动结束；0 表示不限轮次" />
+                </div>
+                <div class="field">
+                  <label for="cfg-max-auto-listing-price-cny">自动上架单价上限（元）</label>
+                  <input type="number" id="cfg-max-auto-listing-price-cny" min="0.01" step="0.01" placeholder="50"
+                    title="智能定价超过该金额时不提交 Steam 上架请求；默认 50 元" />
+                </div>
+                <div class="field field--switch">
+                  <label class="checkbox-wrapper">
+                    <input type="checkbox" id="cfg-stale-listing-staged-mode-enabled" />
+                    <span>开启上架分段自动模式策略</span>
+                  </label>
+                  <span class="field-hint">按 24h / 48h / 72h 分段评估排队与流动性；关闭时保留原 24h 复评逻辑。</span>
+                </div>
+                <div class="field field--switch">
+                  <label class="checkbox-wrapper">
+                    <input type="checkbox" id="cfg-strategy-module-logs-enabled" />
+                    <span>输出策略模块判定日志</span>
+                  </label>
+                  <span class="field-hint">仅控制额外的数学/非数学模块解释日志，不会关闭策略或安全检查。</span>
+                </div>
+                <div class="field">
+                  <label for="cfg-iflow_top_n">正常每轮检查数量（建议10～30）</label>
+                  <input type="number" id="cfg-iflow_top_n" min="1" step="1" placeholder="30"
+                    title="超过30会增加BUFF请求量及限流风险；恢复期会再应用下方独立上限" />
+                </div>
+                <div class="field">
+                  <label for="cfg-buff-protection-recovery-candidate-cap">BUFF保护恢复期每轮数量（建议10～30）</label>
+                  <input type="number" id="cfg-buff-protection-recovery-candidate-cap" min="1" step="1"
+                    placeholder="30" title="超过30会削弱保护并增加限流风险；实际不会超过正常每轮数量" />
                 </div>
                 <div class="field">
                   <label>库存自动刷新 (秒)</label>
@@ -1139,19 +1226,30 @@
           </div>
           <button id="btn-refresh-inventory" class="btn btn-sm btn-secondary">刷新库存</button>
         </div>
+        <div class="inventory-table-controls">
+          <div class="inventory-view-tabs" role="tablist" aria-label="库存归属分类">
+            <button type="button" class="inventory-view-tab active" data-inventory-view="managed" role="tab" aria-selected="true">
+              自动托管 <span id="inv-managed-count">0</span>
+            </button>
+            <button type="button" class="inventory-view-tab" data-inventory-view="personal" role="tab" aria-selected="false">
+              个人保护 <span id="inv-personal-count">0</span>
+            </button>
+          </div>
+          <span class="inventory-sort-hint">点击列名排序</span>
+        </div>
         <div class="table-container">
           <table id="inv-table">
             <thead>
               <tr>
-                <th>物品名称</th>
-                <th>库存归属</th>
-                <th>磨损</th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="name">物品名称</button></th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="ownership">库存归属</button></th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="wear">磨损</button></th>
                 <th>链接</th>
-                <th>可出售</th>
-                <th>可交易</th>
-                <th>解禁时间</th>
-                <th>最低价</th>
-                <th>状态说明</th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="sellable">可出售</button></th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="tradable">可交易</button></th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="unlock">解禁时间</button></th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="price">最低价</button></th>
+                <th><button type="button" class="inventory-sort-button" data-inventory-sort="status">状态说明</button></th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -1858,13 +1956,13 @@
   <script src="/js/utils.js?v=3"></script>
   <script src="/js/theme.js"></script>
   <script src="/js/accounts.js?v=3"></script>
-  <script src="/js/console.js"></script>
+  <script src="/js/console.js?v=2"></script>
   <script src="/js/steamGuard.js"></script>
-  <script src="/js/transactions.js?v=2"></script>
-  <script src="/js/settings.js"></script>
+  <script src="/js/transactions.js?v=5"></script>
+  <script src="/js/settings.js?v=3"></script>
   <script src="/js/proxy.js"></script>
   <script src="/js/strategies.js"></script>
-  <script src="/js/main.js?v=10"></script>
+  <script src="/js/main.js?v=13"></script>
   <script src="/js/gift.js"></script>
   <script src="/js/steamDeals.js"></script>
   <script>
@@ -1934,13 +2032,17 @@
       <!-- 步骤 2：推送通知 -->
       <div class="wizard-step" id="wizard-step-2">
         <div class="wizard-icon">📲</div>
-        <h3 class="wizard-title">推送通知 Token</h3>
-        <p class="wizard-desc">用于在交易完成或出错时向您的微信/公众号发送通知。</p>
+        <h3 class="wizard-title">推送通知</h3>
+        <p class="wizard-desc">用于在待付款、交易完成或出错时向手机发送通知。</p>
+        <div class="field">
+          <label for="wiz-lark-webhook">Lark Webhook（推荐）</label>
+          <input type="password" id="wiz-lark-webhook" placeholder="Lark 自定义机器人 Webhook" autocomplete="off" />
+        </div>
         <div class="field">
           <label for="wiz-pushplus-token">PushPlus Token</label>
           <input type="password" id="wiz-pushplus-token" placeholder="前往 pushplus.plus 获取" autocomplete="off" />
         </div>
-        <p class="wizard-hint">可选配置，跳过后不影响核心交易功能，但不会收到消息推送。</p>
+        <p class="wizard-hint">任选一种即可；两者都填写时优先使用 Lark，失败后再尝试 PushPlus。</p>
       </div>
 
       <!-- 步骤 3：Buff 登录 -->

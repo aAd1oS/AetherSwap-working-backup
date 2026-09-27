@@ -480,36 +480,45 @@ body {
   transition: color 0.2s;
 }
 
-.stat-trend {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  margin-top: 12px;
-  background: var(--bg-body);
-  padding: 4px 10px;
-  border-radius: var(--radius-sm);
-  font-weight: 500;
+.stat-profit-list {
+  display: grid;
+  gap: 8px;
+}
+
+.stat-profit-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.stat-profit-name {
   color: var(--text-secondary);
+  font-size: 12px;
 }
 
-.stat-trend.positive {
-  color: var(--success);
+.stat-profit-value {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
 }
 
-.stat-card.primary .stat-trend {
-  background: rgba(255, 255, 255, 0.15);
-  color: var(--primary-text);
+.stat-tax-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  margin-top: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  opacity: 0.75;
 }
 
-[data-theme="dark"] .stat-card.primary .stat-trend {
-  background: rgba(0, 0, 0, 0.1);
-  color: var(--primary-text);
-}
-
-.stat-trend svg {
-  width: 14px;
-  height: 14px;
+.stat-tax-line span:last-child {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
 }
 
 .control-bar {
@@ -1779,6 +1788,106 @@ textarea.app-modal-input {
 
 .inventory-ownership-select:disabled {
   opacity: 0.65;
+}
+
+.inventory-table-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -4px 0 12px;
+}
+
+.inventory-view-tabs {
+  display: inline-flex;
+  width: fit-content;
+  padding: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  gap: 4px;
+}
+
+.inventory-view-tab {
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 8px 14px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.inventory-view-tab.active {
+  background: var(--primary);
+  color: var(--primary-text);
+}
+
+.inventory-view-tab span {
+  margin-left: 5px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.inventory-sort-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.inventory-sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.inventory-sort-button::after {
+  content: "↕";
+  color: var(--text-muted);
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.inventory-sort-button[data-direction="asc"]::after {
+  content: "▲";
+  color: var(--primary);
+  opacity: 1;
+}
+
+.inventory-sort-button[data-direction="desc"]::after {
+  content: "▼";
+  color: var(--primary);
+  opacity: 1;
+}
+
+.inventory-sort-button:focus-visible,
+.inventory-view-tab:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 3px;
+}
+
+@media (max-width: 768px) {
+  .inventory-table-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .inventory-view-tabs,
+  .inventory-view-tab {
+    width: 100%;
+  }
+
+  .inventory-view-tab {
+    flex: 1 1 0;
+  }
 }
 
 .analytics-group-row td {
@@ -5212,4 +5321,41 @@ textarea.app-modal-input {
   align-items: center;
   justify-content: center;
   gap: 6px;
+}
+
+/* User-triggered operations are visually separate from background task logs. */
+.log-user-action {
+  color: #7c3aed;
+  font-weight: 700;
+}
+
+.log-user-result-success {
+  color: #059669;
+  font-weight: 600;
+}
+
+.log-user-result-partial {
+  color: #d97706;
+  font-weight: 600;
+}
+
+.log-user-result-failure {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+[data-theme="dark"] .log-user-action {
+  color: #c4b5fd;
+}
+
+[data-theme="dark"] .log-user-result-success {
+  color: #34d399;
+}
+
+[data-theme="dark"] .log-user-result-partial {
+  color: #fbbf24;
+}
+
+[data-theme="dark"] .log-user-result-failure {
+  color: #f87171;
 }

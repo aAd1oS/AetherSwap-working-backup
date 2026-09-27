@@ -13,7 +13,7 @@ BUFF_NETWORK_PAUSE_SECONDS = 5 * 60
 BUFF_NETWORK_FAILURE_THRESHOLD = 3
 BUFF_RECOVERY_MODE_SECONDS = 30 * 60
 BUFF_NORMAL_CANDIDATE_CAP = 30
-BUFF_RECOVERY_CANDIDATE_CAP = 10
+BUFF_RECOVERY_CANDIDATE_CAP = 30
 
 
 class BuffProtectionError(RuntimeError):
@@ -45,15 +45,20 @@ class BuffRequestProtection:
 
     def before_request(self) -> None:
         now = time.time()
+        recovered_reason = ""
         with self._lock:
             manual_reason = self._manual_reason
             pause_reason = self._pause_reason
             pause_until = self._pause_until
             if pause_until and now >= pause_until:
+                recovered_reason = pause_reason
                 self._pause_reason = ""
                 self._pause_until = 0.0
+                self._recovery_until = now + BUFF_RECOVERY_MODE_SECONDS
                 pause_reason = ""
                 pause_until = 0.0
+        if recovered_reason:
+            self._notify("pause_recovered", recovered_reason)
         if manual_reason:
             raise BuffManualCircuitOpen(manual_reason)
         if pause_until > now:
@@ -72,9 +77,12 @@ class BuffRequestProtection:
         if any(marker in text for marker in manual_markers):
             reason = "BUFF Action Forbidden / 市场接口访问功能暂时关闭，需要人工检查并更新 Cookie"
             with self._lock:
+                should_notify = not bool(self._manual_reason)
                 self._manual_reason = reason
                 self._pause_reason = ""
                 self._pause_until = 0.0
+            if should_notify:
+                self._notify("triggered", reason)
             raise BuffManualCircuitOpen(reason)
         with self._lock:
             self._network_failures = 0
@@ -92,19 +100,57 @@ class BuffRequestProtection:
     def mark_manual_cookie_updated(self) -> None:
         now = time.time()
         with self._lock:
+            previous_reason = self._manual_reason or self._pause_reason
             self._manual_reason = ""
             self._pause_reason = ""
             self._pause_until = 0.0
             self._network_failures = 0
             self._recovery_until = now + BUFF_RECOVERY_MODE_SECONDS
+        if previous_reason:
+            self._notify("manual_recovered", previous_reason)
 
-    def effective_candidate_cap(self) -> int:
+    @staticmethod
+    def _normalized_candidate_cap(value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    def effective_candidate_cap(
+        self,
+        recovery_candidate_cap: Any = None,
+        normal_candidate_cap: Any = None,
+    ) -> int:
+        now = time.time()
+        recovery_finished = False
         with self._lock:
             recovery_until = self._recovery_until
-        return BUFF_RECOVERY_CANDIDATE_CAP if time.time() < recovery_until else BUFF_NORMAL_CANDIDATE_CAP
+            if recovery_until and now >= recovery_until:
+                self._recovery_until = 0.0
+                recovery_finished = True
+        if recovery_finished:
+            self._notify("recovery_finished", "30 分钟恢复观察期已结束")
+        if now < recovery_until:
+            return self._normalized_candidate_cap(
+                recovery_candidate_cap,
+                BUFF_RECOVERY_CANDIDATE_CAP,
+            )
+        return self._normalized_candidate_cap(
+            normal_candidate_cap,
+            BUFF_NORMAL_CANDIDATE_CAP,
+        )
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(
+        self,
+        recovery_candidate_cap: Any = None,
+        normal_candidate_cap: Any = None,
+    ) -> Dict[str, Any]:
         now = time.time()
+        candidate_cap = self.effective_candidate_cap(
+            recovery_candidate_cap,
+            normal_candidate_cap,
+        )
         with self._lock:
             return {
                 "manual_open": bool(self._manual_reason),
@@ -115,7 +161,7 @@ class BuffRequestProtection:
                 "network_failures": self._network_failures,
                 "recovery_until": self._recovery_until,
                 "recovery_mode": now < self._recovery_until,
-                "candidate_cap": BUFF_RECOVERY_CANDIDATE_CAP if now < self._recovery_until else BUFF_NORMAL_CANDIDATE_CAP,
+                "candidate_cap": candidate_cap,
             }
 
     def reset_for_tests(self) -> None:
@@ -130,11 +176,23 @@ class BuffRequestProtection:
         now = time.time()
         pause_until = now + seconds
         with self._lock:
+            should_notify = not (self._pause_until > now)
             self._pause_reason = reason
             self._pause_until = max(self._pause_until, pause_until)
             self._network_failures = 0
             effective_until = self._pause_until
+        if should_notify:
+            self._notify("triggered", reason)
         raise BuffTemporaryCircuitOpen(reason, effective_until, now)
+
+    @staticmethod
+    def _notify(event: str, reason: str) -> None:
+        try:
+            from app.notify import notify_buff_request_protection
+
+            notify_buff_request_protection(event, reason)
+        except Exception:
+            pass
 
 
 _protection = BuffRequestProtection()

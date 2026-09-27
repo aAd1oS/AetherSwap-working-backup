@@ -10,6 +10,7 @@ from typing import Optional
 from app.state import (
     get_purchases,
     get_sales,
+    get_state,
     is_steam_background_allowed,
     log,
     set_inventory,
@@ -21,7 +22,7 @@ from app.config_loader import (
     get_steam_credentials,
     load_app_config_validated,
 )
-from app.notify import send_pushplus, build_holdings_report_content, compute_holdings_stats
+from app.notify import send_configured_notification, send_lark, build_holdings_report_content, compute_holdings_stats
 from app.inventory_cs2 import scan_cs2_inventory
 from app.accounts import get_current_account, update_account
 _HOLDINGS_REPORT_LAST_FILE = Path(__file__).resolve().parent.parent.parent / "config" / "holdings_report_last.json"
@@ -29,19 +30,149 @@ _HOLDINGS_REPORT_WAIT_INTERVAL = 60
 _HOLDINGS_REPORT_WAIT_MAX = 30 * 60
 _worker_alert_last: dict = {}  
 _WORKER_ALERT_COOLDOWN = 3600  
+_STALE_LISTING_SECONDS = 24 * 60 * 60
+_PENDING_CONFIRMATION_STATUS = "pending_confirmation"
+_PENDING_CONFIRMATION_TIMEOUT_SECONDS = 30 * 60
+_PENDING_CONFIRMATION_ALERT_KEY = "pending_confirmation_timeout"
+
+
+def _check_pending_confirmation_timeouts(
+    purchases: list,
+    notify_cfg: dict,
+    *,
+    now: Optional[float] = None,
+    send_fn=None,
+) -> dict:
+    """Alert once when a listing remains unconfirmed for 30 minutes."""
+    current_time = float(now if now is not None else time.time())
+    result = {"notified": 0, "failed": 0}
+    for row in purchases or []:
+        db_id = int(row.get("_db_id") or 0)
+        listed_at = float(row.get("listed_at") or 0)
+        if (
+            not db_id
+            or row.get("listing_status") != _PENDING_CONFIRMATION_STATUS
+            or listed_at <= 0
+            or current_time - listed_at < _PENDING_CONFIRMATION_TIMEOUT_SECONDS
+            or row.get("last_listing_advice_key") == _PENDING_CONFIRMATION_ALERT_KEY
+        ):
+            continue
+        name = row.get("name") or "未命名商品"
+        assetid = str(row.get("assetid") or "")
+        content = (
+            f"{name} 的 Steam 上架已等待移动确认超过 30 分钟，assetid={assetid}。"
+            "系统保持 pending_confirmation，不会自动重上架或改写为失败；请进入操作记录人工处理。"
+        )
+        if send_fn is None:
+            sent, _channel = send_configured_notification(
+                notify_cfg, "Steam 上架确认超时", content
+            )
+        else:
+            sent = bool(send_fn(notify_cfg, "Steam 上架确认超时", content))
+        if not sent:
+            result["failed"] += 1
+            continue
+        if update_purchase_by_id(
+            db_id, {"last_listing_advice_key": _PENDING_CONFIRMATION_ALERT_KEY}
+        ):
+            result["notified"] += 1
+    return result
+
+def _check_stale_listing_notifications(
+    purchases: list,
+    active_ids: set,
+    notify_cfg: dict,
+    *,
+    now: Optional[float] = None,
+    send_fn=None,
+    listing_assetid_to_name: Optional[dict] = None,
+) -> dict:
+    """Start clocks in tests; production performs the full 24-hour strategy review."""
+    if now is None and send_fn is None:
+        cfg = load_app_config_validated()
+        review_result = _review_stale_listings(
+            purchases,
+            active_ids,
+            listing_assetid_to_name or {},
+            cfg,
+            get_state(),
+        )
+        if review_result.get("relist_items"):
+            from app.sell_pipeline import run_sell_phase_on_inventory_update
+            run_sell_phase_on_inventory_update(
+                review_result["relist_items"],
+                delay_seconds=1.5,
+            )
+        return review_result
+    current_time = float(now if now is not None else time.time())
+    active = {str(value or "").strip() for value in (active_ids or set())}
+    active_rows = [
+        row for row in (purchases or [])
+        if row.get("listing")
+        and not row.get("sold_at")
+        and str(row.get("assetid") or "").strip() in active
+    ]
+    if not active_rows:
+        return {"started": 0, "notified": 0, "failed": 0}
+    ownership_items = [
+        {"assetid": str(row.get("assetid") or ""), "name": row.get("name") or ""}
+        for row in active_rows
+    ]
+    from app.inventory_ownership import annotate_inventory_ownership
+    annotate_inventory_ownership(ownership_items, purchases)
+    ownership = {item["assetid"]: item.get("ownership_mode") for item in ownership_items}
+    webhook = str((notify_cfg or {}).get("lark_webhook") or "").strip()
+    sender = send_fn or send_lark
+    result = {"started": 0, "notified": 0, "failed": 0}
+    for row in active_rows:
+        db_id = int(row.get("_db_id") or 0)
+        if not db_id:
+            continue
+        assetid = str(row.get("assetid") or "").strip()
+        listed_at = float(row.get("listed_at") or 0)
+        if listed_at <= 0:
+            if update_purchase_by_id(db_id, {"listed_at": current_time}):
+                result["started"] += 1
+            continue
+        if ownership.get(assetid) != "managed":
+            continue
+        if current_time - listed_at < _STALE_LISTING_SECONDS:
+            continue
+        if row.get("stale_listing_notified_at") or not webhook:
+            continue
+        price_text = (
+            f"，上架价 {float(row.get('listing_price')):.2f}"
+            if row.get("listing_price") is not None else ""
+        )
+        content = (
+            f"系统托管商品 {row.get('name') or '未命名商品'} 已连续上架满 24 小时仍未售出。"
+            f"assetid={assetid}{price_text}。本次仅提醒，不会自动下架或改价。"
+        )
+        if sender(webhook, "Steam 商品上架满 24 小时", content):
+            if update_purchase_by_id(db_id, {"stale_listing_notified_at": current_time}):
+                result["notified"] += 1
+        else:
+            result["failed"] += 1
+    return result
 def _worker_alert(worker_name: str, error: Exception) -> None:
-    """发送 PushPlus 告警，每个 worker 每小时至多发一次。"""
+    """发送后台任务告警，每个 worker 每小时至多发一次。"""
     now = time.time()
     last = _worker_alert_last.get(worker_name, 0.0)
     if now - last < _WORKER_ALERT_COOLDOWN:
         return
     try:
         cfg = load_app_config_validated()
-        token = (cfg.get("notify") or {}).get("pushplus_token", "") or ""
-        if not token:
+        notify_cfg = cfg.get("notify") or {}
+        if not (notify_cfg.get("lark_webhook") or notify_cfg.get("pushplus_token")):
             return
         msg = str(error)[:200] if error else "未知异常"
-        send_pushplus(token, f"[Worker异常] {worker_name}", f"后台任务 <b>{worker_name}</b> 发生异常，已自动重试。<br>错误信息：{msg}")
+        sent, _channel = send_configured_notification(
+            notify_cfg,
+            f"[Worker异常] {worker_name}",
+            f"后台任务 <b>{worker_name}</b> 发生异常，已自动重试。<br>错误信息：{msg}",
+        )
+        if not sent:
+            return
         _worker_alert_last[worker_name] = now
         log(f"[{worker_name}] 异常告警已发送", "info", category="alert")
     except Exception:
@@ -87,8 +218,7 @@ def run_holdings_report_once(force: bool = False) -> bool:
         return False
     cfg = load_app_config_validated()
     notify_cfg = cfg.get("notify") or {}
-    token = (notify_cfg.get("pushplus_token") or "").strip()
-    if not token:
+    if not (notify_cfg.get("lark_webhook") or notify_cfg.get("pushplus_token")):
         return False
     resell_ratio = float(cfg.get("pipeline", {}).get("resell_ratio", 0.85))
     if resell_ratio <= 0:
@@ -129,7 +259,11 @@ def run_holdings_report_once(force: bool = False) -> bool:
         if drop < drop_threshold_pct:
             return False
     content = build_holdings_report_content(holdings_enriched, resell_ratio)
-    ok = send_pushplus(token, "持有饰品紧急回报" if not force else "持有饰品定时回报", content)
+    ok, _channel = send_configured_notification(
+        notify_cfg,
+        "持有饰品紧急回报" if not force else "持有饰品定时回报",
+        content,
+    )
     if ok and pl_pct is not None:
         _save_last_pl_pct(pl_pct)
     return ok
@@ -230,6 +364,7 @@ def exchange_rate_worker() -> None:
 def receive_worker() -> None:
     from app.receive_flow import try_receive_once
     while True:
+        operation_token = None
         try:
             cfg = load_app_config_validated()
             interval = max(10, int(cfg.get("pipeline", {}).get("receive_poll_interval_seconds", 30) or 30))
@@ -239,6 +374,8 @@ def receive_worker() -> None:
             purchases = get_purchases()
             if not any(p.get("pending_receipt") and not p.get("assetid") for p in purchases):
                 continue
+            from app.account_operations import begin_account_operation
+            operation_token, _operation_account_id = begin_account_operation("自动收货")
             from app.account_scope import validate_current_account_identity
             identity_ok, _ = validate_current_account_identity()
             if not identity_ok:
@@ -257,16 +394,72 @@ def receive_worker() -> None:
             log(f"receive_worker 异常 {type(e).__name__}: {e}", "error", category="receive")
             _worker_alert("receive_worker", e)
             time.sleep(60)
+        finally:
+            if operation_token:
+                from app.account_operations import end_account_operation
+                end_account_operation(operation_token)
+def _partition_listing_visibility(listing_idx: list, active_ids: set) -> tuple:
+    """Keep pending confirmations out of sold/missing reconciliation."""
+    active = {str(value or "").strip() for value in (active_ids or set())}
+    confirmed_pending = []
+    pending_missing = []
+    missing = []
+    for entry in listing_idx:
+        _index, row = entry
+        assetid = str(row.get("assetid") or "").strip()
+        is_pending = row.get("listing_status") == _PENDING_CONFIRMATION_STATUS
+        if assetid in active:
+            if is_pending:
+                confirmed_pending.append(entry)
+            continue
+        if is_pending:
+            pending_missing.append(entry)
+        else:
+            missing.append(entry)
+    return confirmed_pending, pending_missing, missing
+
 def listing_check_worker() -> None:
     from app.steam_listings import fetch_my_listings, fetch_my_history_sold
+    first_check = True
     while True:
+        operation_token = None
         try:
             cfg = load_app_config_validated()
             interval = max(60, int(cfg.get("pipeline", {}).get("listing_check_interval_seconds", 600) or 600))
-            time.sleep(interval)
+            if first_check:
+                first_check = False
+            else:
+                time.sleep(interval)
             if not is_steam_background_allowed():
                 continue
+            from app.account_operations import begin_account_operation
+            operation_token, _operation_account_id = begin_account_operation("在售同步")
             purchases = get_purchases()
+            pending_relist = [
+                row for row in purchases
+                if row.get("listing_status") in _STALE_RELIST_STATUSES
+            ]
+            if pending_relist:
+                ok_pending, pending_items, pending_error = scan_cs2_inventory()
+                if ok_pending:
+                    set_inventory(pending_items)
+                    pending_result = _sync_stale_relist_records(
+                        purchases,
+                        pending_items,
+                    )
+                    if pending_result.get("relist_items"):
+                        from app.sell_pipeline import run_sell_phase_on_inventory_update
+                        run_sell_phase_on_inventory_update(
+                            pending_result["relist_items"],
+                            delay_seconds=1.5,
+                        )
+                    purchases = get_purchases()
+                else:
+                    log(
+                        f"[listing_check] pending stale relist assetid sync failed: {pending_error}",
+                        "warn",
+                        category="delist",
+                    )
             listing_idx = [(i, p) for i, p in enumerate(purchases) if p.get("listing") and p.get("assetid")]
             if not listing_idx:
                 continue
@@ -277,10 +470,53 @@ def listing_check_worker() -> None:
             pipeline_cfg = cfg.get("pipeline") or {}
             steam_debug = bool(pipeline_cfg.get("steam_listings_debug") or pipeline_cfg.get("verbose_debug"))
             debug_fn = (lambda m: log(m, "debug", category="steam")) if steam_debug else None
-            ok, active_ids, err, _ = fetch_my_listings(cookies, debug_fn=debug_fn)
+            ok, active_ids, err, listing_assetid_to_name = fetch_my_listings(cookies, debug_fn=debug_fn)
             if not ok:
                 continue
-            not_in_active = [(i, p) for i, p in listing_idx if str(p.get("assetid") or "") and str(p.get("assetid") or "") not in active_ids]
+            reminder_result = _check_stale_listing_notifications(
+                purchases,
+                active_ids,
+                cfg.get("notify") or {},
+                listing_assetid_to_name=listing_assetid_to_name,
+            )
+            if reminder_result.get("notified"):
+                log(
+                    f"[listing_check] 已发送 {reminder_result['notified']} 条连续上架 24 小时提醒",
+                    "info",
+                    category="steam",
+                )
+            confirmed_pending, pending_missing, not_in_active = _partition_listing_visibility(
+                listing_idx,
+                active_ids,
+            )
+            for index, purchase in confirmed_pending:
+                db_id = purchase.get("_db_id")
+                if db_id:
+                    update_purchase_by_id(db_id, {"listing_status": None})
+                else:
+                    update_purchase(index, {"listing_status": None})
+            if confirmed_pending:
+                log(
+                    f"[listing_check] {len(confirmed_pending)} 件待确认商品已进入 Steam 活跃在售",
+                    "info",
+                    category="steam",
+                )
+            pending_timeout_result = _check_pending_confirmation_timeouts(
+                [row for _index, row in pending_missing],
+                cfg.get("notify") or {},
+            )
+            if pending_timeout_result.get("notified"):
+                log(
+                    f"[listing_check] 已发送 {pending_timeout_result['notified']} 条待确认超时提醒",
+                    "warn",
+                    category="steam",
+                )
+            if steam_debug and pending_missing:
+                log(
+                    f"[listing_check] {len(pending_missing)} 件商品仍等待 Steam 市场确认，保留本地状态且不重复上架",
+                    "debug",
+                    category="steam",
+                )
             if steam_debug and not_in_active:
                 log(f"[listing_check] 本地 {len(listing_idx)} 条在售, Steam 活跃 {len(active_ids)}, 可能已售 {len(not_in_active)} 条", "debug", category="steam")
             if not not_in_active:
@@ -298,22 +534,22 @@ def listing_check_worker() -> None:
                 if db_id:
                     if sale_price_rounded is not None:
                         sold_at = time.time()
-                        update_purchase_by_id(db_id, {"sale_price": sale_price_rounded, "sold_at": sold_at, "listing": False, "listing_status": None})
+                        update_purchase_by_id(db_id, {"sale_price": sale_price_rounded, "sold_at": sold_at, "listing": False, "listing_status": None, "listed_at": None, "listing_price": None, "stale_listing_notified_at": None, "listing_review_after": None})
                         sold_updates += 1
                     else:
-                        update_purchase_by_id(db_id, {"listing": False, "listing_status": "error"})
+                        update_purchase_by_id(db_id, {"listing": False, "listing_status": "error", "listed_at": None, "listing_price": None, "stale_listing_notified_at": None, "listing_review_after": None})
                 else:
                     current = get_purchases()
                     matched = [j for j, q in enumerate(current) if str(q.get("assetid") or "") == aid]
                     if sale_price_rounded is not None:
                         sold_at = time.time()
                         for idx in matched:
-                            update_purchase(idx, {"sale_price": sale_price_rounded, "sold_at": sold_at, "listing": False, "listing_status": None})
+                            update_purchase(idx, {"sale_price": sale_price_rounded, "sold_at": sold_at, "listing": False, "listing_status": None, "listed_at": None, "listing_price": None, "stale_listing_notified_at": None, "listing_review_after": None})
                         if matched:
                             sold_updates += 1
                     else:
                         for idx in matched:
-                            update_purchase(idx, {"listing": False, "listing_status": "error"})
+                            update_purchase(idx, {"listing": False, "listing_status": "error", "listed_at": None, "listing_price": None, "stale_listing_notified_at": None, "listing_review_after": None})
             if sold_updates > 0:
                 log(f"[listing_check] 确认售出 {sold_updates} 件，刷新库存并触发自动补挂", "info", category="steam")
                 ok_inv, inv_items, inv_err = scan_cs2_inventory()
@@ -327,6 +563,10 @@ def listing_check_worker() -> None:
             log(f"listing_check_worker 异常 {type(e).__name__}: {e}", "error", category="steam")
             _worker_alert("listing_check_worker", e)
             time.sleep(60)
+        finally:
+            if operation_token:
+                from app.account_operations import end_account_operation
+                end_account_operation(operation_token)
 def _currency_code_from_price_text(text: str) -> str:
     s = text or ""
     if "¥" in s or "￥" in s or "CNY" in s or "RMB" in s:
@@ -482,7 +722,9 @@ def session_keepalive_worker() -> None:
                 log(f"keepalive: Buff 保活成功: {buff_msg}", "info", category="keepalive")
             time.sleep(10) 
             steam_ok, steam_status, steam_msg = try_steam_auto_relogin()
-            if not steam_ok:
+            if steam_status == "verification_deferred":
+                log(f"keepalive: Steam Cookie 已保留: {steam_msg}", "info", category="keepalive")
+            elif not steam_ok:
                 log(f"keepalive: Steam 保活失败: {steam_msg}", "warn", category="keepalive")
             else:
                 log(f"keepalive: Steam 保活成功: {steam_msg}", "info", category="keepalive")
@@ -490,3 +732,341 @@ def session_keepalive_worker() -> None:
         except Exception as e:
             log(f"keepalive: worker 异常 {e}, 15 分钟后重试", "error", category="keepalive")
             time.sleep(900)
+
+_STALE_LISTING_REVIEW_LIMIT = 5
+_STALE_LISTING_REVIEW_SECONDS = 10 * 60
+_STALE_LISTING_RETRY_SECONDS = 60 * 60
+_STALE_RELIST_STATUSES = {
+    "stale_relist_pending",
+    "stale_relist_assetid_pending",
+    "stale_relist_assetid_ambiguous",
+}
+
+
+def _format_listing_market_metrics(evaluation: dict) -> str:
+    parts = []
+    queue = evaluation.get("queue_ahead")
+    daily = evaluation.get("average_daily_volume")
+    wait_hours = evaluation.get("estimated_wait_hours")
+    if queue is not None:
+        parts.append(f"当前价前方约 {int(queue)} 件")
+    if daily is not None:
+        parts.append(f"近期日均成交约 {float(daily):.1f} 件")
+    if wait_hours is not None:
+        parts.append(f"预计等待约 {float(wait_hours):.1f} 小时")
+    return "；".join(parts)
+
+
+def _listing_advice_key(status: str, evaluation: dict) -> str:
+    """Return a stable key for the recommendation, excluding noisy metrics/reasons."""
+    normalized = str(status or "hold").strip().lower() or "hold"
+    if normalized != "reprice":
+        return normalized
+    try:
+        proposed_price = round(float(evaluation.get("proposed_price") or 0), 2)
+    except (TypeError, ValueError):
+        proposed_price = 0.0
+    return f"reprice:{proposed_price:.2f}"
+
+
+def _send_stale_listing_notice(
+    notify_cfg: dict,
+    title: str,
+    content: str,
+    send_fn=None,
+) -> bool:
+    webhook = str((notify_cfg or {}).get("lark_webhook") or "").strip()
+    if not webhook:
+        return False
+    return bool((send_fn or send_lark)(webhook, title, content))
+
+
+def _sync_stale_relist_records(purchases: list, inventory_items: list) -> dict:
+    """Resolve only stale-relist records; never guess between same-name assets."""
+    from app.database import DuplicateAssetIdError
+    from app.steam_delist import resolve_delisted_assetid_from_inventory
+
+    result = {"resolved": 0, "pending": 0, "ambiguous": 0, "relist_items": []}
+    for row in purchases or []:
+        if row.get("listing_status") not in _STALE_RELIST_STATUSES:
+            continue
+        db_id = int(row.get("_db_id") or 0)
+        if not db_id:
+            continue
+        resolution = resolve_delisted_assetid_from_inventory(
+            row,
+            inventory_items,
+            purchases,
+        )
+        status = resolution.get("status")
+        if status == "resolved":
+            assetid = str(resolution.get("assetid") or "").strip()
+            try:
+                if not update_purchase_by_id(
+                    db_id,
+                    {"assetid": assetid, "listing_status": None},
+                ):
+                    result["pending"] += 1
+                    continue
+            except DuplicateAssetIdError:
+                update_purchase_by_id(
+                    db_id,
+                    {"listing_status": "stale_relist_assetid_ambiguous"},
+                )
+                result["ambiguous"] += 1
+                continue
+            result["resolved"] += 1
+            item = resolution.get("item")
+            if isinstance(item, dict) and item.get("can_sell"):
+                result["relist_items"].append(item)
+        elif status == "ambiguous":
+            update_purchase_by_id(
+                db_id,
+                {"listing_status": "stale_relist_assetid_ambiguous"},
+            )
+            result["ambiguous"] += 1
+        else:
+            update_purchase_by_id(
+                db_id,
+                {"listing_status": "stale_relist_assetid_pending"},
+            )
+            result["pending"] += 1
+    return result
+
+
+def _review_stale_listings(
+    purchases: list,
+    active_ids: set,
+    listing_assetid_to_name: dict,
+    cfg: dict,
+    state,
+    *,
+    now: Optional[float] = None,
+    evaluate_fn=None,
+    delist_fn=None,
+    scan_fn=None,
+    notify_fn=None,
+) -> dict:
+    """Review stale managed listings and delist only when the active strategy reprices."""
+    from app.inventory_ownership import annotate_inventory_ownership
+    from app.sell_pipeline import evaluate_stale_listing_reprice
+    from app.steam_delist import delist_item
+
+    current_time = float(now if now is not None else time.time())
+    active = {str(value or "").strip() for value in (active_ids or set())}
+    evaluator = evaluate_fn or evaluate_stale_listing_reprice
+    delister = delist_fn or delist_item
+    scanner = scan_fn or scan_cs2_inventory
+    result = {
+        "started": 0,
+        "reviewed": 0,
+        "unchanged": 0,
+        "held": 0,
+        "delisted": 0,
+        "failed": 0,
+        "notified": 0,
+        "relist_items": [],
+    }
+    active_rows = [
+        row for row in (purchases or [])
+        if row.get("listing")
+        and not row.get("sold_at")
+        and str(row.get("assetid") or "").strip() in active
+    ]
+    ownership_items = [
+        {"assetid": str(row.get("assetid") or ""), "name": row.get("name") or ""}
+        for row in active_rows
+    ]
+    annotate_inventory_ownership(ownership_items, purchases)
+    ownership = {item["assetid"]: item.get("ownership_mode") for item in ownership_items}
+
+    reviewed_count = 0
+    staged_mode = bool(
+        (cfg.get("pipeline") or {}).get("stale_listing_staged_mode_enabled", False)
+    )
+    for row in active_rows:
+        db_id = int(row.get("_db_id") or 0)
+        assetid = str(row.get("assetid") or "").strip()
+        if not db_id or ownership.get(assetid) != "managed":
+            continue
+        listed_at = float(row.get("listed_at") or 0)
+        if listed_at <= 0:
+            updates = {
+                "listed_at": current_time,
+                "listing_review_after": current_time + _STALE_LISTING_SECONDS,
+            }
+            if update_purchase_by_id(db_id, updates):
+                result["started"] += 1
+            continue
+        review_after = float(
+            row.get("listing_review_after") or (listed_at + _STALE_LISTING_SECONDS)
+        )
+        if current_time < review_after or reviewed_count >= _STALE_LISTING_REVIEW_LIMIT:
+            continue
+        reviewed_count += 1
+        result["reviewed"] += 1
+        listing_age_hours = max(0.0, (current_time - listed_at) / 3600.0)
+        stage_hours = 72 if listing_age_hours >= 72 else 48 if listing_age_hours >= 48 else 24
+        review_label = f"{stage_hours}h分段复评" if staged_mode else "24h复评"
+
+        try:
+            evaluation_row = dict(row)
+            evaluation_row["_listing_age_hours"] = listing_age_hours
+            evaluation = evaluator(
+                cfg,
+                state,
+                evaluation_row,
+                active,
+                listing_assetid_to_name,
+            )
+        except Exception as exc:
+            evaluation = {
+                "status": "hold",
+                "reason": f"复评异常: {type(exc).__name__}: {str(exc)[:120]}",
+            }
+        status = str(evaluation.get("status") or "hold")
+        name = (row.get("market_hash_name") or row.get("name") or "未命名商品").strip()
+        market_summary = _format_listing_market_metrics(evaluation)
+        log(
+            f"[{review_label}] {name}: {evaluation.get('reason') or '无明确原因'}"
+            + (f"；{market_summary}" if market_summary else ""),
+            "info",
+            category="sell",
+        )
+        if status != "reprice":
+            next_review = current_time + _STALE_LISTING_REVIEW_SECONDS
+            update_purchase_by_id(db_id, {"listing_review_after": next_review})
+            if status == "unchanged":
+                result["unchanged"] += 1
+                title = "Steam 挂单复评：价格不变"
+            else:
+                result["held"] += 1
+                title = "Steam 挂单复评：继续持有"
+            content = (
+                f"{name} 已进入 {review_label}。当前策略决定不下架；"
+                f"原因：{evaluation.get('reason') or '安全条件未通过'}。"
+                + (f"市场估算：{market_summary}。" if market_summary else "")
+                + "将在 10 分钟后再次复评；建议不变时不再重复通知。"
+            )
+            advice_key = _listing_advice_key(status, evaluation)
+            advice_changed = str(row.get("last_listing_advice_key") or "") != advice_key
+            if advice_changed and _send_stale_listing_notice(
+                cfg.get("notify") or {}, title, content, notify_fn
+            ):
+                result["notified"] += 1
+                update_purchase_by_id(
+                    db_id,
+                    {
+                        "stale_listing_notified_at": current_time,
+                        "last_listing_advice_key": advice_key,
+                    },
+                )
+            continue
+
+        proposed_price = float(evaluation.get("proposed_price") or 0)
+        old_price = float(evaluation.get("current_price") or row.get("listing_price") or 0)
+
+        def delist_log(message: str, level: str = "info") -> None:
+            log(f"[{review_label}] {message}", level, category="delist")
+
+        ok, new_assetid, error = delister(assetid, name, log_fn=delist_log)
+        if not ok:
+            update_purchase_by_id(
+                db_id,
+                {"listing_review_after": current_time + _STALE_LISTING_RETRY_SECONDS},
+            )
+            result["failed"] += 1
+            content = (
+                f"{name} 的当前策略价由 {old_price:.2f} 变为 {proposed_price:.2f}，"
+                f"但下架未明确成功：{error or '未知原因'}。本地在售状态保持不变，"
+                + (f"市场估算：{market_summary}。" if market_summary else "")
+                + "将在 1 小时后重试复评。"
+            )
+            advice_key = _listing_advice_key(status, evaluation)
+            advice_changed = str(row.get("last_listing_advice_key") or "") != advice_key
+            if advice_changed and _send_stale_listing_notice(
+                cfg.get("notify") or {},
+                "Steam 挂单复评：下架失败",
+                content,
+                notify_fn,
+            ):
+                result["notified"] += 1
+                update_purchase_by_id(
+                    db_id,
+                    {
+                        "stale_listing_notified_at": current_time,
+                        "last_listing_advice_key": advice_key,
+                    },
+                )
+            continue
+
+        updates = {
+            "listing": False,
+            "listing_status": (
+                "stale_relist_pending"
+                if new_assetid
+                else "stale_relist_assetid_pending"
+            ),
+            "listed_at": None,
+            "listing_price": None,
+            "stale_listing_notified_at": None,
+            "listing_review_after": None,
+            "last_listing_advice_key": None,
+        }
+        if new_assetid:
+            updates["assetid"] = str(new_assetid)
+        try:
+            update_purchase_by_id(db_id, updates)
+        except Exception as exc:
+            from app.database import DuplicateAssetIdError
+
+            if not isinstance(exc, DuplicateAssetIdError):
+                raise
+            update_purchase_by_id(
+                db_id,
+                {
+                    "listing": False,
+                    "listing_status": "stale_relist_assetid_ambiguous",
+                    "listed_at": None,
+                    "listing_price": None,
+                    "stale_listing_notified_at": None,
+                    "listing_review_after": None,
+                    "last_listing_advice_key": None,
+                },
+            )
+        result["delisted"] += 1
+
+        ok_inventory, inventory_items, inventory_error = scanner()
+        sync_result = {"resolved": 0, "pending": 1, "ambiguous": 0, "relist_items": []}
+        if ok_inventory:
+            set_inventory(inventory_items)
+            sync_result = _sync_stale_relist_records(
+                state.get_purchases(),
+                inventory_items,
+            )
+            result["relist_items"].extend(sync_result.get("relist_items") or [])
+        else:
+            log(
+                f"[{review_label}] 下架成功，但库存刷新失败，等待后台补全 assetid: {inventory_error}",
+                "warn",
+                category="delist",
+            )
+
+        sync_text = (
+            "assetid 已唯一同步，商品将交回当前出售策略重新上架"
+            if sync_result.get("resolved")
+            else "assetid 尚未唯一确认，已停止自动重挂并等待后续同步"
+        )
+        content = (
+            f"{name} 的当前策略价由 {old_price:.2f} 变为 {proposed_price:.2f}，"
+            f"已明确下架成功；{sync_text}。"
+            + (f"市场估算：{market_summary}。" if market_summary else "")
+        )
+        if _send_stale_listing_notice(
+            cfg.get("notify") or {},
+            "Steam 挂单复评：已按策略下架",
+            content,
+            notify_fn,
+        ):
+            result["notified"] += 1
+    return result

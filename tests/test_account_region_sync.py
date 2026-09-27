@@ -216,7 +216,56 @@ def test_verify_account_triggers_region_currency_refresh(monkeypatch):
 
     assert result["ok"] is True
     assert result["region_sync"]["ok"] is True
-    assert result["message"] == "验证通过"
+    assert result["status"] == "business_ok"
+    assert result["message"] == "Steam 会话可用（钱包与结算币种已确认）"
+
+
+def test_verify_account_uses_recent_business_evidence_without_extra_wallet_request(monkeypatch):
+    from app.routes import accounts
+
+    monkeypatch.setattr(accounts, "_activate_account", lambda account_id: {"ok": True})
+    monkeypatch.setattr(
+        accounts,
+        "verify_steam_auto_login",
+        lambda account_id: {
+            "ok": True,
+            "status": "business_ok",
+            "message": "Steam 会话可用（Steam 在售列表已确认）",
+        },
+    )
+    monkeypatch.setattr(
+        accounts,
+        "refresh_account_region_currency",
+        lambda account_id: (_ for _ in ()).throw(AssertionError("recent business evidence must be reused")),
+    )
+
+    result = accounts.api_verify_account("acc1")
+
+    assert result["ok"] is True
+    assert result["status"] == "business_ok"
+    assert result["region_sync"] is None
+
+
+def test_verify_account_prompts_login_only_for_explicit_business_auth_failure(monkeypatch):
+    from app.routes import accounts
+
+    monkeypatch.setattr(accounts, "_activate_account", lambda account_id: {"ok": True})
+    monkeypatch.setattr(
+        accounts,
+        "verify_steam_auto_login",
+        lambda account_id: {"ok": True, "status": "verification_deferred", "message": "待业务确认"},
+    )
+    monkeypatch.setattr(
+        accounts,
+        "refresh_account_region_currency",
+        lambda account_id: {"ok": False, "status": "invalid", "error": "Steam Community Cookie未登录或已过期"},
+    )
+
+    result = accounts.api_verify_account("acc1")
+
+    assert result["ok"] is False
+    assert result["status"] == "invalid"
+    assert "更新 Steam 信息" in result["message"]
 
 
 def test_get_base_auth_status_strict_reads_store_user_config_country(monkeypatch):

@@ -83,6 +83,7 @@ def api_delete_account(account_id: str):
     return {"ok": ok, "error": None if ok else "删除失败"}
 
 def _activate_account(account_id: str) -> dict:
+    from app.account_operations import switch_account_atomically
     from app.account_scope import ensure_account_runtime, get_account_runtime_status
     from app.config_loader import invalidate_config_cache
     from app.pipeline import is_pipeline_running
@@ -93,12 +94,15 @@ def _activate_account(account_id: str) -> dict:
     if get_pending_payment():
         return {"ok": False, "error": "当前仍有待支付确认，处理完成后才能切换账号"}
     previous = get_current_account()
-    if not set_current(account_id):
-        return {"ok": False, "error": "账号不存在"}
+    switched, switch_error = switch_account_atomically(account_id, lambda: set_current(account_id))
+    if not switched:
+        return {"ok": False, "error": switch_error}
     ensure_account_runtime(account_id)
     invalidate_config_cache()
     if not previous or previous.get("id") != account_id:
         reset_account_view()
+        from app.services.buff_balance import clear_buff_balance_cache
+        clear_buff_balance_cache()
         log(
             f"account_switch: 已切换账号 {previous.get('id') if previous else '-'} -> {account_id}",
             "info",
@@ -127,10 +131,16 @@ def api_verify_account(account_id: str):
             "message": activation.get("error") or "账号切换失败",
         }
     result = verify_steam_auto_login(account_id)
-    if result.get("ok"):
+    should_confirm_with_business_request = result.get("ok") and result.get("status") != "business_ok"
+    if should_confirm_with_business_request:
         sync_result = refresh_account_region_currency(account_id)
         result["region_sync"] = sync_result
         if sync_result.get("ok"):
+            result.update({
+                "ok": True,
+                "status": "business_ok",
+                "message": "Steam 会话可用（钱包与结算币种已确认）",
+            })
             log(
                 "account_verify: 结算币种确认成功 "
                 f"account_id={account_id} "
@@ -140,6 +150,19 @@ def api_verify_account(account_id: str):
                 category="account",
             )
         else:
+            sync_status = sync_result.get("status") or "unavailable"
+            if result.get("status") == "verification_deferred":
+                result.update({
+                    "ok": False,
+                    "status": "invalid" if sync_status == "invalid" else (
+                        "rate_limited" if sync_status == "rate_limited" else "temporarily_unavailable"
+                    ),
+                    "message": (
+                        "Steam 登录信息已过期，请点击“更新 Steam 信息”重新登录"
+                        if sync_status == "invalid"
+                        else f"Steam 暂时无法确认（{sync_result.get('error') or '业务请求失败'}），Cookie 已保留"
+                    ),
+                })
             log(
                 "account_verify: 结算币种确认失败 "
                 f"account_id={account_id} "

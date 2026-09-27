@@ -21,6 +21,7 @@ def test_default_buy_strategy_contains_current_protection_chain():
         "guard.sell_pressure",
         "guard.max_discount",
         "guard.history_data_window",
+        "guard.history_outlier_filter",
         "guard.volatility_cv",
         "guard.trend_quality",
         "guard.price_position",
@@ -32,6 +33,30 @@ def test_default_buy_strategy_contains_current_protection_chain():
         "guard.target_balance",
         "action.buff_lock_pay",
     } <= enabled
+
+
+def test_outlier_module_maps_params_and_old_strategy_stays_disabled():
+    base = {
+        "strategies": {"active_buy_strategy_id": "system.buy.default"},
+        "pipeline": {},
+        "stability": {
+            "outlier_filter_enabled": False,
+            "outlier_iqr_multiplier": 1.5,
+            "outlier_max_removed_ratio": 0.2,
+            "outlier_protect_persistent_recent": True,
+        },
+    }
+    configured = se.apply_strategy_to_config(base, "buy")
+
+    assert configured["stability"]["outlier_filter_enabled"] is True
+    assert configured["stability"]["outlier_iqr_multiplier"] == 1.5
+
+    legacy = se.apply_strategy_to_config(base, "buy", strategy_override={
+        "id": "custom.buy.legacy",
+        "strategy_type": "buy",
+        "steps": [{"module_id": "guard.history_data_window", "enabled": True, "params": {}}],
+    })
+    assert legacy["stability"]["outlier_filter_enabled"] is False
 
 
 def test_default_sell_strategy_uses_split_pricing_modules():

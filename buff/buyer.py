@@ -69,6 +69,7 @@ API_SELL_ORDER = "https://buff.163.com/api/market/goods/sell_order"
 API_GOODS = "https://buff.163.com/api/market/goods"
 API_BUY = "https://buff.163.com/api/market/goods/buy"
 API_BUY_PREVIEW = "https://buff.163.com/api/market/goods/buy/preview"
+API_BRIEF_ASSET = "https://buff.163.com/api/asset/get_brief_asset"
 API_PAGE_PAY = "https://buff.163.com/api/market/bill_order/page_pay"
 API_BILL_ORDER_INFO = "https://buff.163.com/api/market/bill_order/batch/info"
 API_WX_PAY_QRCODE = "https://buff.163.com/api/market/bill_order/wx_pay_qrcode"
@@ -307,6 +308,32 @@ class BuffBuyer:
             ),
         }
 
+    def get_available_funds(self, timeout: int = 15) -> dict:
+        """Read the account-level BUFF available funds without creating an order."""
+        res = self._make_request(
+            "GET",
+            API_BRIEF_ASSET,
+            headers={"Referer": "https://buff.163.com/account"},
+            timeout=timeout,
+        )
+        if res.get("code") != "OK":
+            reason = res.get("error") or res.get("msg") or f"账户资产接口返回 {res.get('code', '未知状态')}"
+            return {"ok": False, "balance": None, "reason": str(reason)}
+        data = res.get("data")
+        if not isinstance(data, dict):
+            return {"ok": False, "balance": None, "reason": "账户资产接口未返回可识别数据"}
+        for field in (
+            "cash_amount_outer",
+            "cash_amount_inner",
+            "alipay_amount",
+            "epay_amount",
+            "cash_amount",
+        ):
+            balance = self._amount_value(data.get(field))
+            if balance is not None and balance >= 0:
+                return {"ok": True, "balance": balance, "source_field": field}
+        return {"ok": False, "balance": None, "reason": "账户资产接口未返回可识别余额字段"}
+
     def lock_order_once(
         self,
         game: str,
@@ -351,6 +378,94 @@ class BuffBuyer:
         if not order_id:
             raise BuffOrderOutcomeUnknown("BUFF 返回锁单成功，但没有返回平台订单号")
         return {"success": True, "order_id": order_id, "data": res.get("data") or {}}
+
+    def get_manual_pay_url_once(self, game: str, order_id: str, timeout: int = 15) -> dict:
+        """Read a payment URL for an already-created order without retrying."""
+        if self.pay_method == PAY_METHOD_WECHAT:
+            url = API_WX_PAY_QRCODE
+            params = {"bill_order_id": str(order_id), "_": str(int(time.time() * 1000))}
+            headers = {"Referer": f"https://buff.163.com/market/buy_order/history?game={game}"}
+        else:
+            url = API_PAGE_PAY
+            params = {"bill_order_id": str(order_id), "_": str(int(time.time() * 1000))}
+            headers = {
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"https://buff.163.com/market/buy_order/history?game={game}",
+            }
+        res = self._make_request("GET", url, params=params, headers=headers, timeout=timeout)
+        if res.get("code") != "OK":
+            return {
+                "success": False,
+                "code": res.get("code") or "FAIL",
+                "msg": str(res.get("error") or res.get("msg") or "支付链接接口明确拒绝"),
+            }
+        data = res.get("data") or {}
+        pay_url = (
+            data.get("url")
+            or data.get("qrcode")
+            or data.get("elements_v2", {}).get("wechatpay", {}).get("url")
+            or data.get("elements_v2", {}).get("alipay", {}).get("url")
+            or data.get("elements", {}).get("url")
+        )
+        return {"success": bool(pay_url), "pay_url": pay_url or "", "data": data}
+
+    def batch_buy_create_once(
+        self, goods_id: int, max_price: float, num: int, game: str = "csgo"
+    ) -> dict:
+        if self.pay_method != PAY_METHOD_WECHAT:
+            return {"success": False, "code": "UNSUPPORTED", "msg": "批量购买仅支持微信"}
+        import uuid
+        payload = {
+            "game": game, "goods_id": int(goods_id), "pay_method": PAY_METHOD_WECHAT,
+            "frozen_amount": float(max_price) * num, "max_price": str(max_price),
+            "num": str(num), "steamid": None,
+        }
+        headers = {
+            "Referer": f"https://buff.163.com/goods/{goods_id}",
+            "Buff-Cashier-Trace-Id": uuid.uuid4().hex,
+        }
+        try:
+            res = self._make_request("POST", API_BATCH_BUY_CREATE, headers=headers, data=json.dumps(payload))
+        except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+            raise
+        except Exception as exc:
+            raise BuffOrderOutcomeUnknown(f"BUFF 批量锁单结果未知: {type(exc).__name__}: {exc}") from exc
+        if res.get("code") != "OK":
+            return {"success": False, "code": res.get("code") or "FAIL", "msg": str(res.get("error") or res.get("msg") or "批量锁单失败")}
+        batch_id = str((res.get("data") or {}).get("id") or (res.get("data") or {}).get("batch_buy_id") or "").strip()
+        if not batch_id:
+            raise BuffOrderOutcomeUnknown("BUFF 返回批量锁单成功，但没有 batch_id")
+        return {"success": True, "batch_id": batch_id}
+
+    def batch_buy_finalize_once(
+        self, game: str, goods_id: int, sell_order_id: str, price: str, batch_buy_id: str
+    ) -> dict:
+        import uuid
+        payload = {
+            "game": game, "goods_id": int(goods_id), "sell_order_id": str(sell_order_id),
+            "price": str(price), "pay_method": PAY_METHOD_WECHAT, "batch": 1,
+            "batch_buy_id": str(batch_buy_id), "batch_id": "",
+            "allow_tradable_cooldown": 0, "hide_non_epay": False, "steamid": None,
+        }
+        headers = {
+            "Referer": f"https://buff.163.com/goods/{goods_id}",
+            "Buff-Cashier-Trace-Id": uuid.uuid4().hex,
+        }
+        try:
+            res = self._make_request("POST", API_BUY, headers=headers, data=json.dumps(payload))
+        except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+            raise
+        except Exception as exc:
+            raise BuffOrderOutcomeUnknown(
+                f"BUFF 批量核销结果未知 sell_order_id={sell_order_id}: {type(exc).__name__}: {exc}"
+            ) from exc
+        if res.get("code") != "OK":
+            return {"success": False, "code": res.get("code") or "FAIL", "msg": str(res.get("error") or res.get("msg") or "批量核销失败")}
+        bill_order_id = str((res.get("data") or {}).get("id") or "").strip()
+        if not bill_order_id:
+            raise BuffOrderOutcomeUnknown("BUFF 返回批量核销成功，但没有订单号")
+        return {"success": True, "order_id": bill_order_id}
 
     def pay_bill_order_once(self, order_id: str, timeout: int = 15) -> dict:
         params = {"bill_order_id": str(order_id), "_": str(int(time.time() * 1000))}

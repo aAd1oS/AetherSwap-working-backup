@@ -113,6 +113,59 @@ def test_balance_preview_marks_order_specific_zero_as_untrustworthy(monkeypatch)
     assert "不能代表账号可用资金" in result["balance_observation_reason"]
 
 
+def test_balance_preview_rejects_positive_balance_when_platform_marks_order_unsupported(monkeypatch):
+    buyer = BuffBuyer("csrf_token=test; session=test")
+    monkeypatch.setattr(
+        buyer,
+        "_make_request",
+        lambda *_args, **_kwargs: _preview_response(
+            _usable_balance_method(
+                value=63,
+                btn_clickable=False,
+                enough=False,
+                real_enough=False,
+                balance="0.39",
+                error="余额不足，当前订单不可用",
+            )
+        ),
+    )
+
+    result = buyer.preview_balance_payment(
+        "csgo", 34144, "sell-order", "14.50", "76561190000000000"
+    )
+
+    assert result["usable"] is False
+    assert result["reported_balance"] == pytest.approx(0.39)
+    assert result["balance_observation_trustworthy"] is False
+    assert "不能代表账号可用资金" in result["balance_observation_reason"]
+    assert "小于订单金额 14.50" in result["reason"]
+
+
+def test_account_asset_balance_uses_outer_cash_amount(monkeypatch):
+    buyer = BuffBuyer("csrf_token=test; session=test")
+    monkeypatch.setattr(
+        buyer,
+        "_make_request",
+        lambda *_args, **_kwargs: {
+            "code": "OK",
+            "data": {
+                "cash_amount": "0",
+                "cash_amount_outer": "0.39",
+                "cash_amount_inner": "0.39",
+                "alipay_amount": "0.39",
+            },
+        },
+    )
+
+    result = buyer.get_available_funds()
+
+    assert result == {
+        "ok": True,
+        "balance": pytest.approx(0.39),
+        "source_field": "cash_amount_outer",
+    }
+
+
 def test_balance_preview_reports_each_channel_when_all_are_unusable(monkeypatch):
     buyer = BuffBuyer("csrf_token=test; session=test")
     monkeypatch.setattr(
@@ -306,7 +359,7 @@ class _SmartBalanceClient:
         self.events.append("preview")
         return self.preview
 
-    def lock_and_get_pay_url(self, *_args):
+    def lock_manual_order_once(self, *_args):
         self.events.append("manual_lock")
         return {
             "success": True,

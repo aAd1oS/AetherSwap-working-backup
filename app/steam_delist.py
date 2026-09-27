@@ -19,6 +19,27 @@ REMOVELISTING_PATTERN = re.compile(
 )
 SESSIONID_PATTERN = re.compile(r'g_sessionID\s*=\s*"([^"]+)"')
 TIMEOUT = 25
+
+
+def _validate_delist_response(response, *, listing_removed: bool = False) -> Optional[str]:
+    if response.status_code != 200:
+        return f"下架请求失败 HTTP {response.status_code}"
+    try:
+        data = response.json()
+    except (ValueError, TypeError, json.JSONDecodeError):
+        if listing_removed:
+            return None
+        return "下架请求 HTTP 成功但返回非 JSON，已保留原在售状态"
+    if not isinstance(data, dict):
+        if listing_removed:
+            return None
+        return "下架请求返回格式异常，已保留原在售状态"
+    if not (data.get("success") is True or data.get("success") == 1):
+        if listing_removed and "success" not in data:
+            return None
+        message = data.get("message") or data.get("error") or "业务结果未明确成功"
+        return f"下架未成功: {message}；已保留原在售状态"
+    return None
 def _cookies_to_dict(cookies) -> dict:
     if isinstance(cookies, dict):
         return dict(cookies)
@@ -178,6 +199,8 @@ def _get_assetids_by_class_instance(
         pass
     return result
 def delist_item(assetid: str, name: str, log_fn: Optional[Callable[[str, str], None]] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+    from app.accounts import get_current_id
+    expected_account_id = str(get_current_id() or "")
     cred = get_steam_credentials()
     cookies_str = cred.get("cookies", "")
     steam_id = cred.get("steam_id", "")
@@ -282,12 +305,29 @@ def delist_item(assetid: str, name: str, log_fn: Optional[Callable[[str, str], N
             "X-Requested-With": "XMLHttpRequest",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         }
+        if expected_account_id:
+            from app.account_operations import assert_current_account
+            assert_current_account(expected_account_id)
         resp = session.post(remove_url, data={"sessionid": sessionid}, headers=post_headers, timeout=TIMEOUT)
-        if resp.status_code != 200:
-            return False, None, f"下架请求失败 HTTP {resp.status_code}"
-        if log_fn:
+        response_error = _validate_delist_response(resp)
+        if resp.status_code == 200 and log_fn:
             log_fn("等待 3 秒让 Steam 后端刷新库存…", "info")
-        jittered_sleep(3)
+        if resp.status_code == 200:
+            jittered_sleep(3)
+        if response_error and resp.status_code == 200:
+            refreshed_listings = None
+            for attempt in range(3):
+                refreshed_listings = _get_mylistings_api(session)
+                if refreshed_listings is not None and assetid not in refreshed_listings:
+                    break
+                if attempt < 2:
+                    jittered_sleep(2)
+            listing_removed = refreshed_listings is not None and assetid not in refreshed_listings
+            response_error = _validate_delist_response(resp, listing_removed=listing_removed)
+            if response_error is None and log_fn:
+                log_fn("Steam 返回格式不明确，但已确认原挂单从在售列表消失", "warn")
+        if response_error:
+            return False, None, response_error
         new_ids = set()
         for attempt in range(3):
             set_after = _get_assetids_by_class_instance(session, steam_id, appid, contextid, classid, instanceid)
@@ -303,8 +343,53 @@ def delist_item(assetid: str, name: str, log_fn: Optional[Callable[[str, str], N
             return True, new_assetid, None
         if len(new_ids) == 0:
             if log_fn:
-                log_fn("下架成功但库存中未检测到新 assetid，已清空本地 assetid，请使用「同步售出/持有」补全", "warn")
+                log_fn("下架成功但库存中未检测到唯一新 assetid，已保留旧 ID 并等待同步", "warn")
             return True, None, None
         return False, None, f"下架后新 assetid 数量异常: {len(new_ids)} (期望 1)"
     except Exception as e:
         return False, None, str(e)[:150]
+
+def resolve_delisted_assetid_from_inventory(
+    purchase: dict,
+    inventory_items: list,
+    purchases: list,
+) -> dict:
+    """Resolve a delisted item's current assetid only when one candidate is unique."""
+    name = (purchase.get("market_hash_name") or purchase.get("name") or "").strip()
+    db_id = int(purchase.get("_db_id") or 0)
+    if not name:
+        return {"status": "pending", "reason": "记录缺少市场名称"}
+
+    claimed = {
+        str(row.get("assetid") or "").strip()
+        for row in (purchases or [])
+        if int(row.get("_db_id") or 0) != db_id
+        and str(row.get("assetid") or "").strip()
+    }
+    candidates = []
+    seen = set()
+    for item in inventory_items or []:
+        item_name = (item.get("market_hash_name") or item.get("name") or "").strip()
+        assetid = str(item.get("assetid") or "").strip()
+        if item_name != name or not assetid or assetid in claimed or assetid in seen:
+            continue
+        seen.add(assetid)
+        candidates.append(item)
+
+    if len(candidates) == 1:
+        item = candidates[0]
+        return {
+            "status": "resolved",
+            "assetid": str(item.get("assetid") or "").strip(),
+            "item": item,
+        }
+    if not candidates:
+        return {
+            "status": "pending",
+            "reason": "库存暂未出现可唯一匹配的同名物品",
+        }
+    return {
+        "status": "ambiguous",
+        "reason": f"库存存在 {len(candidates)} 个未绑定的同名候选，需人工核对",
+        "candidate_assetids": [str(item.get("assetid") or "") for item in candidates],
+    }

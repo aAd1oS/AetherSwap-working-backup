@@ -21,6 +21,15 @@ DEFAULTS = {
         "game": "csgo",
         "price_tolerance": 0.5,
     },
+    "c5": {
+        "price_compare_enabled": False,
+        "app_key": "",
+        "manual_recommendation_enabled": False,
+        "min_savings_percent": 2.0,
+        "min_savings_amount": 0.2,
+        "quote_page_size": 10,
+        "request_timeout_seconds": 12,
+    },
     "stability": {
         "days": 30,
         "cv_threshold": 0.05,
@@ -34,6 +43,10 @@ DEFAULTS = {
         "slope_stable_floor": -0.005,
         "price_percentile_ceil_rising": 0.5,
         "use_vwap": True,
+        "outlier_filter_enabled": False,
+        "outlier_iqr_multiplier": 1.5,
+        "outlier_max_removed_ratio": 0.2,
+        "outlier_protect_persistent_recent": True,
         "request_interval_seconds": 2.5,
         "request_failure_delay_seconds": 5,
     },
@@ -45,6 +58,7 @@ DEFAULTS = {
         "iflow_top_n": 30,
         "exclude_keywords": ["印花"],
         "sell_price_ratio": 1.0,
+        "max_auto_listing_price_cny": 50.0,
         "verbose_debug": False,
         "sell_strategy": 4,
         "sell_price_offset": 0,
@@ -52,6 +66,8 @@ DEFAULTS = {
         "sell_price_max_ignore_volume": 4,
         "sell_trend_days": 7,
         "retry_interval_seconds": 300,
+        "max_run_rounds": 0,
+        "buff_protection_recovery_candidate_cap": 30,
         "buff_retry_delay_seconds": 5,
         "current_price_refresh_minutes": 10,
         "resell_ratio": 0.85,
@@ -66,6 +82,8 @@ DEFAULTS = {
         "listing_check_interval_seconds": 600,
         "max_listings_per_item": 5,
         "listing_delay_seconds": 3,
+        "stale_listing_staged_mode_enabled": False,
+        "strategy_module_logs_enabled": False,
         "steam_listings_debug": False,
         "start_time_limit_enabled": False,
         "start_time_hour": 8,
@@ -76,6 +94,7 @@ DEFAULTS = {
     },
     "notify": {
         "pushplus_token": "",
+        "lark_webhook": "",
         "holdings_report_interval_hours": 0,
         "holdings_report_change_threshold_pct": 20,
         "holdings_report_drop_enabled": True,
@@ -103,6 +122,7 @@ DEFAULTS = {
     "proxy_pool": {
         "enabled": False,
         "strategy": 3,
+        "steam_route_mode": "auto",
         "test_url": "https://ipv4.webshare.io/",
         "timeout_seconds": 10,
         "webshare_api_key": "",
@@ -150,6 +170,7 @@ def _validate_ranges(cfg: dict) -> dict:
     pipe = cfg.get("pipeline") or {}
     stab = cfg.get("stability") or {}
     buff = cfg.get("buff") or {}
+    c5 = cfg.get("c5") or {}
     inv = cfg.get("inventory") or {}
 
     if isinstance(pipe.get("max_discount"), (int, float)):
@@ -163,6 +184,33 @@ def _validate_ranges(cfg: dict) -> dict:
         if v <= 0:
             warnings.warn("[config] pipeline.max_unit_purchase_price 必须大于0，已修正为0.01")
             pipe["max_unit_purchase_price"] = 0.01
+    if isinstance(pipe.get("max_auto_listing_price_cny"), (int, float)):
+        value = float(pipe["max_auto_listing_price_cny"])
+        if value <= 0:
+            warnings.warn(
+                "[config] pipeline.max_auto_listing_price_cny 必须大于0，已修正为50"
+            )
+            pipe["max_auto_listing_price_cny"] = 50.0
+
+
+    if isinstance(pipe.get("max_run_rounds"), (int, float)):
+        value = int(pipe["max_run_rounds"])
+        normalized = min(max(value, 0), 1000)
+        if normalized != value:
+            warnings.warn(
+                f"[config] pipeline.max_run_rounds={value} 超出范围[0,1000]，已修正为 {normalized}"
+            )
+        pipe["max_run_rounds"] = normalized
+
+    if isinstance(pipe.get("buff_protection_recovery_candidate_cap"), (int, float)):
+        value = int(pipe["buff_protection_recovery_candidate_cap"])
+        normalized = max(value, 1)
+        if normalized != value:
+            warnings.warn(
+                "[config] pipeline.buff_protection_recovery_candidate_cap="
+                f"{value} 小于1，已修正为 {normalized}"
+            )
+        pipe["buff_protection_recovery_candidate_cap"] = normalized
 
     if isinstance(stab.get("cv_threshold"), (int, float)):
         v = stab["cv_threshold"]
@@ -175,6 +223,17 @@ def _validate_ranges(cfg: dict) -> dict:
         if not (0 < v < 1):
             warnings.warn(f"[config] stability.r2_threshold={v} 超出范围(0,1)，已修正")
             stab["r2_threshold"] = max(0.001, min(v, 0.999))
+
+    for key, lower, upper in (
+        ("outlier_iqr_multiplier", 0.1, 5.0),
+        ("outlier_max_removed_ratio", 0.0, 0.5),
+    ):
+        if isinstance(stab.get(key), (int, float)):
+            value = float(stab[key])
+            normalized = min(max(value, lower), upper)
+            if normalized != value:
+                warnings.warn(f"[config] stability.{key}={value} 超出范围[{lower},{upper}]，已修正")
+            stab[key] = normalized
 
     if isinstance(stab.get("price_percentile_ceil"), (int, float)):
         v = stab["price_percentile_ceil"]
@@ -208,6 +267,32 @@ def _validate_ranges(cfg: dict) -> dict:
         )
         fallback_method = "wechat"
     buff["balance_fallback_method"] = fallback_method
+
+    for key, upper in (("min_savings_percent", 100.0), ("min_savings_amount", None)):
+        if isinstance(c5.get(key), (int, float)):
+            value = float(c5[key])
+            normalized = max(value, 0.0)
+            if upper is not None:
+                normalized = min(normalized, upper)
+            if normalized != value:
+                warnings.warn(f"[config] c5.{key}={value} 超出范围，已修正为 {normalized}")
+            c5[key] = normalized
+
+    if isinstance(c5.get("quote_page_size"), (int, float)):
+        value = int(c5["quote_page_size"])
+        normalized = min(max(value, 1), 50)
+        if normalized != value:
+            warnings.warn(f"[config] c5.quote_page_size={value} 超出范围[1,50]，已修正为 {normalized}")
+        c5["quote_page_size"] = normalized
+
+    if isinstance(c5.get("request_timeout_seconds"), (int, float)):
+        value = int(c5["request_timeout_seconds"])
+        normalized = min(max(value, 3), 60)
+        if normalized != value:
+            warnings.warn(
+                f"[config] c5.request_timeout_seconds={value} 超出范围[3,60]，已修正为 {normalized}"
+            )
+        c5["request_timeout_seconds"] = normalized
 
     if isinstance(inv.get("refresh_seconds"), (int, float)):
         v = inv["refresh_seconds"]

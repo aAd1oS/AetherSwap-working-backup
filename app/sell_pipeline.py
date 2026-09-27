@@ -14,7 +14,7 @@ from app.pipeline_context import PipelineContext
 from app.services.account_region import refresh_account_region_currency
 from app.strategy_engine import apply_strategy_to_config, evaluate_strategy_runtime_modules
 from app.state import get_state, append_sale
-from app.steam_confirm import auto_confirm_once
+from app.steam_confirm import SteamConfirmer, select_new_listing_confirmations
 from app.steam_listings import fetch_my_listings
 from steam.market import list_item
 from steam.market_orders import compute_smart_list_price, get_sell_orders_cny
@@ -25,22 +25,139 @@ from utils.time import parse_steam_history_date
 from utils.trend import calculate_trend_robust
 
 _sell_phase_lock = threading.Lock()
+_STALE_LISTING_REVIEW_SECONDS = 24 * 60 * 60
+_STALE_WAIT_REPRICE_HOURS = 72.0
+_STALE_STAGED_WAIT_HOURS = {24: 72.0, 48: 48.0, 72: 24.0}
+_PENDING_CONFIRMATION_STATUS = "pending_confirmation"
+_CONFIRMATION_RETRY_DELAYS = (2, 8)
+
+
+def _sell_order_price_volume(order) -> tuple:
+    if isinstance(order, (list, tuple)) and len(order) >= 2:
+        raw_price, raw_volume = order[0], order[1]
+    elif isinstance(order, dict):
+        raw_price = order.get("price")
+        raw_volume = order.get("quantity", order.get("volume"))
+        try:
+            raw_price = float(raw_price) / 100.0
+        except (TypeError, ValueError):
+            return 0.0, 0
+    else:
+        return 0.0, 0
+    try:
+        return float(raw_price), max(0, int(raw_volume))
+    except (TypeError, ValueError):
+        return 0.0, 0
+
+
+def _queue_ahead_at_price(sell_orders: list, target_price: float) -> int:
+    """Conservative queue estimate: all visible units priced at or below target."""
+    total = 0
+    for order in sell_orders or []:
+        price, volume = _sell_order_price_volume(order)
+        if price > 0 and price <= float(target_price) + 0.0001:
+            total += volume
+    return total
+
+
+def _estimate_wait_hours(queue_ahead: int, average_daily_volume) -> Optional[float]:
+    try:
+        daily_volume = float(average_daily_volume)
+    except (TypeError, ValueError):
+        return None
+    if daily_volume <= 0:
+        return None
+    return round(max(0, int(queue_ahead)) / daily_volume * 24.0, 1)
+
+
+def _apply_stale_wait_gate(
+    current_price: float,
+    proposed_price: float,
+    reason: str,
+    queue_ahead: int,
+    average_daily_volume,
+    *,
+    listing_age_hours: float = 24.0,
+    staged_mode: bool = False,
+) -> dict:
+    wait_hours = _estimate_wait_hours(queue_ahead, average_daily_volume)
+    try:
+        normalized_daily_volume = round(float(average_daily_volume), 1)
+    except (TypeError, ValueError):
+        normalized_daily_volume = None
+    metrics = {
+        "queue_ahead": max(0, int(queue_ahead)),
+        "average_daily_volume": normalized_daily_volume,
+        "estimated_wait_hours": wait_hours,
+    }
+    if staged_mode:
+        stage_hours = 72 if listing_age_hours >= 72 else 48 if listing_age_hours >= 48 else 24
+        wait_threshold = _STALE_STAGED_WAIT_HOURS[stage_hours]
+        metrics["stage_hours"] = stage_hours
+        metrics["wait_threshold_hours"] = wait_threshold
+        if proposed_price > current_price + 0.009:
+            return {
+                "status": "hold",
+                "current_price": round(current_price, 2),
+                "proposed_price": round(proposed_price, 2),
+                "reason": f"{stage_hours}h 分段不自动上调滞销挂单，继续等待",
+                **metrics,
+            }
+        if proposed_price < current_price - 0.009:
+            if wait_hours is None:
+                return {
+                    "status": "hold",
+                    "current_price": round(current_price, 2),
+                    "proposed_price": round(proposed_price, 2),
+                    "reason": f"{stage_hours}h 分段缺少可靠成交量，禁止自动降价下架",
+                    **metrics,
+                }
+            if wait_hours < wait_threshold:
+                return {
+                    "status": "hold",
+                    "current_price": round(current_price, 2),
+                    "proposed_price": round(proposed_price, 2),
+                    "reason": (
+                        f"{stage_hours}h 分段预计等待 {wait_hours:.1f} 小时，"
+                        f"未达到 {wait_threshold:.0f} 小时调价门槛；继续等待"
+                    ),
+                    **metrics,
+                }
+        return {"status": "allow", "reason": reason, **metrics}
+    if (
+        proposed_price < current_price - 0.009
+        and wait_hours is not None
+        and wait_hours < _STALE_WAIT_REPRICE_HOURS
+    ):
+        return {
+            "status": "hold",
+            "current_price": round(current_price, 2),
+            "proposed_price": round(proposed_price, 2),
+            "reason": (
+                f"当前价前方约 {metrics['queue_ahead']} 件，按近期开单速度预计 "
+                f"{wait_hours:.1f} 小时，未达到 {_STALE_WAIT_REPRICE_HOURS:.0f} 小时降价门槛；"
+                "暂不下架，继续等待"
+            ),
+            **metrics,
+        }
+    return {"status": "allow", "reason": reason, **metrics}
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _steam_latest_price_and_trend(market_hash_name: str, trend_days: int = 7):
+def _steam_recent_market_activity(market_hash_name: str, trend_days: int = 7) -> Optional[dict]:
     from app.services.steam_client import SteamClient
     from utils.money import apply_currency
+
     client = SteamClient()
     raw = client.fetch_history(market_hash_name, app_id=730, return_currency=True)
     if not raw or not isinstance(raw, dict):
-        return None, None, None
+        return None
     history = raw.get("history")
     currency = raw.get("currency")
     if not history:
-        return None, None, None
+        return None
     parsed = []
     for entry in history:
         if len(entry) < 2:
@@ -49,26 +166,67 @@ def _steam_latest_price_and_trend(market_hash_name: str, trend_days: int = 7):
         if dt is None:
             continue
         try:
-            p = float(entry[1])
+            price = float(entry[1])
         except (ValueError, TypeError):
             continue
-        parsed.append((dt, p))
+        volume = 0
+        if len(entry) >= 3:
+            try:
+                volume = max(0, int(str(entry[2]).replace(",", "").strip()))
+            except (ValueError, TypeError):
+                volume = 0
+        parsed.append((dt, price, volume))
     if not parsed:
-        return None, None, None
-    prices = [p for (_, p) in parsed]
-    prices_cny, _ = apply_currency(prices, currency, USD_TO_CNY_DEFAULT)
+        return None
+    prices_cny, _ = apply_currency(
+        [entry[1] for entry in parsed],
+        currency,
+        USD_TO_CNY_DEFAULT,
+    )
     if not prices_cny:
-        return None, None, None
-    parsed_cny = list(zip([x[0] for x in parsed], prices_cny))
-    parsed_cny.sort(key=lambda x: x[0])
-    latest_price = parsed_cny[-1][1]
-    newest_dt = parsed_cny[-1][0]
+        return None
+    converted = [
+        (parsed[index][0], prices_cny[index], parsed[index][2])
+        for index in range(len(parsed))
+    ]
+    converted.sort(key=lambda entry: entry[0])
+    newest_dt = converted[-1][0]
     cutoff = newest_dt - timedelta(days=trend_days)
-    in_range = [(dt, p) for dt, p in parsed_cny if dt >= cutoff]
-    prices_in_range = [p for (_, p) in in_range]
-    trend = calculate_trend_robust(prices_in_range, use_dynamic_sensitivity=True) if len(prices_in_range) >= 3 else 0
-    return latest_price, trend, prices_in_range
+    in_range = [entry for entry in converted if entry[0] >= cutoff]
+    prices_in_range = [entry[1] for entry in in_range]
+    trend = (
+        calculate_trend_robust(prices_in_range, use_dynamic_sensitivity=True)
+        if len(prices_in_range) >= 3
+        else 0
+    )
+    observed_days = max(
+        1,
+        min(
+            trend_days,
+            (in_range[-1][0].date() - in_range[0][0].date()).days + 1,
+        ),
+    )
+    total_volume = sum(entry[2] for entry in in_range)
+    average_daily_volume = (
+        round(total_volume / observed_days, 1)
+        if total_volume > 0
+        else None
+    )
+    return {
+        "latest_price": converted[-1][1],
+        "trend": trend,
+        "prices": prices_in_range,
+        "average_daily_volume": average_daily_volume,
+        "total_volume": total_volume,
+        "observed_days": observed_days,
+    }
 
+
+def _steam_latest_price_and_trend(market_hash_name: str, trend_days: int = 7):
+    activity = _steam_recent_market_activity(market_hash_name, trend_days=trend_days)
+    if not activity:
+        return None, None, None
+    return activity["latest_price"], activity["trend"], activity["prices"]
 
 def _load_rate_map() -> dict:
     """Load exchange rate JSON from config dir. Returns an empty dict on any failure."""
@@ -84,19 +242,39 @@ def _load_rate_map() -> dict:
     return {}
 
 
-def _record_listing_success(ctx, aid: str, name: str, list_price: float, listing_delay: float) -> None:
-    """Append sale record, mark purchase as listed, and sleep the listing delay."""
-    append_sale({"name": name, "goods_id": 0, "price": list_price, "at": time.time(), "assetid": aid or ""})
+def _record_listing_success(
+    ctx, aid: str, name: str, list_price: float, listing_delay: float, *,
+    requires_confirmation: bool = False, record_event: bool = True,
+) -> None:
+    """Mark a listing request locally without duplicating existing listing events."""
+    if record_event:
+        append_sale({
+            "name": name, "goods_id": 0, "price": list_price,
+            "at": time.time(), "assetid": aid or "",
+        })
     if aid:
         purchases = ctx.state.get_purchases()
         for i, p in enumerate(purchases):
             if str(p.get("assetid") or "") == aid:
                 db_id = p.get("_db_id")
+                listed_at = time.time()
+                listing_updates = {
+                    "listing": True,
+                    "listed_at": listed_at,
+                    "listing_price": list_price,
+                    "stale_listing_notified_at": None,
+                    "listing_review_after": listed_at + _STALE_LISTING_REVIEW_SECONDS,
+                    "last_listing_advice_key": None,
+                    "listing_status": _PENDING_CONFIRMATION_STATUS if requires_confirmation else None,
+                }
                 if db_id:
-                    ctx.state.update_purchase_by_id(db_id, {"listing": True})
+                    ctx.state.update_purchase_by_id(db_id, listing_updates)
                 else:
-                    ctx.state.update_purchase(i, {"listing": True})
+                    ctx.state.update_purchase(i, listing_updates)
                 break
+    from app.services.steam_auth import record_steam_session_success
+
+    record_steam_session_success("Steam 上架成功")
     jittered_sleep(listing_delay)
 
 
@@ -136,7 +314,7 @@ def _get_inventory(ctx: PipelineContext, items: Optional[list]) -> Optional[list
         ctx.log("Steam 登录已过期，尝试自动重新登录…", "warn", category="steam")
         try:
             from app.services.steam_auth import try_steam_auto_relogin
-            relogin_ok, _, relogin_msg = try_steam_auto_relogin()
+            relogin_ok, _, relogin_msg = try_steam_auto_relogin(force_login=True)
             if relogin_ok:
                 ctx.log(f"自动重新登录成功: {relogin_msg}，重新获取库存", "info", category="steam")
                 jittered_sleep(2, jitter_ratio=0.2)
@@ -149,6 +327,64 @@ def _get_inventory(ctx: PipelineContext, items: Optional[list]) -> Optional[list
         ctx.log(f"获取库存失败: {err}，跳过", "warn", category="steam")
         return None
     return items
+
+
+def _is_personal_protected_item(item: dict, buy_record: Optional[dict]) -> bool:
+    ownership_mode = str(item.get("ownership_mode") or "").strip().lower()
+    return ownership_mode == "personal" or (ownership_mode != "managed" and not buy_record)
+
+
+def _count_sellable_ownership(sellable: list, purchases_snapshot: list) -> tuple:
+    personal_count = 0
+    managed_count = 0
+    for item in sellable:
+        name = (item.get("market_hash_name") or item.get("name") or "").strip()
+        assetid = str(item.get("assetid") or "").strip()
+        buy_record = _find_buy_record(purchases_snapshot, assetid, name)
+        if _is_personal_protected_item(item, buy_record):
+            personal_count += 1
+        else:
+            managed_count += 1
+    return managed_count, personal_count
+
+
+def _format_listing_plan_summary(to_list: list, limit: int = 10) -> str:
+    entries = [
+        f"{entry.get('name') or '未命名商品'}@{float(entry.get('list_price') or 0):.2f}"
+        for entry in to_list
+    ]
+    visible = entries[:max(1, int(limit))]
+    suffix = f" 等共 {len(entries)} 件" if len(entries) > len(visible) else ""
+    return "、".join(visible) + suffix
+
+def _max_auto_listing_price_cny(pipeline_cfg: dict) -> float:
+    try:
+        value = float((pipeline_cfg or {}).get("max_auto_listing_price_cny", 50.0) or 50.0)
+    except (TypeError, ValueError):
+        return 50.0
+    return value if value > 0 else 50.0
+
+
+def _filter_auto_listing_price_cap(ctx: PipelineContext, to_list: list, pipeline_cfg: dict) -> list:
+    cap = _max_auto_listing_price_cny(pipeline_cfg)
+    allowed = []
+    for entry in to_list:
+        try:
+            list_price = float(entry.get("list_price") or 0)
+        except (TypeError, ValueError):
+            list_price = 0.0
+        if list_price > cap:
+            ctx.log(
+                f"[出售保护] {entry.get('name') or '未命名商品'} "
+                f"assetid={entry.get('aid') or ''} 自动上架价 {list_price:.2f} "
+                f"超过单价上限 {cap:.2f}，跳过上架",
+                "warn",
+                category="steam",
+            )
+            continue
+        entry["max_auto_listing_price_cny"] = cap
+        allowed.append(entry)
+    return allowed
 
 
 def _build_listing_plan(
@@ -165,6 +401,8 @@ def _build_listing_plan(
     assetid_to_name_map: dict,
     account_currency: str,
     rate_map: dict,
+    exclude_active_assetids: Optional[set] = None,
+    collect_wait_metrics: bool = False,
 ) -> list:
     """Decide which sellable items to actually list and at what price.
 
@@ -180,6 +418,9 @@ def _build_listing_plan(
     skip_same_name_cap: dict = defaultdict(int)
     to_list = []
     seen_assetids: set = set()
+    excluded_active = {
+        str(value or "").strip() for value in (exclude_active_assetids or set())
+    }
 
     for it in sellable:
         if ctx.is_stop_requested():
@@ -199,8 +440,17 @@ def _build_listing_plan(
         
         buy_record = _find_buy_record(purchases_snapshot, aid, market_hash_name)
         ownership_mode = str(it.get("ownership_mode") or "").strip().lower()
-        if ownership_mode == "personal" or (ownership_mode != "managed" and not buy_record):
-            ctx.log(f"[出售] {name} assetid={aid} 属于个人保护库存，跳过出售", "info", category="steam")
+        if _is_personal_protected_item(it, buy_record):
+            ctx.debug(
+                f"[出售] {name} assetid={aid} 属于个人保护库存，跳过出售",
+                category="steam",
+            )
+            continue
+        if buy_record and buy_record.get("listing"):
+            ctx.debug(
+                f"[出售] {name} assetid={aid} 本地已标记为在售或等待确认，跳过重复上架",
+                category="steam",
+            )
             continue
         if ownership_mode == "managed" and not buy_record and sell_strategy == 3:
             ctx.log(
@@ -215,11 +465,13 @@ def _build_listing_plan(
         if ok_listings and listing_assetid_to_name:
             steam_same_name = sum(
                 1 for lid in active_listing_ids
+                if str(lid or "").strip() not in excluded_active
                 if (listing_assetid_to_name.get(lid) or "").strip() == market_hash_name
             )
         elif ok_listings:
             steam_same_name = sum(
                 1 for lid in active_listing_ids
+                if str(lid or "").strip() not in excluded_active
                 if (assetid_to_name_map.get(lid) or "").strip() == market_hash_name
             )
         else:
@@ -263,6 +515,19 @@ def _build_listing_plan(
         list_price = round(float(list_price), 2)
         trend = None
         profit_output = {}
+        sell_orders = list(orders_data.get("sell_orders") or [])
+        queue_ahead = _queue_ahead_at_price(sell_orders, list_price)
+        market_activity = (
+            _steam_recent_market_activity(market_hash_name, trend_days=trend_days)
+            if collect_wait_metrics
+            else None
+        )
+        average_daily_volume = (
+            market_activity.get("average_daily_volume")
+            if market_activity
+            else None
+        )
+        estimated_wait_hours = _estimate_wait_hours(queue_ahead, average_daily_volume)
 
         # Currency conversion for display
         display_price = list_price
@@ -284,7 +549,13 @@ def _build_listing_plan(
 
         # Sell strategy 2/3: skip if rising trend
         if sell_strategy in (2, 3):
-            _, trend, _ = _steam_latest_price_and_trend(market_hash_name, trend_days=trend_days)
+            if market_activity is not None:
+                trend = market_activity.get("trend")
+            else:
+                _, trend, _ = _steam_latest_price_and_trend(
+                    market_hash_name,
+                    trend_days=trend_days,
+                )
             if trend is not None and trend > 0:
                 ctx.log(f"[出售] {name} assetid={aid} 近{trend_days}天上升趋势，等待", "info", category="steam")
                 continue
@@ -327,11 +598,13 @@ def _build_listing_plan(
                 "list_price": list_price,
                 "reason": reason,
                 "order_count": len(orders_data.get("sell_orders") or []),
+                "queue_ahead": queue_ahead,
             },
             "pricing.steam_wall_gap": {
                 "list_price": list_price,
                 "reason": reason,
                 "order_count": len(orders_data.get("sell_orders") or []),
+                "queue_ahead": queue_ahead,
             },
             "pricing.price_offset": {"sell_price_offset": sell_offset},
             "guard.rising_trend_wait": {"trend": trend, "trend_days": trend_days},
@@ -350,29 +623,62 @@ def _build_listing_plan(
             context=custom_context,
             outputs=custom_outputs,
         )
-        for result in custom_results:
-            level = "warn" if result.get("status") in {"reject", "error"} else "info"
-            ctx.log(
-                f"[策略模块] {name} assetid={aid} {result.get('module_name')}: "
-                f"{result.get('reason')} ({result.get('status')})",
-                level,
-                category="steam",
+        if pipeline_cfg.get("strategy_module_logs_enabled", False):
+            enabled_modules = set(
+                (((cfg.get("_strategy_runtime") or {}).get("sell") or {}).get("enabled_modules") or [])
             )
+            for module_id, module_output in custom_outputs.items():
+                if module_id not in enabled_modules:
+                    continue
+                details = " ".join(
+                    f"{key}={value}" for key, value in module_output.items() if value is not None
+                )
+                ctx.log(
+                    f"[策略模块:{module_id}] DATA | {name} assetid={aid} {details}",
+                    "info",
+                    category="strategy",
+                )
+            for result in custom_results:
+                level = "warn" if result.get("status") in {"reject", "error"} else "info"
+                ctx.log(
+                    f"[策略模块] {name} assetid={aid} {result.get('module_name')}: "
+                    f"{result.get('reason')} ({result.get('status')})",
+                    level,
+                    category="strategy",
+                )
         if blocking:
             continue
 
         price_cents = list_price_display_to_cents(display_price, account_currency)
+        if buy_record and float(buy_record.get("price") or 0) > 0:
+            currency_rate = 1.0 if account_currency == "CNY" else float(rate_map.get(account_currency) or 0)
+            expected_net_cny = round((price_cents / 100.0) * currency_rate, 2)
+            purchase_cost = round(float(buy_record.get("price") or 0), 2)
+            if expected_net_cny + 0.0001 < purchase_cost:
+                ctx.log(
+                    f"[出售保护] {name} assetid={aid} 预计税后到账 {expected_net_cny:.2f} "
+                    f"低于购入成本 {purchase_cost:.2f}，跳过上架",
+                    "warn",
+                    category="steam",
+                )
+                continue
         to_list_by_name[market_hash_name] += 1
         n_this_name = to_list_by_name[market_hash_name]
         ctx.log(
             f"[出售] 列入待上架 assetid={aid} {name} 价格={list_price:.2f}"
-            f"（该同名 Steam 在售 {steam_same_name}，本轮回第 {n_this_name} 件，上限 {max_per_item}）",
+            f"（目标价前方约 {queue_ahead} 件；该同名 Steam 在售 {steam_same_name}，"
+            f"本轮回第 {n_this_name} 件，上限 {max_per_item}）",
             "info", category="steam",
         )
         to_list.append({
             "it": it, "list_price": list_price, "reason": reason,
             "price_cents": price_cents, "market_hash_name": market_hash_name,
             "name": name, "aid": aid,
+            "sell_orders": sell_orders,
+            "queue_ahead": queue_ahead,
+            "average_daily_volume": average_daily_volume,
+            "estimated_wait_hours": estimated_wait_hours,
+            "account_id": str((get_current_account() or {}).get("id") or ""),
         })
 
     if skip_same_name_cap:
@@ -401,12 +707,12 @@ def _submit_listings(
     session,
     session_id_effective: str,
     listing_delay: float,
-) -> int:
+) -> list:
     """POST listing requests to Steam and handle retries.
 
-    Returns the count of successfully submitted listings.
+    Returns details for successfully submitted listings.
     """
-    listed = 0
+    listed = []
     for entry in to_list:
         if ctx.is_stop_requested():
             ctx.set_status("stopped", "已停止")
@@ -418,10 +724,28 @@ def _submit_listings(
         price_cents = entry["price_cents"]
         name = entry["name"]
         aid = entry["aid"]
+        try:
+            price_cap = float(entry.get("max_auto_listing_price_cny", 50.0) or 50.0)
+        except (TypeError, ValueError):
+            price_cap = 50.0
+        if price_cap <= 0:
+            price_cap = 50.0
+        if float(list_price) > price_cap:
+            ctx.log(
+                f"[出售保护] {name} assetid={aid} 自动上架价 {float(list_price):.2f} "
+                f"超过单价上限 {price_cap:.2f}，已阻止提交 Steam 上架请求",
+                "warn",
+                category="steam",
+            )
+            continue
 
         ctx.log(f"[出售] 上架请求 {name} assetid={aid} 价格={list_price:.2f} ({reason})", "info", category="steam")
 
         def _do_list():
+            from app.account_operations import assert_current_account
+            expected_account_id = str(entry.get("account_id") or (get_current_account() or {}).get("id") or "")
+            if expected_account_id:
+                assert_current_account(expected_account_id)
             return list_item(
                 session, session_id_effective,
                 int(it.get("appid", 730)),
@@ -438,13 +762,49 @@ def _submit_listings(
 
         try:
             data = json.loads(out.get("text") or "{}")
+            if not isinstance(data, dict):
+                status_code = out.get("status_code") or "?"
+                content_type = str(out.get("content_type") or "未知")[:80]
+                response_text = str(out.get("text") or "").strip()[:80] or "空响应"
+                ctx.log(
+                    f"[出售] 上架失败 assetid={aid} {name}: Steam 返回异常响应 "
+                    f"HTTP {status_code}, Content-Type={content_type}, Body={response_text}",
+                    "warn",
+                    category="steam",
+                )
+                jittered_sleep(listing_delay)
+                continue
             msg = (data.get("message") or "")[:80]
             msg_lower = msg.lower()
 
-            if data.get("success") or "pending confirmation" in msg_lower or "already have a listing" in msg_lower:
-                listed += 1
-                ctx.log(f"[出售] 已上架 assetid={aid} {name} 价格={list_price:.2f} ({reason})", "info", category="steam")
-                _record_listing_success(ctx, aid, name, list_price, listing_delay)
+            already_listed = "already have a listing" in msg_lower
+            chinese_pending = "等待确认" in msg and "已上架" in msg
+            already_listed = already_listed or chinese_pending
+            pending_confirmation = "pending confirmation" in msg_lower or chinese_pending
+            if data.get("success") or pending_confirmation or already_listed:
+                listing_id = str(data.get("listingid") or data.get("listing_id") or "").strip()
+                requires_confirmation = bool(
+                    data.get("needs_mobile_confirmation") is True
+                    or data.get("requires_confirmation") is True
+                    or pending_confirmation
+                )
+                listed.append({
+                    "assetid": aid,
+                    "listing_id": listing_id,
+                    "requires_confirmation": requires_confirmation,
+                    "created": not already_listed,
+                })
+                action = "检测到已存在待确认上架" if already_listed else "已上架"
+                ctx.log(f"[出售] {action} assetid={aid} {name} 价格={list_price:.2f} ({reason})", "info", category="steam")
+                _record_listing_success(
+                    ctx,
+                    aid,
+                    name,
+                    list_price,
+                    listing_delay,
+                    requires_confirmation=requires_confirmation,
+                    record_event=not already_listed,
+                )
                 continue
 
             if "previous action completes" in msg_lower or "until your previous" in msg_lower:
@@ -454,11 +814,39 @@ def _submit_listings(
                 if out2:
                     try:
                         data2 = json.loads(out2.get("text") or "{}")
-                        msg2 = (data2.get("message") or "")[:80].lower()
-                        if data2.get("success") or "pending confirmation" in msg2 or "already have a listing" in msg2:
-                            listed += 1
+                        if not isinstance(data2, dict):
+                            raise ValueError("Steam 重试返回非对象 JSON")
+                        raw_msg2 = (data2.get("message") or "")[:80]
+                        msg2 = raw_msg2.lower()
+                        chinese_pending2 = "等待确认" in raw_msg2 and "已上架" in raw_msg2
+                        already_listed2 = "already have a listing" in msg2 or chinese_pending2
+                        pending_confirmation2 = "pending confirmation" in msg2 or chinese_pending2
+                        if data2.get("success") or pending_confirmation2 or already_listed2:
+                            listing_id = str(data2.get("listingid") or data2.get("listing_id") or "").strip()
+                            listed.append({
+                                "assetid": aid,
+                                "listing_id": listing_id,
+                                "requires_confirmation": bool(
+                                    data2.get("needs_mobile_confirmation") is True
+                                    or data2.get("requires_confirmation") is True
+                                    or pending_confirmation2
+                                ),
+                                "created": not already_listed2,
+                            })
                             ctx.log(f"[出售] 已上架 assetid={aid} {name} 价格={list_price:.2f} ({reason}) [重试成功]", "info", category="steam")
-                            _record_listing_success(ctx, aid, name, list_price, listing_delay)
+                            _record_listing_success(
+                                ctx,
+                                aid,
+                                name,
+                                list_price,
+                                listing_delay,
+                                requires_confirmation=bool(
+                                    data2.get("needs_mobile_confirmation") is True
+                                    or data2.get("requires_confirmation") is True
+                                    or pending_confirmation2
+                                ),
+                                record_event=not already_listed2,
+                            )
                             continue
                     except Exception:
                         pass  # retry response unparseable, fall through to failure log
@@ -472,28 +860,95 @@ def _submit_listings(
     return listed
 
 
-def _auto_confirm_listings(ctx: PipelineContext, cfg: dict, steam_id: str, cookies: str) -> None:
+def _prepare_listing_confirmations(ctx: PipelineContext, cfg: dict, steam_id: str, cookies: str):
+    """Read the baseline confirmation list before listing; failure disables this batch."""
     """Confirm pending Steam Guard confirmations after listing, if configured."""
     steam_confirm_cfg = cfg.get("steam_confirm") or {}
     if not bool(steam_confirm_cfg.get("enabled")):
-        return
+        return None
     identity_secret = (steam_confirm_cfg.get("identity_secret") or "").strip()
     device_id = (steam_confirm_cfg.get("device_id") or "").strip()
     if not identity_secret or not device_id:
         ctx.log("[确认] 已开启自动确认，但 identity_secret/device_id 未配置，跳过", "warn", category="steam")
-        return
-    jittered_sleep(2)
-    ctx.log("[确认] 正在检查待确认列表…", "info", category="steam")
-    okc, n, errc = auto_confirm_once(
+        return None
+    bot = SteamConfirmer(
         identity_secret=identity_secret,
         device_id=device_id,
         steam_id=str(steam_id),
         cookies=str(cookies),
     )
+    ok, baseline, error = bot.get_confirmations()
+    if not ok:
+        ctx.log(f"[确认] 上架前确认列表读取失败，本轮禁用自动确认: {error}", "warn", category="steam")
+        return None
+    return bot, baseline
+
+
+def _clear_listing_confirmation_status(ctx: PipelineContext, successful_listings: list) -> None:
+    assetids = {
+        str(row.get("assetid") or "").strip()
+        for row in successful_listings
+        if row.get("requires_confirmation") is True and str(row.get("assetid") or "").strip()
+    }
+    for index, purchase in enumerate(ctx.state.get_purchases()):
+        if str(purchase.get("assetid") or "").strip() not in assetids:
+            continue
+        db_id = purchase.get("_db_id")
+        if db_id:
+            ctx.state.update_purchase_by_id(db_id, {"listing_status": None})
+        else:
+            ctx.state.update_purchase(index, {"listing_status": None})
+
+
+def _auto_confirm_listings(ctx: PipelineContext, prepared, successful_listings: list) -> None:
+    if not successful_listings:
+        return
+    if not any(
+        row.get("requires_confirmation") is True
+        for row in successful_listings
+    ):
+        ctx.debug("[确认] 本轮成功上架均未要求 Steam 手机确认，无需处理", category="steam")
+        return
+    if prepared is None:
+        return
+    bot, baseline = prepared
+    jittered_sleep(_CONFIRMATION_RETRY_DELAYS[0])
+    ok, after, error = bot.get_confirmations()
+    if not ok:
+        ctx.log(f"[确认] 上架后确认列表读取失败，未处理任何确认: {error}", "warn", category="steam")
+        return
+    selected, selection_error = select_new_listing_confirmations(baseline, after, successful_listings)
+    if selection_error:
+        ctx.log(
+            f"[确认] 本轮确认暂时无法唯一对应，将在 {_CONFIRMATION_RETRY_DELAYS[1]} 秒后严格重试一次",
+            "info",
+            category="steam",
+        )
+        jittered_sleep(_CONFIRMATION_RETRY_DELAYS[1])
+        ok_retry, after_retry, retry_error = bot.get_confirmations()
+        if ok_retry:
+            selected, selection_error = select_new_listing_confirmations(baseline, after_retry, successful_listings)
+        else:
+            selection_error = f"确认列表重试失败: {retry_error}"
+    if selection_error:
+        ctx.log(f"[确认] 未处理任何确认: {selection_error}", "warn", category="steam")
+        from app.notify import send_lark
+        webhook = str((load_app_config_validated().get("notify") or {}).get("lark_webhook") or "").strip()
+        if webhook:
+            send_lark(webhook, "Steam 自动确认已转人工", selection_error)
+        return
+    okc, n, errc = bot.accept_selected(selected)
     if okc:
-        ctx.log(f"[确认] 已自动确认 {n} 项", "info", category="steam")
+        _clear_listing_confirmation_status(ctx, successful_listings)
+        ctx.log(f"[确认] 已定向确认本轮市场上架 {n} 项", "info", category="steam")
     else:
-        ctx.log(f"[确认] 自动确认失败: {errc}", "warn", category="steam")
+        ctx.log(f"[确认] 定向确认失败: {errc}", "warn", category="steam")
+        from app.notify import send_lark
+        webhook = str((load_app_config_validated().get("notify") or {}).get("lark_webhook") or "").strip()
+        if webhook:
+            send_lark(
+                webhook, "Steam 上架确认需要人工处理", errc or "Steam 自动确认未返回明确成功结果"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -596,10 +1051,16 @@ def _run_sell_phase_impl(cfg: dict, state, flow_id: str, items: Optional[list] =
         for p in purchases_snapshot if str(p.get("assetid") or "").strip()
     }
 
+    managed_count, personal_count = _count_sellable_ownership(
+        sellable,
+        purchases_snapshot,
+    )
     ctx.log(
-        f"策略{sell_strategy}，可出售 {len(sellable)} 件"
+        f"[出售扫描] 策略{sell_strategy}：Steam 可出售 {len(sellable)} 件，"
+        f"其中自动托管 {managed_count} 件、个人保护 {personal_count} 件"
         f"（智能定价：墙+断层；上架间隔={listing_delay}s）",
-        "info", category="steam",
+        "info",
+        category="steam",
     )
 
     to_list = _build_listing_plan(
@@ -607,17 +1068,39 @@ def _run_sell_phase_impl(cfg: dict, state, flow_id: str, items: Optional[list] =
         purchases_snapshot, ok_listings, active_listing_ids,
         listing_assetid_to_name, assetid_to_name_map, account_currency, rate_map,
     )
+    to_list = _filter_auto_listing_price_cap(ctx, to_list, pipeline_cfg)
 
     if not to_list:
-        ctx.debug("[出售] 本轮回无需上架", category="steam")
+        ctx.log(
+            f"[出售汇总] 扫描 {len(sellable)} 件：个人保护 {personal_count} 件，"
+            f"自动托管 {managed_count} 件；计划上架 0 件，"
+            f"自动托管未进入计划 {managed_count} 件",
+            "info",
+            category="steam",
+        )
         return
 
+    confirmation_scope = _prepare_listing_confirmations(
+        ctx, cfg, cred_steam.get("steam_id", ""), cred_steam.get("cookies", "")
+    )
     ctx.log(f"[出售] 开始上架 {len(to_list)} 件", "info", category="steam")
     listed = _submit_listings(ctx, to_list, session, session_id_effective, listing_delay)
 
     if listed:
-        ctx.log(f"[出售] 本轮回共上架 {listed} 件，等待下一轮", "info", category="steam")
-        _auto_confirm_listings(ctx, cfg, cred_steam.get("steam_id", ""), cred_steam.get("cookies", ""))
+        ctx.log(f"[出售] 本轮回共上架 {len(listed)} 件，等待下一轮", "info", category="steam")
+        _auto_confirm_listings(ctx, confirmation_scope, listed)
+
+    failed_count = max(0, len(to_list) - len(listed))
+    not_planned_count = max(0, managed_count - len(to_list))
+    ctx.log(
+        f"[出售汇总] 扫描 {len(sellable)} 件：个人保护 {personal_count} 件，"
+        f"自动托管 {managed_count} 件；计划上架 {len(to_list)} 件，"
+        f"成功 {len(listed)} 件，失败 {failed_count} 件，"
+        f"自动托管未进入计划 {not_planned_count} 件；"
+        f"计划商品：{_format_listing_plan_summary(to_list)}",
+        "info",
+        category="steam",
+    )
 
 
 def _run_sell_phase(cfg: dict, state, flow_id: str, items: Optional[list] = None) -> None:
@@ -625,7 +1108,15 @@ def _run_sell_phase(cfg: dict, state, flow_id: str, items: Optional[list] = None
         state.log("[出售] 已有出售任务在执行，本次跳过", "info", category="steam", flow_id=flow_id)
         return
     try:
-        _run_sell_phase_impl(cfg, state, flow_id, items)
+        from app.account_operations import account_operation
+        with account_operation("出售任务"):
+            _run_sell_phase_impl(cfg, state, flow_id, items)
+    except Exception as exc:
+        from app.account_operations import AccountOperationConflict
+        if isinstance(exc, AccountOperationConflict):
+            state.log(f"[出售] {exc}", "warn", category="account", flow_id=flow_id)
+        else:
+            raise
     finally:
         _sell_phase_lock.release()
 
@@ -634,13 +1125,153 @@ def _run_sell_phase(cfg: dict, state, flow_id: str, items: Optional[list] = None
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def run_sell_phase_on_inventory_update(items: list) -> None:
+def run_sell_phase_on_inventory_update(items: list, *, delay_seconds: float = 0.0) -> None:
     cfg = merge(DEFAULTS, load_app_config_validated())
     state = get_state()
-    t = threading.Thread(
-        target=_run_sell_phase,
-        args=(cfg, state, "inventory"),
-        kwargs={"items": items},
-        daemon=True,
-    )
+
+    def runner() -> None:
+        if delay_seconds > 0:
+            time.sleep(float(delay_seconds))
+        _run_sell_phase(cfg, state, "inventory", items=items)
+
+    t = threading.Thread(target=runner, daemon=True)
     t.start()
+
+def evaluate_stale_listing_reprice(
+    cfg: dict,
+    state,
+    purchase: dict,
+    active_listing_ids: set,
+    listing_assetid_to_name: Optional[dict] = None,
+) -> dict:
+    """Run the active sell strategy for one listed item without submitting it."""
+    cfg = apply_strategy_to_config(cfg, "sell")
+    pipeline_cfg = cfg.get("pipeline", {})
+    ctx = PipelineContext(
+        state,
+        "stale-listing-review",
+        verbose=bool(pipeline_cfg.get("verbose_debug", False)),
+    )
+    sell_strategy = int(pipeline_cfg.get("sell_strategy", 1))
+    if sell_strategy == 4:
+        return {"status": "hold", "reason": "策略4已暂停自动出售"}
+
+    assetid = str(purchase.get("assetid") or "").strip()
+    name = (purchase.get("market_hash_name") or purchase.get("name") or "").strip()
+    current_price = float(purchase.get("listing_price") or 0)
+    if not assetid or not name:
+        return {"status": "hold", "reason": "缺少 assetid 或市场名称"}
+    if current_price <= 0:
+        return {"status": "hold", "reason": "缺少当前上架价，无法安全比较"}
+
+    from app.account_scope import get_account_runtime_status, validate_current_account_identity
+
+    identity_ok, identity_error = validate_current_account_identity()
+    if not identity_ok:
+        return {"status": "hold", "reason": f"账号身份保护: {identity_error}"}
+    account = get_current_account()
+    if account is None:
+        return {"status": "hold", "reason": "当前没有有效 Steam 账号"}
+    account_id = str(account.get("id") or "")
+    purchase_account_id = str(purchase.get("account_id") or "")
+    if purchase_account_id and purchase_account_id != account_id:
+        return {"status": "hold", "reason": "记录账号与当前账号不一致"}
+    if not get_account_runtime_status(account_id).get("auto_sell_enabled", False):
+        return {"status": "hold", "reason": "当前账号未开启自动出售"}
+
+    cred_steam = get_steam_credentials()
+    session_result = _resolve_steam_session(ctx, cred_steam)
+    if session_result is None:
+        return {"status": "hold", "reason": "Steam 会话不可用"}
+    session, _session_id = session_result
+
+    region_check = refresh_account_region_currency(
+        account_id,
+        cookies_raw=cred_steam.get("cookies", ""),
+    )
+    if not region_check.get("ok"):
+        return {
+            "status": "hold",
+            "reason": f"无法实时确认结算币种: {region_check.get('error') or '未知原因'}",
+        }
+    account_currency = (region_check.get("currency_code") or "").strip().upper()
+    if not account_currency:
+        return {"status": "hold", "reason": "Steam 未返回结算币种"}
+
+    purchases_snapshot = state.get_purchases()
+    item = {
+        "name": name,
+        "market_hash_name": name,
+        "assetid": assetid,
+        "can_sell": True,
+        "appid": 730,
+        "contextid": "2",
+        "ownership_mode": "managed",
+    }
+    active_ids = {str(value or "").strip() for value in (active_listing_ids or set())}
+    listing_names = dict(listing_assetid_to_name or {})
+    assetid_to_name_map = {
+        str(row.get("assetid") or "").strip():
+        (row.get("market_hash_name") or row.get("name") or "").strip()
+        for row in purchases_snapshot
+        if str(row.get("assetid") or "").strip()
+    }
+    plan = _build_listing_plan(
+        ctx,
+        cfg,
+        session,
+        [item],
+        sell_strategy,
+        pipeline_cfg,
+        purchases_snapshot,
+        True,
+        active_ids,
+        listing_names,
+        assetid_to_name_map,
+        account_currency,
+        _load_rate_map(),
+        exclude_active_assetids={assetid},
+        collect_wait_metrics=True,
+    )
+    if not plan:
+        return {"status": "hold", "reason": "当前出售策略选择继续等待或安全条件未通过"}
+
+    candidate = plan[0]
+    proposed_price = round(float(candidate.get("list_price") or 0), 2)
+    if proposed_price <= 0:
+        return {"status": "hold", "reason": "当前出售策略未生成有效价格"}
+    current_queue = _queue_ahead_at_price(
+        candidate.get("sell_orders") or [],
+        current_price,
+    )
+    wait_gate = _apply_stale_wait_gate(
+        current_price,
+        proposed_price,
+        candidate.get("reason") or "当前策略建议改价",
+        current_queue,
+        candidate.get("average_daily_volume"),
+        listing_age_hours=float(purchase.get("_listing_age_hours") or 24.0),
+        staged_mode=bool(pipeline_cfg.get("stale_listing_staged_mode_enabled", False)),
+    )
+    if wait_gate["status"] == "hold":
+        return wait_gate
+    market_metrics = {
+        "queue_ahead": wait_gate.get("queue_ahead"),
+        "average_daily_volume": wait_gate.get("average_daily_volume"),
+        "estimated_wait_hours": wait_gate.get("estimated_wait_hours"),
+    }
+    if abs(proposed_price - round(current_price, 2)) < 0.009:
+        return {
+            "status": "unchanged",
+            "current_price": round(current_price, 2),
+            "proposed_price": proposed_price,
+            "reason": candidate.get("reason") or "当前策略价格未变化",
+            **market_metrics,
+        }
+    return {
+        "status": "reprice",
+        "current_price": round(current_price, 2),
+        "proposed_price": proposed_price,
+        "reason": candidate.get("reason") or "当前策略建议改价",
+        **market_metrics,
+    }

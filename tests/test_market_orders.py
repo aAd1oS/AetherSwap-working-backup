@@ -309,6 +309,44 @@ def test_新版_orderbook_action_按精确名称拉取目标变体(monkeypatch):
     assert requested["headers"]["x-valve-request-type"] == "queryAction"
 
 
+def test_新版_orderbook_action_兼容外层data包装(monkeypatch):
+    from steam import market_orders
+
+    target = "SSG 08 | Acid Fade (Factory New)"
+
+    class DummyResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": {
+                    "success": True,
+                    "data": {
+                        "eCurrency": 23,
+                        "amtMinSellOrder": 800,
+                        "rgCompactSellOrders": [800, 2, 811, 3],
+                    },
+                },
+            }
+
+    class DummySession:
+        def get(self, *_args, **_kwargs):
+            return DummyResponse()
+
+    monkeypatch.setattr(
+        market_orders,
+        "get_proxy_manager",
+        lambda: type("PM", (), {"get_steam_proxies": lambda self: None})(),
+    )
+
+    result, error = market_orders._fetch_action_orderbook_cny(
+        DummySession(), target, 730
+    )
+
+    assert error is None
+    assert result == {"lowest_price": 8.0, "sell_orders": [(8.0, 2), (8.11, 3)]}
+
+
 def test_get_sell_orders_cny_ssr预取错变体时回退新版_orderbook_action(monkeypatch):
     from steam import market_orders
 

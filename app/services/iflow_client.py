@@ -87,7 +87,11 @@ def fetch_iflow_rows(config: dict) -> List[Any]:
     iflow_cfg = config.get("steamdt") or config.get("iflow", {})
     pipeline_cfg = config.get("pipeline", {})
     configured_top_n = int(pipeline_cfg.get("iflow_top_n", 30) or 0)
-    safety_cap = get_buff_request_protection().effective_candidate_cap()
+    recovery_cap = pipeline_cfg.get("buff_protection_recovery_candidate_cap", 30)
+    safety_cap = get_buff_request_protection().effective_candidate_cap(
+        recovery_cap,
+        configured_top_n,
+    )
     top_n = min(configured_top_n, safety_cap) if configured_top_n > 0 else safety_cap
 
     client = IflowClient(timeout_sec=int(iflow_cfg.get("fetch_timeout", steamdt_fetch_timeout)))
@@ -134,5 +138,40 @@ def fetch_iflow_rows(config: dict) -> List[Any]:
 
         if top_n > 0 and len(all_rows) >= top_n:
             break
+
+    c5_compare_enabled = bool((config.get("c5") or {}).get("price_compare_enabled", False))
+    if c5_compare_enabled and all_rows:
+        c5_params = dict(params)
+        c5_params["platforms"] = "c5"
+        c5_rows: List[Any] = []
+        for page_offset in range(target_pages):
+            c5_params["page_num"] = start_page + page_offset
+            page_rows = client.fetch(c5_params, headless=True)
+            if not page_rows:
+                break
+            c5_rows.extend(page_rows)
+            if len(page_rows) < page_size:
+                break
+            if top_n > 0 and len(c5_rows) >= top_n:
+                break
+
+        c5_by_name = {
+            str(getattr(row, "name", "") or "").strip().casefold(): row
+            for row in c5_rows
+            if str(getattr(row, "name", "") or "").strip()
+        }
+        for row in all_rows:
+            match = c5_by_name.get(str(getattr(row, "name", "") or "").strip().casefold())
+            if match is None:
+                continue
+            try:
+                c5_price = float(getattr(match, "min_price", 0) or 0)
+            except (TypeError, ValueError):
+                c5_price = 0.0
+            if c5_price <= 0:
+                continue
+            row.c5_reference_price = c5_price
+            row.c5_reference_link = str(getattr(match, "platform", "") or "")
+            row.c5_reference_update_time = str(getattr(match, "update_time", "") or "")
 
     return all_rows

@@ -171,7 +171,10 @@ def _extract_country_code(page_text: str, config_data: dict = None) -> str:
 
 
 def _effective_proxies(proxies):
-    return proxies or None
+    # An explicit blank mapping means "do not inherit HTTP(S)_PROXY".  This
+    # is required when Steam++ owns the localhost route while Clash remains
+    # enabled for the rest of the desktop.
+    return proxies if proxies is not None else None
 
 
 def _market_country_code(page_text: str) -> str:

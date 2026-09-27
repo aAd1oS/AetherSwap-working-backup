@@ -29,7 +29,8 @@ class _NoWaitThrottle:
 
 
 @pytest.fixture(autouse=True)
-def _reset_protection():
+def _reset_protection(monkeypatch):
+    monkeypatch.setattr("app.notify.notify_buff_request_protection", lambda *_args: True)
     protection = get_buff_request_protection()
     protection.reset_for_tests()
     yield
@@ -112,7 +113,8 @@ def test_action_forbidden_opens_manual_circuit_until_cookie_update(monkeypatch, 
     protection = get_buff_request_protection()
     protection.mark_manual_cookie_updated()
     assert protection.snapshot()["recovery_mode"] is True
-    assert protection.effective_candidate_cap() == 10
+    assert protection.effective_candidate_cap() == 30
+    assert protection.effective_candidate_cap(12) == 12
 
 
 def test_open_circuit_blocks_a_cached_sell_order(monkeypatch):
@@ -162,6 +164,14 @@ def test_candidate_cap_is_30_outside_recovery_mode():
     assert get_buff_request_protection().effective_candidate_cap() == 30
 
 
+def test_candidate_caps_allow_values_above_30():
+    protection = get_buff_request_protection()
+    assert protection.effective_candidate_cap(60, 60) == 60
+
+    protection.mark_manual_cookie_updated()
+    assert protection.effective_candidate_cap(45, 60) == 45
+
+
 def test_candidate_filter_caps_normal_and_manual_recovery_modes():
     rows = [
         SimpleNamespace(
@@ -173,13 +183,61 @@ def test_candidate_filter_caps_normal_and_manual_recovery_modes():
             steam_link="",
             volume="100",
         )
-        for index in range(40)
+        for index in range(70)
     ]
     config = {
-        "pipeline": {"iflow_top_n": 50, "exclude_keywords": []},
+        "pipeline": {
+            "iflow_top_n": 50,
+            "buff_protection_recovery_candidate_cap": 30,
+            "exclude_keywords": [],
+        },
         "iflow": {"sort_by": "sell", "min_volume": 0},
     }
 
-    assert len(filter_iflow_rows(rows, config)) == 30
+    assert len(filter_iflow_rows(rows, config)) == 50
     get_buff_request_protection().mark_manual_cookie_updated()
-    assert len(filter_iflow_rows(rows, config)) == 10
+    assert len(filter_iflow_rows(rows, config)) == 30
+
+    config["pipeline"]["buff_protection_recovery_candidate_cap"] = 12
+    assert len(filter_iflow_rows(rows, config)) == 12
+
+
+def test_protection_transition_notifies_once(monkeypatch):
+    notifications = []
+    monkeypatch.setattr(
+        "app.notify.notify_buff_request_protection",
+        lambda event, reason: notifications.append((event, reason)) or True,
+    )
+    protection = get_buff_request_protection()
+
+    with pytest.raises(BuffManualCircuitOpen):
+        protection.record_response(200, {"code": "Action Forbidden"})
+    with pytest.raises(BuffManualCircuitOpen):
+        protection.record_response(200, {"code": "Action Forbidden"})
+
+    assert [event for event, _reason in notifications] == ["triggered"]
+
+    protection.mark_manual_cookie_updated()
+    assert [event for event, _reason in notifications] == ["triggered", "manual_recovered"]
+
+
+def test_temporary_pause_enters_configurable_recovery_mode_when_it_expires(monkeypatch):
+    now = [1000.0]
+    notifications = []
+    monkeypatch.setattr("utils.buff_protection.time.time", lambda: now[0])
+    monkeypatch.setattr(
+        "app.notify.notify_buff_request_protection",
+        lambda event, reason: notifications.append((event, reason)) or True,
+    )
+    protection = get_buff_request_protection()
+
+    with pytest.raises(BuffTemporaryCircuitOpen):
+        protection.record_response(429, {"code": "HTTP_429"})
+    now[0] += BUFF_HTTP_429_PAUSE_SECONDS + 1
+
+    protection.before_request()
+    snapshot = protection.snapshot(12)
+
+    assert snapshot["recovery_mode"] is True
+    assert snapshot["candidate_cap"] == 12
+    assert [event for event, _reason in notifications] == ["triggered", "pause_recovered"]

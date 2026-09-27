@@ -37,6 +37,31 @@ def test_parse_cooldown_supports_tradable_after_without_trade_protected_text():
     assert timestamp == 1786442400
 
 
+def test_unparsed_cooldown_is_fail_closed(monkeypatch):
+    from app import inventory_cs2
+
+    monkeypatch.setattr(inventory_cs2, "get_steam_credentials", lambda: {
+        "steam_id": "111", "cookies": "sessionid=test",
+    })
+    monkeypatch.setattr(inventory_cs2, "create_market_session", lambda *_args: object())
+    monkeypatch.setattr(inventory_cs2, "fetch_cs2_inventory", lambda *_args: {
+        "assets": [{"assetid": "1", "classid": "10", "instanceid": "0", "appid": 730, "contextid": "2"}],
+        "descriptions": [{
+            "classid": "10", "instanceid": "0", "name": "Item",
+            "market_hash_name": "Item", "marketable": 1, "tradable": 1,
+            "owner_descriptions": [{"value": "This item is trade-protected and cannot be transferred until someday GMT"}],
+        }],
+    })
+
+    ok, items, _error = inventory_cs2.scan_cs2_inventory()
+
+    assert ok is True
+    assert items[0]["cooldown_text"]
+    assert items[0]["cooldown_at"] is None
+    assert items[0]["can_trade"] is False
+    assert items[0]["can_sell"] is False
+
+
 def test_parse_wear_prefers_inventory_description_and_falls_back_to_market_name():
     description = {
         "descriptions": [
@@ -169,6 +194,30 @@ def test_inventory_listing_state_uses_exact_assetid():
 
     assert items[0]["listing"] is True
     assert items[1]["listing"] is False
+
+
+def test_inventory_cooldown_fallback_never_spreads_to_same_name_personal_items(monkeypatch):
+    from app.routes import inventory as inventory_route
+
+    purchase = {
+        "assetid": "purchased-new-asset",
+        "name": "Fracture Case",
+        "tradable_at": 9999999999,
+        "market_price": 5.0,
+    }
+    items = [
+        {"assetid": "old-personal-asset", "market_hash_name": "Fracture Case"},
+        {"assetid": "purchased-new-asset", "market_hash_name": "Fracture Case"},
+    ]
+    monkeypatch.setattr(inventory_route, "get_purchases", lambda: [purchase])
+    monkeypatch.setattr(inventory_route, "batch_fetch_prices", lambda _names: {})
+    monkeypatch.setattr(inventory_route, "_sync_inventory_metadata", lambda *_args: 0)
+
+    inventory_route._enrich_inventory_with_steam_prices(items, [])
+
+    assert items[0].get("cooldown_at") is None
+    assert items[0]["lowest_price"] == 5.0
+    assert items[1]["cooldown_at"] == 9999999999
 
 
 def test_inventory_ui_prioritizes_active_listing_state():

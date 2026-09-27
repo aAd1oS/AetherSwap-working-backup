@@ -49,3 +49,6 @@ class SteamDTRow:
     name_cn: str = ""         
     steam_price: float = 0.0  
     profit_amount: float = 0.0
+    c5_reference_price: float = 0.0
+    c5_reference_link: str = ""
+    c5_reference_update_time: str = ""

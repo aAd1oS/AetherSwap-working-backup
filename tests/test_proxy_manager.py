@@ -17,6 +17,7 @@ def _构造代理管理器(entries: list):
         mgr._proxies = entries
         mgr._cached_strategy = 2  # 完全走代理
         mgr._cached_enabled = True
+        mgr._cached_steam_route_mode = "project_proxy"
         mgr._proxy_configs = [p["config"] for p in entries]
         mgr._proxy_weights = [max(0, p["score"]) for p in entries]
         mgr._last_disabled_proxy_log_key = None
@@ -133,3 +134,37 @@ def test_steam_route_does_not_fall_back_to_direct_when_enabled_pool_is_empty():
 
     with pytest.raises(RuntimeError, match="no usable proxy"):
         mgr.get_steam_proxies()
+
+
+def test_steam_route_auto_prefers_ready_local_accelerator(monkeypatch):
+    from utils.proxy_manager import ProxyManager
+
+    mgr = _构造代理管理器([
+        {"config": {"host": "127.0.0.1", "port": 7890}, "score": 1},
+    ])
+    mgr._cached_steam_route_mode = "auto"
+    monkeypatch.setattr(
+        "steam.session.get_local_steam_accelerator_status",
+        lambda: {"active": True, "reason": "ready", "addresses": ["127.0.0.1"]},
+    )
+
+    route = mgr.get_steam_route()
+
+    assert route["name"] == "local_accelerator"
+    assert route["proxies"] == {"http": "", "https": "", "all": ""}
+
+
+def test_steam_route_auto_falls_back_to_project_proxy(monkeypatch):
+    mgr = _构造代理管理器([
+        {"config": {"host": "127.0.0.1", "port": 7890}, "score": 1},
+    ])
+    mgr._cached_steam_route_mode = "auto"
+    monkeypatch.setattr(
+        "steam.session.get_local_steam_accelerator_status",
+        lambda: {"active": False, "reason": "dns_not_loopback", "addresses": []},
+    )
+
+    route = mgr.get_steam_route()
+
+    assert route["name"] == "project_proxy"
+    assert route["proxies"]["https"] == "http://127.0.0.1:7890/"

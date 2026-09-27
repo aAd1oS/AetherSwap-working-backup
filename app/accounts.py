@@ -78,6 +78,11 @@ def update_account(account_id: str, **kwargs: Any) -> Optional[dict]:
             "region_checked_at",
             "currency_checked_at",
             "wallet_currency_id",
+            "steam_session_last_ok_at",
+            "steam_session_last_ok_source",
+            "steam_session_last_issue_at",
+            "steam_session_last_issue_status",
+            "steam_session_last_issue",
         )
         for a in accs:
             if a.get("id") == account_id:
@@ -114,6 +119,15 @@ def replace_all(data: dict) -> None:
     _save(payload)
 def get_profile_dir(account_id: Optional[str] = None) -> Path:
     base = Path(__file__).resolve().parent.parent / "config" / "playwright_steam"
+    if account_id:
+        return base / account_id
+    cur = get_current_account()
+    if cur:
+        return base / cur.get("id", "default")
+    return base / "default"
+
+def get_buff_profile_dir(account_id: Optional[str] = None) -> Path:
+    base = Path(__file__).resolve().parent.parent / "config" / "playwright_buff"
     if account_id:
         return base / account_id
     cur = get_current_account()

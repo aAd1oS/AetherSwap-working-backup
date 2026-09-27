@@ -280,3 +280,51 @@ def test_manual_managed_untracked_asset_is_blocked_by_profit_strategy():
     )
     assert result == []
 
+
+@pytest.mark.parametrize("sell_strategy", [1, 2, 3])
+def test_purchase_cost_net_floor_blocks_all_sell_strategies(sell_strategy):
+    from app.sell_pipeline import _build_listing_plan
+
+    item = _make_sellable()[0]
+    item["ownership_mode"] = "managed"
+    purchase = {
+        "assetid": "12345678",
+        "name": "AK-47 | Redline",
+        "price": 30.0,
+        "market_price": 30.0,
+    }
+    logged = []
+    with patch("app.sell_pipeline.get_sell_orders_cny", return_value={"sell_orders": [{"price": 3000, "quantity": 2}]}), \
+         patch("app.sell_pipeline.compute_smart_list_price", return_value=(30.0, "wall")), \
+         patch("app.sell_pipeline._steam_latest_price_and_trend", return_value=(30.0, 0, [])), \
+         patch("app.sell_pipeline.get_current_account", return_value={"id": "account-a"}):
+        result = _build_listing_plan(
+            ctx=_build_ctx(logged), cfg={"pipeline": {}}, session=MagicMock(),
+            sellable=[item], sell_strategy=sell_strategy, pipeline_cfg={},
+            purchases_snapshot=[purchase], ok_listings=False, active_listing_ids=set(),
+            listing_assetid_to_name={}, assetid_to_name_map={},
+            account_currency="CNY", rate_map={},
+        )
+    assert result == []
+    assert any("预计税后到账" in message for _level, message in logged)
+
+
+def test_purchase_cost_net_floor_allows_equal_or_higher_net():
+    from app.sell_pipeline import _build_listing_plan
+
+    item = _make_sellable()[0]
+    item["ownership_mode"] = "managed"
+    purchase = {"assetid": "12345678", "name": "AK-47 | Redline", "price": 25.0}
+    with patch("app.sell_pipeline.get_sell_orders_cny", return_value={"sell_orders": [{"price": 3000, "quantity": 2}]}), \
+         patch("app.sell_pipeline.compute_smart_list_price", return_value=(30.0, "wall")), \
+         patch("app.sell_pipeline.get_current_account", return_value={"id": "account-a"}):
+        result = _build_listing_plan(
+            ctx=_build_ctx([]), cfg={"pipeline": {}}, session=MagicMock(),
+            sellable=[item], sell_strategy=1, pipeline_cfg={},
+            purchases_snapshot=[purchase], ok_listings=False, active_listing_ids=set(),
+            listing_assetid_to_name={}, assetid_to_name_map={},
+            account_currency="CNY", rate_map={},
+        )
+    assert len(result) == 1
+    assert result[0]["price_cents"] >= 2500
+

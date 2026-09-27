@@ -120,3 +120,83 @@ def test_invalid_buff_payment_modes_are_replaced_with_safe_defaults():
     assert result["buff"]["pay_method"] == "alipay"
     assert result["buff"]["balance_fallback_method"] == "wechat"
     assert len(caught) >= 2
+
+
+def test_max_run_rounds_defaults_to_unlimited_and_is_range_limited():
+    assert validate_and_fill({}, DEFAULTS)["pipeline"]["max_run_rounds"] == 0
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        below = _validate_ranges(merge(DEFAULTS, {"pipeline": {"max_run_rounds": -2}}))
+        above = _validate_ranges(merge(DEFAULTS, {"pipeline": {"max_run_rounds": 1001}}))
+
+    assert below["pipeline"]["max_run_rounds"] == 0
+    assert above["pipeline"]["max_run_rounds"] == 1000
+
+
+def test_buff_protection_recovery_candidate_cap_defaults_to_30_without_upper_limit():
+    assert validate_and_fill({}, DEFAULTS)["pipeline"]["buff_protection_recovery_candidate_cap"] == 30
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        below = _validate_ranges(merge(DEFAULTS, {"pipeline": {"buff_protection_recovery_candidate_cap": 0}}))
+        above = _validate_ranges(merge(DEFAULTS, {"pipeline": {"buff_protection_recovery_candidate_cap": 99}}))
+
+    assert below["pipeline"]["buff_protection_recovery_candidate_cap"] == 1
+    assert above["pipeline"]["buff_protection_recovery_candidate_cap"] == 99
+
+
+def test_max_auto_listing_price_defaults_to_50_and_rejects_non_positive_values():
+    assert validate_and_fill({}, DEFAULTS)["pipeline"]["max_auto_listing_price_cny"] == 50.0
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _validate_ranges(
+            merge(DEFAULTS, {"pipeline": {"max_auto_listing_price_cny": 0}})
+        )
+
+    assert result["pipeline"]["max_auto_listing_price_cny"] == 50.0
+    assert any("max_auto_listing_price_cny" in str(w.message) for w in caught)
+
+
+def test_staged_listing_and_strategy_logs_default_off_and_coerce_booleans():
+    defaults = validate_and_fill({}, DEFAULTS)["pipeline"]
+    assert defaults["stale_listing_staged_mode_enabled"] is False
+    assert defaults["strategy_module_logs_enabled"] is False
+
+    configured = validate_and_fill(
+        {"pipeline": {
+            "stale_listing_staged_mode_enabled": "true",
+            "strategy_module_logs_enabled": "1",
+        }},
+        DEFAULTS,
+    )["pipeline"]
+    assert configured["stale_listing_staged_mode_enabled"] is True
+    assert configured["strategy_module_logs_enabled"] is True
+
+
+def test_history_outlier_filter_defaults_and_ranges():
+    defaults = validate_and_fill({}, DEFAULTS)["stability"]
+    assert defaults["outlier_filter_enabled"] is False
+    assert defaults["outlier_iqr_multiplier"] == 1.5
+    assert defaults["outlier_max_removed_ratio"] == 0.2
+    assert defaults["outlier_protect_persistent_recent"] is True
+
+    configured = validate_and_fill(
+        {"stability": {
+            "outlier_filter_enabled": "true",
+            "outlier_protect_persistent_recent": "0",
+        }},
+        DEFAULTS,
+    )["stability"]
+    assert configured["outlier_filter_enabled"] is True
+    assert configured["outlier_protect_persistent_recent"] is False
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        ranged = _validate_ranges(merge(DEFAULTS, {"stability": {
+            "outlier_iqr_multiplier": 9,
+            "outlier_max_removed_ratio": 0.8,
+        }}))["stability"]
+    assert ranged["outlier_iqr_multiplier"] == 5.0
+    assert ranged["outlier_max_removed_ratio"] == 0.5

@@ -93,3 +93,27 @@ def test_local_read_only_api_smoke():
 
     accounts = responses["/api/accounts"]["accounts"]
     assert all("password" not in account for account in accounts)
+
+
+def test_auto_listing_price_cap_is_present_in_settings_ui():
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "web" / "index.html").read_text(encoding="utf-8")
+    js = (root / "web" / "js" / "settings.js").read_text(encoding="utf-8")
+
+    assert 'id="cfg-max-auto-listing-price-cny"' in html
+    assert 'p.max_auto_listing_price_cny ?? 50' in js
+    assert 'max_auto_listing_price_cny: readNumberInput("cfg-max-auto-listing-price-cny")' in js
+
+
+def test_staged_listing_and_strategy_log_switches_are_bound_in_settings_ui():
+    root = Path(__file__).resolve().parent.parent
+    html = (root / "web" / "index.html").read_text(encoding="utf-8")
+    js = (root / "web" / "js" / "settings.js").read_text(encoding="utf-8")
+
+    for field_id, config_key in (
+        ("cfg-stale-listing-staged-mode-enabled", "stale_listing_staged_mode_enabled"),
+        ("cfg-strategy-module-logs-enabled", "strategy_module_logs_enabled"),
+    ):
+        assert f'id="{field_id}"' in html
+        assert f'p.{config_key}' in js
+        assert f'{config_key}: !!el("{field_id}")?.checked' in js

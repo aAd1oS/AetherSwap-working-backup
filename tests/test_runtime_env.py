@@ -113,6 +113,24 @@ def test_steam_relogin_browser_uses_configured_project_proxy(monkeypatch):
     assert "--no-proxy-server" not in kwargs["args"]
 
 
+def test_steam_relogin_browser_bypasses_clash_for_local_accelerator(monkeypatch):
+    from app.routes import auth
+
+    route = {
+        "name": "local_accelerator",
+        "proxies": {"http": "", "https": "", "all": ""},
+    }
+    monkeypatch.setattr(
+        "utils.proxy_manager.get_proxy_manager",
+        lambda: type("ProxyManager", (), {"get_steam_route": lambda self: route})(),
+    )
+
+    kwargs = auth._browser_network_kwargs("steam")
+
+    assert "proxy" not in kwargs
+    assert "--no-proxy-server" in kwargs["args"]
+
+
 def test_buff_relogin_browser_remains_direct():
     from app.routes import auth
 

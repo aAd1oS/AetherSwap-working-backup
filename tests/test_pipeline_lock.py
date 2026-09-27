@@ -1,5 +1,18 @@
 import threading
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def selected_test_account(tmp_path, monkeypatch):
+    from app import accounts
+
+    monkeypatch.setattr(accounts, "_ACCOUNTS_FILE", tmp_path / "accounts.json")
+    monkeypatch.setattr(accounts, "_cache", {
+        "accounts": [{"id": "pipeline-test-account"}],
+        "current_id": "pipeline-test-account",
+    })
+
 
 def test_start_pipeline_rejects_duplicate_running_pipeline(monkeypatch):
     from app import pipeline

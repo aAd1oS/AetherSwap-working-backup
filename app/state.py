@@ -28,7 +28,7 @@ class State:
     _round_summaries: List[dict]
     _log_seq: int
     _pending_payment: Optional[dict]
-    _user_confirmed: Optional[bool]
+    _user_confirmation: Optional[tuple[str, bool]]
     _stop_requested: bool
     _plan: List[Any]
     _inventory: List[Any]
@@ -48,7 +48,7 @@ class State:
         self._round_summaries = []
         self._log_seq = 0
         self._pending_payment = None
-        self._user_confirmed = None
+        self._user_confirmation = None
         self._stop_requested = False
         self._plan = []
         self._inventory = []
@@ -156,31 +156,40 @@ class State:
     def set_pending_payment(self, p: Optional[dict]) -> None:
         with self._lock:
             self._pending_payment = p
+        with self._confirm:
+            self._user_confirmation = None
+            self._confirm.notify_all()
     def get_pending_payment(self) -> Optional[dict]:
         with self._lock:
             return self._pending_payment
-    def wait_payment_confirm(self, timeout_seconds: Optional[float] = None) -> bool:
+    def wait_payment_confirm(self, order_id: str, timeout_seconds: Optional[float] = None) -> Optional[bool]:
         with self._confirm:
-            self._user_confirmed = None
             deadline = (time.time() + timeout_seconds) if timeout_seconds is not None else None
             while True:
-                if self._user_confirmed is not None:
-                    return self._user_confirmed is True
+                if self._user_confirmation is not None:
+                    confirmed_order_id, confirmed_ok = self._user_confirmation
+                    if confirmed_order_id == str(order_id):
+                        return confirmed_ok
                 if self._stop_requested:
-                    return False
+                    return None
                 if deadline is not None and time.time() >= deadline:
-                    return False
+                    return None
                 wait_time = 1.0
                 if deadline is not None:
                     remaining = deadline - time.time()
                     if remaining <= 0:
-                        return False
+                        return None
                     wait_time = min(1.0, remaining)
                 self._confirm.wait(timeout=wait_time)
-    def confirm_payment(self, ok: bool) -> None:
+    def confirm_payment(self, order_id: str, ok: bool) -> bool:
+        with self._lock:
+            pending_order_id = str((self._pending_payment or {}).get("order_id") or "")
+        if not pending_order_id or pending_order_id != str(order_id or ""):
+            return False
         with self._confirm:
-            self._user_confirmed = ok
+            self._user_confirmation = (pending_order_id, bool(ok))
             self._confirm.notify_all()
+        return True
     def request_stop(self) -> None:
         with self._lock:
             self._stop_requested = True
@@ -222,6 +231,12 @@ class State:
             self._next_progress_item = ""
             self._status = "idle"
             self._step = ""
+            self._buff_auth_expired = False
+            self._buff_verification_required = False
+            self._buff_verification_reason = ""
+        with self._confirm:
+            self._user_confirmation = None
+            self._confirm.notify_all()
     def clear_log(self) -> None:
         with self._lock:
             self._log.clear()
@@ -277,10 +292,10 @@ def set_pending_payment(p: Optional[dict]) -> None:
     get_state().set_pending_payment(p)
 def get_pending_payment() -> Optional[dict]:
     return get_state().get_pending_payment()
-def wait_payment_confirm(timeout_seconds: Optional[float] = None) -> bool:
-    return get_state().wait_payment_confirm(timeout_seconds=timeout_seconds)
-def confirm_payment(ok: bool) -> None:
-    get_state().confirm_payment(ok)
+def wait_payment_confirm(order_id: str, timeout_seconds: Optional[float] = None) -> Optional[bool]:
+    return get_state().wait_payment_confirm(order_id, timeout_seconds=timeout_seconds)
+def confirm_payment(order_id: str, ok: bool) -> bool:
+    return get_state().confirm_payment(order_id, ok)
 def request_stop() -> None:
     get_state().request_stop()
 def clear_stop() -> None:

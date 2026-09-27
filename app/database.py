@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from sqlalchemy import update as sql_update
+from sqlalchemy.exc import IntegrityError
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 _DB_PATH = Path(os.environ.get("AETHERSWAP_DB_PATH") or (_CONFIG_DIR / "app.db"))
 _TRANSACTIONS_JSON = _CONFIG_DIR / "transactions.json"
@@ -43,7 +44,16 @@ class Purchase(SQLModel, table=True):
     current_price_updated_at: Optional[float] = None
     received_at: Optional[float] = None
     tradable_at: Optional[float] = None
+    listed_at: Optional[float] = None
+    listing_price: Optional[float] = None
+    stale_listing_notified_at: Optional[float] = None
+    listing_review_after: Optional[float] = None
+    last_listing_advice_key: Optional[str] = None
     account_id: str = Field(default="", index=True)
+
+
+class DuplicateAssetIdError(ValueError):
+    pass
 
 class PurchaseOrder(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -76,6 +86,8 @@ class SteamAccountRuntime(SQLModel, table=True):
     cookies: str = ""
     session_id: str = ""
     steam_id: str = ""
+    buff_cookies: str = ""
+    c5_app_key: str = ""
     shared_secret: str = ""
     identity_secret: str = ""
     device_id: str = ""
@@ -193,6 +205,24 @@ def init_db() -> None:
             conn.commit()
         except Exception:
             pass
+    with engine.connect() as conn:
+        try:
+            conn.execute(sa_text(
+                "ALTER TABLE steamaccountruntime "
+                "ADD COLUMN buff_cookies TEXT DEFAULT ''"
+            ))
+            conn.commit()
+        except Exception:
+            pass
+    with engine.connect() as conn:
+        try:
+            conn.execute(sa_text(
+                "ALTER TABLE steamaccountruntime "
+                "ADD COLUMN c5_app_key TEXT DEFAULT ''"
+            ))
+            conn.commit()
+        except Exception:
+            pass
     purchase_columns = {
         "external_order_id": "TEXT",
         "source": "TEXT DEFAULT 'legacy'",
@@ -201,6 +231,11 @@ def init_db() -> None:
         "current_price_updated_at": "REAL",
         "received_at": "REAL",
         "tradable_at": "REAL",
+        "listed_at": "REAL",
+        "listing_price": "REAL",
+        "stale_listing_notified_at": "REAL",
+        "listing_review_after": "REAL",
+        "last_listing_advice_key": "TEXT",
         "account_id": "TEXT DEFAULT ''",
     }
     with engine.connect() as conn:
@@ -229,6 +264,24 @@ def init_db() -> None:
                     f"CREATE INDEX IF NOT EXISTS ix_{table_name}_account_id ON {table_name} (account_id)"
                 ))
             conn.commit()
+    with engine.begin() as conn:
+        conflicts = conn.execute(sa_text(
+            "SELECT account_id, assetid, GROUP_CONCAT(id), COUNT(*) "
+            "FROM purchase "
+            "WHERE assetid IS NOT NULL AND TRIM(assetid) <> '' "
+            "GROUP BY account_id, assetid HAVING COUNT(*) > 1"
+        )).fetchall()
+        if conflicts:
+            details = "; ".join(
+                f"account={row[0]} assetid={row[1]} records={row[2]}"
+                for row in conflicts
+            )
+            raise RuntimeError(f"assetid 唯一索引迁移已停止，发现冲突: {details}")
+        conn.execute(sa_text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_purchase_account_assetid_nonempty "
+            "ON purchase (account_id, assetid) "
+            "WHERE assetid IS NOT NULL AND TRIM(assetid) <> ''"
+        ))
     with engine.connect() as conn:
         rows = conn.execute(
             sa_text("SELECT id, positive_rate, total_reviews FROM steamdealgame WHERE wilson_score IS NULL")
@@ -261,6 +314,11 @@ def _purchase_from_dict(d: dict) -> Purchase:
         current_price_updated_at=float(d["current_price_updated_at"]) if d.get("current_price_updated_at") is not None else None,
         received_at=float(d["received_at"]) if d.get("received_at") is not None else None,
         tradable_at=float(d["tradable_at"]) if d.get("tradable_at") is not None else None,
+        listed_at=float(d["listed_at"]) if d.get("listed_at") is not None else None,
+        listing_price=float(d["listing_price"]) if d.get("listing_price") is not None else None,
+        stale_listing_notified_at=float(d["stale_listing_notified_at"]) if d.get("stale_listing_notified_at") is not None else None,
+        listing_review_after=float(d["listing_review_after"]) if d.get("listing_review_after") is not None else None,
+        last_listing_advice_key=str(d["last_listing_advice_key"]) if d.get("last_listing_advice_key") is not None else None,
         account_id=_current_account_id(d.get("account_id") or None),
     )
 def _sale_from_dict(d: dict) -> Sale:
@@ -308,6 +366,16 @@ def _purchase_to_dict(p: Purchase) -> dict:
         d["received_at"] = p.received_at
     if p.tradable_at is not None:
         d["tradable_at"] = p.tradable_at
+    if p.listed_at is not None:
+        d["listed_at"] = p.listed_at
+    if p.listing_price is not None:
+        d["listing_price"] = p.listing_price
+    if p.stale_listing_notified_at is not None:
+        d["stale_listing_notified_at"] = p.stale_listing_notified_at
+    if p.listing_review_after is not None:
+        d["listing_review_after"] = p.listing_review_after
+    if p.last_listing_advice_key is not None:
+        d["last_listing_advice_key"] = p.last_listing_advice_key
     return d
 def _sale_to_dict(s: Sale) -> dict:
     d = {
@@ -356,7 +424,34 @@ _PURCHASE_UPDATABLE = frozenset({
     "sold_at", "pending_receipt", "assetid", "listing", "listing_status",
     "external_order_id", "source", "order_status", "current_market_price",
     "current_price_updated_at", "received_at", "tradable_at",
+    "listed_at", "listing_price", "stale_listing_notified_at",
+    "listing_review_after", "last_listing_advice_key",
 })
+
+
+def _ensure_assetid_available(session: Session, account_id: str, assetid, exclude_id: Optional[int] = None) -> None:
+    normalized = str(assetid or "").strip()
+    if not normalized:
+        return
+    statement = select(Purchase).where(
+        Purchase.account_id == account_id,
+        Purchase.assetid == normalized,
+    )
+    if exclude_id:
+        statement = statement.where(Purchase.id != int(exclude_id))
+    conflict = session.exec(statement.limit(1)).first()
+    if conflict is not None:
+        raise DuplicateAssetIdError(
+            f"当前账号的 assetid {normalized} 已绑定记录 #{conflict.id}，原记录未修改，请人工核对"
+        )
+
+
+def _commit_with_assetid_error(session: Session) -> None:
+    try:
+        session.commit()
+    except IntegrityError as exc:
+        session.rollback()
+        raise DuplicateAssetIdError("assetid 已被当前账号的其他记录占用，原记录未修改") from exc
 _SALE_UPDATABLE = frozenset({"name", "price", "goods_id", "assetid", "at"})
 
 def db_get_account_runtime(account_id: str) -> Optional[dict]:
@@ -372,6 +467,8 @@ def db_get_account_runtime(account_id: str) -> Optional[dict]:
             "cookies": row.cookies or "",
             "session_id": row.session_id or "",
             "steam_id": row.steam_id or "",
+            "buff_cookies": row.buff_cookies or "",
+            "c5_app_key": row.c5_app_key or "",
             "shared_secret": row.shared_secret or "",
             "identity_secret": row.identity_secret or "",
             "device_id": row.device_id or "",
@@ -384,13 +481,39 @@ def db_has_any_account_runtime() -> bool:
     with get_session() as session:
         return session.exec(select(SteamAccountRuntime.account_id).limit(1)).first() is not None
 
+def db_has_any_account_buff_credentials() -> bool:
+    with get_session() as session:
+        return session.exec(
+            select(SteamAccountRuntime.account_id).where(
+                SteamAccountRuntime.buff_cookies != ""
+            ).limit(1)
+        ).first() is not None
+
+def db_export_account_runtimes() -> list:
+    with get_session() as session:
+        rows = session.exec(select(SteamAccountRuntime)).all()
+        return [db_get_account_runtime(row.account_id) for row in rows]
+
+def db_import_account_runtimes(rows: list, allowed_account_ids: Optional[set] = None) -> int:
+    imported = 0
+    allowed_ids = {str(value) for value in allowed_account_ids} if allowed_account_ids is not None else None
+    for data in rows or []:
+        if not isinstance(data, dict):
+            continue
+        account_id = str(data.get("account_id") or "").strip()
+        if not account_id or (allowed_ids is not None and account_id not in allowed_ids):
+            continue
+        db_upsert_account_runtime(account_id, data)
+        imported += 1
+    return imported
+
 def db_upsert_account_runtime(account_id: str, data: dict) -> dict:
     import time
     aid = _current_account_id(account_id)
     if not aid:
         raise ValueError("account_id is required")
     allowed = {
-        "cookies", "session_id", "steam_id", "shared_secret",
+        "cookies", "session_id", "steam_id", "buff_cookies", "c5_app_key", "shared_secret",
         "identity_secret", "device_id", "auto_confirm_enabled", "auto_sell_enabled",
     }
     with get_session() as session:
@@ -416,7 +539,14 @@ def db_account_record_counts(account_id: str) -> dict:
         return {
             "purchases": int(session.exec(select(func.count()).select_from(Purchase).where(Purchase.account_id == aid)).one()),
             "orders": int(session.exec(select(func.count()).select_from(PurchaseOrder).where(PurchaseOrder.account_id == aid)).one()),
-            "sales": int(session.exec(select(func.count()).select_from(Sale).where(Sale.account_id == aid)).one()),
+            "sales": int(session.exec(
+                select(func.count()).select_from(Purchase).where(
+                    Purchase.account_id == aid,
+                    Purchase.sold_at.is_not(None),
+                    Purchase.sale_price.is_not(None),
+                )
+            ).one()),
+            "listing_events": int(session.exec(select(func.count()).select_from(Sale).where(Sale.account_id == aid)).one()),
         }
 
 def db_get_inventory_ownership_overrides(account_id: Optional[str] = None) -> dict[str, str]:
@@ -472,11 +602,78 @@ def db_set_inventory_ownership_override(
         }
 
 def db_append_purchase(p: dict) -> None:
-    if not _current_account_id(p.get("account_id") or None):
+    account_id = _current_account_id(p.get("account_id") or None)
+    if not account_id:
         raise ValueError("未选择当前账号")
     with get_session() as session:
+        _ensure_assetid_available(session, account_id, p.get("assetid"))
         session.add(_purchase_from_dict(p))
+        _commit_with_assetid_error(session)
+
+
+def db_finalize_purchase_order_payment(
+    external_order_id: str,
+    *,
+    user_confirmed: bool = False,
+    paid_at: Optional[float] = None,
+    create_purchases: bool = True,
+    purchase_rows: Optional[list[dict]] = None,
+    market_price: Optional[float] = None,
+) -> dict:
+    """Atomically mark an order paid and create only its missing purchase rows."""
+    import time
+
+    order_id = str(external_order_id or "").strip()
+    account_id = _current_account_id()
+    if not order_id or not account_id:
+        raise ValueError("订单号和当前账号不能为空")
+    now = float(paid_at or time.time())
+    with get_session() as session:
+        order = session.exec(select(PurchaseOrder).where(
+            PurchaseOrder.external_order_id == order_id,
+            PurchaseOrder.account_id == account_id,
+        )).first()
+        if order is None:
+            raise ValueError("当前账号找不到该订单")
+        existing = session.exec(select(Purchase).where(
+            Purchase.external_order_id == order_id,
+            Purchase.account_id == account_id,
+        )).all()
+        desired_rows = list(purchase_rows or [])
+        if create_purchases and not desired_rows:
+            desired_rows = [
+                {
+                    "name": order.name,
+                    "goods_id": int(order.goods_id or 0),
+                    "price": float(order.unit_price or 0),
+                    "market_price": market_price,
+                    "source": order.source or "buff",
+                }
+                for _ in range(max(1, int(order.quantity or 1)))
+            ]
+        missing_rows = desired_rows[len(existing):] if create_purchases else []
+        for data in missing_rows:
+            session.add(Purchase(
+                name=str(data.get("name") or order.name),
+                goods_id=int(data.get("goods_id") or order.goods_id or 0),
+                price=float(data.get("price") or order.unit_price or 0),
+                market_price=(float(data["market_price"]) if data.get("market_price") is not None else None),
+                at=now,
+                pending_receipt=True,
+                external_order_id=order_id,
+                source=str(data.get("source") or order.source or "buff"),
+                order_status="awaiting_ship",
+                account_id=account_id,
+            ))
+        order.status = "awaiting_ship" if create_purchases else "platform_confirmed"
+        order.paid_at = order.paid_at or now
+        if user_confirmed:
+            order.user_confirmed_at = order.user_confirmed_at or now
+        order.updated_at = now
+        order.error = None
+        session.add(order)
         session.commit()
+        return {"order_id": order_id, "created": len(missing_rows), "quantity": int(order.quantity or 1)}
 
 def db_upsert_purchase_order(order: dict) -> dict:
     import time
@@ -772,11 +969,13 @@ def db_update_purchase(idx: int, data: dict) -> bool:
         rows = session.exec(select(Purchase).where(Purchase.account_id == account_id).order_by(Purchase.id)).all()
         if 0 <= idx < len(rows):
             row = rows[idx]
+            if "assetid" in data:
+                _ensure_assetid_available(session, account_id, data.get("assetid"), row.id)
             for k, v in data.items():
                 if k in _PURCHASE_UPDATABLE:
                     setattr(row, k, v)
             session.add(row)
-            session.commit()
+            _commit_with_assetid_error(session)
             return True
     return False
 def db_update_purchase_by_id(db_id: int, data: dict) -> bool:
@@ -787,11 +986,13 @@ def db_update_purchase_by_id(db_id: int, data: dict) -> bool:
         row = session.get(Purchase, db_id)
         if row is None or row.account_id != _current_account_id():
             return False
+        if "assetid" in data:
+            _ensure_assetid_available(session, row.account_id, data.get("assetid"), row.id)
         for k, v in data.items():
             if k in _PURCHASE_UPDATABLE:
                 setattr(row, k, v)
         session.add(row)
-        session.commit()
+        _commit_with_assetid_error(session)
         return True
 def db_delete_purchase_by_id(db_id: int) -> bool:
     """按主键 ID 删除，O(1) 操作。"""

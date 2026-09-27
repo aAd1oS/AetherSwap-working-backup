@@ -173,6 +173,8 @@ def fetch_my_listings(cookies, debug_fn: Optional[Callable[[str], None]] = None)
                             if (p.get("market_hash_name") or p.get("name") or "").strip()
                         }
                         _debug(debug_fn, f"[mylistings] 在售 {len(assetids)} 个, 有名称 {len(name_by_assetid)} 个")
+                        from app.services.steam_auth import record_steam_session_success
+                        record_steam_session_success("Steam 在售列表")
                         return True, assetids, "", name_by_assetid
                     for appid, ctx_dict in (data.get("assets") or {}).items():
                         if isinstance(ctx_dict, dict):
@@ -180,10 +182,14 @@ def fetch_my_listings(cookies, debug_fn: Optional[Callable[[str], None]] = None)
                                 if isinstance(asset_dict, dict):
                                     assetids.update(str(aid) for aid in asset_dict.keys())
                     _debug(debug_fn, f"[mylistings] 在售 {len(assetids)} 个")
+                    from app.services.steam_auth import record_steam_session_success
+                    record_steam_session_success("Steam 在售列表")
                     return True, assetids, "", {}
         if not assetids:
             return False, set(), "未解析到在售列表", {}
         _debug(debug_fn, f"[mylistings] 在售 {len(assetids)} 个, 有名称 {len(name_by_assetid)} 个")
+        from app.services.steam_auth import record_steam_session_success
+        record_steam_session_success("Steam 在售列表")
         return True, assetids, "", name_by_assetid
     except Exception as e:
         _debug(debug_fn, f"[mylistings] 异常: {type(e).__name__}: {e}")
@@ -312,3 +318,6 @@ def fetch_my_history_sold(cookies, debug_fn: Optional[Callable[[str], None]] = N
     except Exception as e:
         _debug(debug_fn, f"[myhistory] 异常: {type(e).__name__}: {e}")
         return False, {}, str(e)[:120]
+
+# Canonical paginated history implementation.
+from app.steam_history import fetch_my_history_sales, fetch_my_history_sold

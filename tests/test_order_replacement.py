@@ -8,6 +8,13 @@ from app.routes import transactions
 
 @pytest.fixture
 def isolated_order_db(tmp_path, monkeypatch):
+    from app import accounts
+
+    monkeypatch.setattr(accounts, "_ACCOUNTS_FILE", tmp_path / "accounts.json")
+    monkeypatch.setattr(accounts, "_cache", {
+        "accounts": [{"id": "replacement-test-account"}],
+        "current_id": "replacement-test-account",
+    })
     engine = create_engine(
         f"sqlite:///{tmp_path / 'orders.db'}",
         connect_args={"check_same_thread": False},
@@ -59,11 +66,13 @@ def test_replacement_atomically_cancels_old_order_and_records_paid_purchase(isol
     assert new_order.status == "awaiting_ship"
     assert new_order.paid_at is not None
     assert new_order.source == "buff_manual_replacement"
+    assert new_order.account_id == "replacement-test-account"
     assert len(purchases) == 1
     assert purchases[0].price == 2.27
     assert purchases[0].market_price == 3.75
     assert purchases[0].pending_receipt is True
     assert purchases[0].source == "manual_replacement"
+    assert purchases[0].account_id == "replacement-test-account"
     assert result["market_price"] == 3.75
 
 

@@ -1,11 +1,14 @@
 import imaplib
 import email
+from html.parser import HTMLParser
 import threading
 import time
 from email.header import decode_header
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from typing import Callable, Optional
 import requests
+
+
 def send_pushplus(token: str, title: str, content: str, template: str = "html") -> bool:
     if not token or not token.strip():
         return False
@@ -18,11 +21,125 @@ def send_pushplus(token: str, title: str, content: str, template: str = "html") 
         return r.status_code == 200
     except Exception:
         return False
+
+
+class _NotificationTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag.lower() in {"br", "p", "div", "li"}:
+            self.parts.append("\n")
+        if tag.lower() == "a":
+            href = dict(attrs).get("href")
+            self.links.append((href or "").strip())
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a" and self.links:
+            href = self.links.pop()
+            if href:
+                self.parts.append(f" ({href})")
+        elif tag.lower() in {"p", "div", "li"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _notification_plain_text(content: str) -> str:
+    parser = _NotificationTextParser()
+    parser.feed(str(content or ""))
+    lines = [line.strip() for line in "".join(parser.parts).splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _is_allowed_lark_webhook(webhook: str) -> bool:
+    try:
+        parsed = urlparse(webhook.strip())
+    except Exception:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in {"open.larksuite.com", "open.feishu.cn"}
+        and parsed.path.startswith("/open-apis/bot/v2/hook/")
+        and bool(parsed.path.removeprefix("/open-apis/bot/v2/hook/").strip("/"))
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def send_lark(webhook: str, title: str, content: str) -> bool:
+    webhook = (webhook or "").strip()
+    if not _is_allowed_lark_webhook(webhook):
+        return False
+    text = _notification_plain_text(content)
+    message = f"AetherSwap\n{title.strip()}"
+    if text:
+        message += f"\n\n{text}"
+    try:
+        response = requests.post(
+            webhook,
+            json={"msg_type": "text", "content": {"text": message}},
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return False
+        payload = response.json()
+        return payload.get("code") == 0
+    except Exception:
+        return False
+
+
+def send_configured_notification(notify_cfg: dict, title: str, content: str) -> tuple[bool, str]:
+    """Send through Lark first, then fall back to PushPlus if needed."""
+    notify_cfg = notify_cfg or {}
+    lark_webhook = (notify_cfg.get("lark_webhook") or "").strip()
+    if lark_webhook and send_lark(lark_webhook, title, content):
+        return True, "Lark"
+    pushplus_token = (notify_cfg.get("pushplus_token") or "").strip()
+    if pushplus_token and send_pushplus(pushplus_token, title, content):
+        return True, "PushPlus"
+    return False, ""
+
+
+def notify_buff_request_protection(event: str, reason: str) -> bool:
+    """Send one BUFF protection state transition through Lark only."""
+    from app.config_loader import load_app_config_validated
+
+    cfg = load_app_config_validated()
+    webhook = str((cfg.get("notify") or {}).get("lark_webhook") or "").strip()
+    if not webhook:
+        return False
+    pipeline_cfg = cfg.get("pipeline") or {}
+    normal_cap = int(pipeline_cfg.get("iflow_top_n", 30) or 30)
+    recovery_cap = int(pipeline_cfg.get("buff_protection_recovery_candidate_cap", 30) or 30)
+    recovery_cap = max(recovery_cap, 1)
+    effective_recovery_cap = min(max(normal_cap, 1), recovery_cap)
+    titles = {
+        "triggered": "BUFF 请求保护已触发",
+        "manual_recovered": "BUFF 请求保护已解除",
+        "pause_recovered": "BUFF 临时请求保护已解除",
+        "recovery_finished": "BUFF 恢复观察期已结束",
+    }
+    title = titles.get(event, "BUFF 请求保护状态变化")
+    content = (
+        f"事件：{title}<br/>"
+        f"原因：{reason}<br/>"
+        f"正常每轮数量：{normal_cap}<br/>"
+        f"保护恢复期每轮数量：{effective_recovery_cap}"
+    )
+    return send_lark(webhook, title, content)
+
+
 _last_manual_notify_time: dict = {}
 _last_manual_notify_lock = threading.Lock()  
 def notify_manual_intervention_required(platform: str, reason: str) -> bool:
     """
-    Sends a PushPlus notification when manual intervention is required (e.g., login expired).
+    Sends a configured notification when manual intervention is required (e.g., login expired).
     Includes rate-limiting per platform (max 1 notify per 4 hours).
     """
     from app.config_loader import load_app_config_validated
@@ -34,8 +151,7 @@ def notify_manual_intervention_required(platform: str, reason: str) -> bool:
         _last_manual_notify_time[platform] = now
     cfg = load_app_config_validated()
     notify_cfg = cfg.get("notify") or {}
-    token = (notify_cfg.get("pushplus_token") or "").strip()
-    if not token:
+    if not (notify_cfg.get("lark_webhook") or notify_cfg.get("pushplus_token")):
         with _last_manual_notify_lock:
             _last_manual_notify_time[platform] = last_time
         return False
@@ -46,7 +162,7 @@ def notify_manual_intervention_required(platform: str, reason: str) -> bool:
         f"<span style='color: red;'>{reason}</span><br/><br/>"
         f"为了避免被限制或错失交易，请尽快前往图形界面或浏览器完成手动登录与验证操作。"
     )
-    success = send_pushplus(token, title, content)
+    success, _channel = send_configured_notification(notify_cfg, title, content)
     if not success:
         with _last_manual_notify_lock:
             _last_manual_notify_time[platform] = last_time

@@ -60,6 +60,27 @@ def test_market_session_bypasses_environment_for_local_accelerator(monkeypatch):
     assert fake.proxies == {}
 
 
+def test_explicit_direct_bypass_disables_environment_proxy(monkeypatch):
+    from steam import session as steam_session
+
+    fake = _FakeSession()
+    monkeypatch.setattr(steam_session.requests, "Session", lambda: fake)
+    monkeypatch.setattr(
+        "utils.proxy_manager.get_proxy_manager",
+        lambda: SimpleNamespace(
+            get_steam_proxies=lambda: {"http": "", "https": "", "all": ""}
+        ),
+    )
+
+    steam_session.create_market_session(
+        "sessionid=test; steamLoginSecure=token",
+        "76561198000000000",
+    )
+
+    assert fake.trust_env is False
+    assert fake.proxies == {}
+
+
 def test_market_session_uses_project_proxy_without_environment_fallback(monkeypatch):
     from steam import session as steam_session
 

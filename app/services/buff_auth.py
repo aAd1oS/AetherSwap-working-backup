@@ -3,16 +3,16 @@ Buff authentication service for background keep-alive.
 """
 import threading
 import time
-from pathlib import Path
 from app.state import log, set_buff_auth_expired, set_buff_verification_required
 from app.config_loader import get_buff_credentials, update_buff_creds
+from app.accounts import get_buff_profile_dir, get_current_id
 _buff_auto_relogin_lock = threading.Lock()
-_buff_auto_relogin_last_success = 0.0
+_buff_auto_relogin_last_success = {}
 def try_buff_auto_relogin() -> tuple:
-    global _buff_auto_relogin_last_success
+    account_id = str(get_current_id() or "")
     if not _buff_auto_relogin_lock.acquire(blocking=False):
         log("buff_relogin: 另一个保活任务正在进行，跳过", "info", category="buff")
-        if time.time() - _buff_auto_relogin_last_success < 60:
+        if time.time() - float(_buff_auto_relogin_last_success.get(account_id, 0)) < 60:
             return True, "auto_ok", "另一个自动登录刚刚完成"
         return False, "busy", "另一个自动登录正在进行"
     try:
@@ -20,12 +20,12 @@ def try_buff_auto_relogin() -> tuple:
     finally:
         _buff_auto_relogin_lock.release()
 def _try_buff_auto_relogin_impl() -> tuple:
-    global _buff_auto_relogin_last_success
+    account_id = str(get_current_id() or "")
     cred = get_buff_credentials()
     if not cred or not cred.get("cookies"):
         log("buff_relogin: 未保存凭证，无法保活", "warn", category="buff")
         return False, "no_creds", "未配置初始凭证，无法无感保活"
-    profile_dir = Path(__file__).resolve().parent.parent.parent / "config" / "playwright_buff"
+    profile_dir = get_buff_profile_dir(account_id or None)
     profile_dir.mkdir(parents=True, exist_ok=True)
     log("buff_relogin: 开始自动保活/刷新 Cookie…", "info", category="buff")
     try:
@@ -47,7 +47,7 @@ def _try_buff_auto_relogin_impl() -> tuple:
                 set_buff_verification_required(False)
                 log("buff_relogin: Cookie 刷新成功，会话已延长", "info", category="buff")
                 context.close()
-                _buff_auto_relogin_last_success = time.time()
+                _buff_auto_relogin_last_success[account_id] = time.time()
                 return True, "auto_ok", "Buff 会话刷新成功"
             else:
                 log("buff_relogin: 发现会话已失效 (未携带 session)，需要手动重新扫码登录", "warn", category="buff")

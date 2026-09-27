@@ -1,4 +1,5 @@
 import sys
+import sqlite3
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,6 +18,9 @@ def _isolated_store(tmp_path, monkeypatch):
         "session_id": "a",
         "steam_id": "111",
     })
+    monkeypatch.setattr(config, "get_buff", lambda: {
+        "cookies": "session=buff-a; csrf_token=token-a",
+    })
     monkeypatch.setattr(config, "load_app_config", lambda: {
         "steam_guard": {"shared_secret": "shared-a"},
         "steam_confirm": {
@@ -32,8 +36,10 @@ def test_account_runtime_never_reuses_another_accounts_secrets(tmp_path, monkeyp
     accounts, database = _isolated_store(tmp_path, monkeypatch)
     from app.account_scope import (
         ensure_account_runtime,
+        get_account_buff_credentials,
         get_account_steam_credentials,
         overlay_account_config,
+        update_account_buff_credentials,
         update_account_steam_credentials,
     )
 
@@ -43,22 +49,92 @@ def test_account_runtime_never_reuses_another_accounts_secrets(tmp_path, monkeyp
     assert runtime_a["steam_id"] == "111"
     assert runtime_a["shared_secret"] == "shared-a"
     assert "steamLoginSecure=111" in runtime_a["cookies"]
+    assert "session=buff-a" in runtime_a["buff_cookies"]
 
     account_b = accounts.add_account(username="b", steam_id="222")
     accounts.set_current(account_b["id"])
     runtime_b = ensure_account_runtime(account_b["id"])
     assert runtime_b["steam_id"] == "222"
     assert runtime_b["cookies"] == ""
+    assert runtime_b["buff_cookies"] == ""
     assert runtime_b["shared_secret"] == ""
     assert get_account_steam_credentials()["cookies"] == ""
+    assert get_account_buff_credentials()["cookies"] == ""
     assert overlay_account_config({"steam_guard": {"shared_secret": "legacy"}})["steam_guard"]["shared_secret"] == ""
 
     update_account_steam_credentials(
         "sessionid=b; steamLoginSecure=222%7C%7Ctoken-b", "b", "222"
     )
+    update_account_buff_credentials("session=buff-b; csrf_token=token-b")
     assert get_account_steam_credentials()["steam_id"] == "222"
+    assert "session=buff-b" in get_account_buff_credentials()["cookies"]
     accounts.set_current(account_a["id"])
     assert get_account_steam_credentials()["steam_id"] == "111"
+    assert "session=buff-a" in get_account_buff_credentials()["cookies"]
+
+
+def test_legacy_buff_cookie_is_not_guessed_when_multiple_accounts_exist(tmp_path, monkeypatch):
+    accounts, database = _isolated_store(tmp_path, monkeypatch)
+    from app.account_scope import ensure_account_runtime, get_account_buff_credentials
+
+    account_a = accounts.add_account(username="a", steam_id="111")
+    account_b = accounts.add_account(username="b", steam_id="222")
+    database.init_db()
+
+    runtime_a = ensure_account_runtime(account_a["id"])
+    runtime_b = ensure_account_runtime(account_b["id"])
+
+    assert runtime_a["buff_cookies"] == ""
+    assert runtime_b["buff_cookies"] == ""
+    assert get_account_buff_credentials(account_a["id"])["cookies"] == ""
+    assert get_account_buff_credentials(account_b["id"])["cookies"] == ""
+
+
+def test_existing_account_runtime_table_gains_buff_cookie_column(tmp_path, monkeypatch):
+    accounts, database = _isolated_store(tmp_path, monkeypatch)
+    db_path = tmp_path / "app.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE steamaccountruntime ("
+            "account_id TEXT PRIMARY KEY, cookies TEXT DEFAULT '', "
+            "session_id TEXT DEFAULT '', steam_id TEXT DEFAULT '', "
+            "shared_secret TEXT DEFAULT '', identity_secret TEXT DEFAULT '', "
+            "device_id TEXT DEFAULT '', auto_confirm_enabled BOOLEAN DEFAULT 0, "
+            "updated_at REAL DEFAULT 0)"
+        )
+
+    database.init_db()
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(steamaccountruntime)")}
+    assert "buff_cookies" in columns
+    assert "c5_app_key" in columns
+
+
+def test_c5_app_key_is_scoped_to_current_account(tmp_path, monkeypatch):
+    accounts, database = _isolated_store(tmp_path, monkeypatch)
+    from app.account_scope import (
+        ensure_account_runtime,
+        get_account_c5_credentials,
+        overlay_account_config,
+        update_account_c5_credentials,
+    )
+
+    account_a = accounts.add_account(username="a", steam_id="111")
+    database.init_db()
+    ensure_account_runtime(account_a["id"])
+    update_account_c5_credentials("key-a")
+
+    account_b = accounts.add_account(username="b", steam_id="222")
+    accounts.set_current(account_b["id"])
+    ensure_account_runtime(account_b["id"])
+    assert get_account_c5_credentials()["app_key"] == ""
+    assert overlay_account_config({"c5": {"app_key": "legacy"}})["c5"]["app_key"] == ""
+
+    update_account_c5_credentials("key-b")
+    assert get_account_c5_credentials()["app_key"] == "key-b"
+    accounts.set_current(account_a["id"])
+    assert get_account_c5_credentials()["app_key"] == "key-a"
 
 
 def test_legacy_cookie_is_assigned_to_matching_account_not_current(tmp_path, monkeypatch):
@@ -89,6 +165,14 @@ def test_transactions_are_filtered_and_updated_by_current_account(tmp_path, monk
     purchase_a = database.db_get_purchases()[0]
     database.db_upsert_purchase_order({"external_order_id": "order-a", "name": "item-a"})
     database.db_append_sale({"name": "sold-a", "price": 2, "at": 2})
+    counts = database.db_account_record_counts(account_a["id"])
+    assert counts["sales"] == 0
+    assert counts["listing_events"] == 1
+    assert database.db_update_purchase_by_id(
+        purchase_a["_db_id"],
+        {"sale_price": 2, "sold_at": 2},
+    ) is True
+    assert database.db_account_record_counts(account_a["id"])["sales"] == 1
 
     accounts.set_current(account_b["id"])
     database.db_append_purchase({"name": "item-b", "price": 3, "at": 3})
@@ -126,6 +210,7 @@ def test_switch_resets_account_view_and_loads_target_runtime(tmp_path, monkeypat
     from app.routes import accounts as account_routes
     from app import pipeline
     from app.state import get_inventory, set_inventory, set_pending_payment
+    from app.services import buff_balance
 
     account_a = accounts_store.add_account(username="a", steam_id="111")
     database.init_db()
@@ -134,6 +219,7 @@ def test_switch_resets_account_view_and_loads_target_runtime(tmp_path, monkeypat
     ensure_account_runtime(account_b["id"])
     set_inventory([{"assetid": "old-account-item"}])
     set_pending_payment(None)
+    monkeypatch.setattr(buff_balance, "_CACHE_FILE", tmp_path / "buff_balance_cache.json")
     monkeypatch.setattr(pipeline, "is_pipeline_running", lambda: False)
 
     result = account_routes._activate_account(account_b["id"])
@@ -209,6 +295,8 @@ def test_account_ui_exposes_scoped_runtime_without_secret_values():
     settings_js = (root / "web" / "js" / "settings.js").read_text(encoding="utf-8")
     html = (root / "web" / "index.html").read_text(encoding="utf-8")
     assert "runtime.has_cookie" in accounts_js
+    assert "runtime.has_buff_cookie" in accounts_js
+    assert "btn-acc-buff-relogin" in accounts_js
     assert "window.location.reload()" in accounts_js
     assert "cfg-steam-account-label" in settings_js
     assert "cfg-steam-account-label" in html
@@ -256,3 +344,27 @@ def test_inventory_ownership_override_is_account_scoped(tmp_path, monkeypatch):
     annotate_inventory_ownership(items_auto, [{"assetid": "asset-1"}])
     assert items_auto[0]["ownership_mode"] == "managed"
     assert items_auto[0]["ownership_source"] == "purchase"
+
+
+def test_inventory_auto_management_requires_completed_unsold_purchase(monkeypatch):
+    from app import inventory_ownership
+
+    monkeypatch.setattr(inventory_ownership, "db_get_inventory_ownership_overrides", lambda: {})
+    cases = [
+        ({"assetid": "pending", "pending_receipt": True, "order_status": "awaiting_trade"}, False),
+        ({"assetid": "sold", "sale_price": 2.0, "order_status": "sold"}, False),
+        ({"assetid": "failed", "pending_receipt": False, "order_status": "failed"}, False),
+        ({"assetid": "locked", "pending_receipt": False, "order_status": "trade_locked"}, True),
+        ({"assetid": "received", "pending_receipt": False, "order_status": "received"}, True),
+        ({"assetid": "legacy"}, True),
+    ]
+    items = [{"assetid": purchase["assetid"]} for purchase, _expected in cases]
+
+    inventory_ownership.annotate_inventory_ownership(
+        items,
+        [purchase for purchase, _expected in cases],
+    )
+
+    assert [item["managed_by_aetherswap"] for item in items] == [
+        expected for _purchase, expected in cases
+    ]

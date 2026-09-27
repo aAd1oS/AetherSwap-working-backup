@@ -23,3 +23,31 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Local-only data: publish source, never a running user's workspace.
+/config/*
+!/config/__init__.py
+!/config/config.json
+/.env
+/.env.*
+!/.env.example
+/.agreed_disclaimer
+/.playwright/
+/PRIVATE INF/
+/.agents/
+/.codex/
+/.claude/
+/.dsh/
+/.pytest_cache/
+/output_cards/
+/delivery/
+*.log
+*.maFile
+*.lnk
+*.orig
+*.bak
+*.db
+*.db-*
+/diagnostics/*
+!/diagnostics/steam_auth_flow_probe.py
+!/diagnostics/steam_history_once.py

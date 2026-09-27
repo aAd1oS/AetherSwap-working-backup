@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from analysis import analyze_by_time as _analyze_by_time
 from utils.money import USD_TO_CNY_DEFAULT
@@ -21,10 +22,16 @@ class StabilityAnalyzer:
         slope_stable_floor: float = -0.005,
         price_percentile_ceil_rising: float = 0.5,
         use_vwap: bool = True,
+        outlier_filter_enabled: bool = False,
+        outlier_iqr_multiplier: float = 1.5,
+        outlier_max_removed_ratio: float = 0.2,
+        outlier_protect_persistent_recent: bool = True,
+        as_of: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         return _analyze_by_time(
             history,
             days=days,
+            as_of=as_of,
             currency=currency,
             usd_to_cny=self._usd_to_cny,
             cv_threshold=cv_threshold,
@@ -39,4 +46,8 @@ class StabilityAnalyzer:
             slope_stable_floor=slope_stable_floor,
             price_percentile_ceil_rising=price_percentile_ceil_rising,
             use_vwap=use_vwap,
+            outlier_filter_enabled=outlier_filter_enabled,
+            outlier_iqr_multiplier=outlier_iqr_multiplier,
+            outlier_max_removed_ratio=outlier_max_removed_ratio,
+            outlier_protect_persistent_recent=outlier_protect_persistent_recent,
         )

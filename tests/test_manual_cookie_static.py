@@ -31,10 +31,28 @@ def test_browser_relogin_defers_inventory_and_profile_requests():
     assert "steamcommunity.com/my/" in browser_worker
 
 
+def test_buff_cookie_updates_trigger_dashboard_balance_refresh():
+    accounts_source = (ROOT / "web" / "js" / "accounts.js").read_text(encoding="utf-8")
+
+    manual_start = accounts_source.index("async function promptManualCookieLogin")
+    manual_end = accounts_source.index("async function openBrowserAndLogin", manual_start)
+    manual_cookie_flow = accounts_source[manual_start:manual_end]
+    assert 'typeof refreshBuffBalance === "function"' in manual_cookie_flow
+    assert "await refreshBuffBalance()" in manual_cookie_flow
+
+    finish_start = accounts_source.index("async function finishRelogin")
+    finish_end = accounts_source.index("function renderAccountsUI", finish_start)
+    browser_finish = accounts_source[finish_start:finish_end]
+    assert 'typeof refreshBuffBalance === "function"' in browser_finish
+    assert "await refreshBuffBalance()" in browser_finish
+
+
 def test_current_account_has_explicit_steam_relogin_entry():
     source = (ROOT / "web" / "js" / "accounts.js").read_text(encoding="utf-8")
 
     assert 'id="btn-acc-relogin"' in source
     assert "更新 Steam 信息" in source
+    assert "检查会话" in source
+    assert '["invalid", "need_2fa", "wrong_creds", "no_creds"]' in source
     assert 'showReloginModal("steam")' in source
     assert 'el("relogin-btn-open")' in source

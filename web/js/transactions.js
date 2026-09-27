@@ -17,26 +17,45 @@ async function refreshOrderLedger() {
         `<span class="summary-stat"><span class="summary-label">已确认</span><span class="summary-value mono">${Number(budget.confirmed || 0).toFixed(2)}</span></span>`,
         `<span class="summary-stat"><span class="summary-label">未决占用</span><span class="summary-value mono">${Number(budget.reserved || 0).toFixed(2)}</span></span>`,
         `<span class="summary-stat"><span class="summary-label">剩余</span><span class="summary-value mono">${Number(budget.remaining || 0).toFixed(2)}</span></span>`,
+        `<span class="summary-stat"><span class="summary-label">待处理</span><span class="summary-value mono">${Number(data.attention_count || 0)}</span></span>`,
       ].join("");
     }
     if (!tbody) return;
     const orders = data.orders || [];
     tbody.innerHTML = orders.map((order) => {
       const updated = order.updated_at ? new Date(order.updated_at * 1000).toLocaleString() : "—";
-      const action = order.blocking
-        ? `<button type="button" class="btn btn-sm btn-secondary order-btn-replace-paid" data-order-id="${escapeHtml(order.external_order_id || "")}">旧单取消，新单已付款</button> <button type="button" class="btn btn-sm btn-danger-outline order-btn-cancel" data-order-id="${escapeHtml(order.external_order_id || "")}">仅确认已取消</button>`
-        : "";
+      const availableActions = order.available_actions || [];
+      const action = [
+        availableActions.includes("replace_paid") ? `<button type="button" class="btn btn-sm btn-secondary order-btn-replace-paid" data-order-id="${escapeHtml(order.external_order_id || "")}">旧单取消，新单已付款</button>` : "",
+        availableActions.includes("cancel") ? `<button type="button" class="btn btn-sm btn-danger-outline order-btn-cancel" data-order-id="${escapeHtml(order.external_order_id || "")}">仅确认已取消</button>` : "",
+      ].filter(Boolean).join(" ");
       return `<tr>
         <td class="mono">${escapeHtml(updated)}</td>
         <td class="mono">${escapeHtml(order.external_order_id || "—")}</td>
         <td>${escapeHtml(order.name || "—")}</td>
         <td class="mono">${escapeHtml(String(order.quantity || 0))}</td>
         <td class="mono">${Number(order.total_price || 0).toFixed(2)}</td>
-        <td class="status-cell ${order.blocking ? "status-error" : ""}">${escapeHtml(order.status_label || order.status || "—")}</td>
-        <td>${escapeHtml(order.error || "")}</td>
+        <td class="status-cell ${order.needs_attention ? "status-error" : ""}">${escapeHtml(order.status_label || order.status || "—")}</td>
+        <td>${escapeHtml([order.error, order.attention_hint].filter(Boolean).join("；"))}</td>
         <td class="tx-actions">${action}</td>
       </tr>`;
     }).join("");
+    const reconcileButton = el("btn-order-reconcile");
+    if (reconcileButton) {
+      reconcileButton.disabled = Number(data.attention_count || 0) === 0;
+      reconcileButton.onclick = async () => {
+        reconcileButton.disabled = true;
+        try {
+          const result = await fetchJson(API + "/orders/reconcile", { method: "POST" });
+          if (!result.ok) throw new Error(result.error || "平台复核失败");
+          toast("平台复核完成", `已检查 ${Number(result.checked_count || 0)} 笔，更新 ${Number(result.changed_count || 0)} 笔`);
+          await refreshOrderLedger();
+        } catch (e) {
+          toast("平台复核失败", e.message || "");
+          reconcileButton.disabled = false;
+        }
+      };
+    }
     tbody.querySelectorAll(".order-btn-cancel").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const orderId = btn.dataset.orderId || "";
@@ -158,6 +177,19 @@ function renderTxTable(tbody, list, isPurchase = false, resellRatio = 0.85, mult
       const mp = t.market_price != null ? Number(t.market_price).toFixed(2) : "—";
       const cur = t.current_market_price != null ? Number(t.current_market_price) : null;
       const cmp = cur != null ? cur.toFixed(2) : "";
+      const listingPrice = t.listing_price != null ? Number(t.listing_price) : null;
+      let listingPriceCell = "<td></td>";
+      if (listingPrice != null && Number.isFinite(listingPrice) && listingPrice > 0) {
+        let gapHtml = "";
+        if (cur != null && Number.isFinite(cur) && cur > 0) {
+          const gap = listingPrice - cur;
+          const gapPct = gap / cur * 100;
+          const gapClass = gap > 0.009 ? "text-bad" : gap < -0.009 ? "text-ok" : "";
+          const sign = gap >= 0 ? "+" : "";
+          gapHtml = `<br><span class="${gapClass}">${sign}${gap.toFixed(2)} (${sign}${gapPct.toFixed(2)}%)</span>`;
+        }
+        listingPriceCell = `<td class="mono">${listingPrice.toFixed(2)}${gapHtml}</td>`;
+      }
       const marketAtBuy = t.market_price != null ? Number(t.market_price) : null;
       let plCell = "<td></td>";
       if (cur != null && marketAtBuy != null && marketAtBuy > 0) {
@@ -180,7 +212,7 @@ function renderTxTable(tbody, list, isPurchase = false, resellRatio = 0.85, mult
       const profitCell = cashProfit ? `<td class="mono ${profitClass}">${escapeHtml(parseFloat(cashProfit) >= 0 ? "+" + cashProfit : cashProfit)}</td>` : "<td></td>";
       const selfUseCell = selfUseProfit ? `<td class="mono ${selfUseClass}">${escapeHtml(parseFloat(selfUseProfit) >= 0 ? "+" + selfUseProfit : selfUseProfit)}</td>` : "<td></td>";
       const assetidCell = `<td class="mono">${escapeHtml(t.assetid ?? "—")}</td>`;
-      rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td>${assetidCell}${priceCell}<td class="mono">${escapeHtml(mp)}</td><td class="mono">${escapeHtml(cmp)}</td>${afterTaxCell}${discountRatioCell}${profitCell}${selfUseCell}${plCell}<td class="tx-actions">${actHtml}</td></tr>`);
+      rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td>${assetidCell}${priceCell}<td class="mono">${escapeHtml(mp)}</td><td class="mono">${escapeHtml(cmp)}</td>${listingPriceCell}${afterTaxCell}${discountRatioCell}${profitCell}${selfUseCell}${plCell}<td class="tx-actions">${actHtml}</td></tr>`);
     } else {
       const assetidCell = `<td class="mono">${escapeHtml(t.assetid ?? "—")}</td>`;
       rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td>${assetidCell}${priceCell}<td class="tx-actions">${actHtml}</td></tr>`);
@@ -265,8 +297,9 @@ function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelect
     const mp = t.market_price != null ? Number(t.market_price).toFixed(2) : "—";
     const sold = t.sale_price != null && Number(t.sale_price) > 0;
     const listingError = t.listing_status === "error";
-    const statusStr = t.order_status_label || (t.pending_receipt ? "待收货" : sold ? "已出售" : listingError ? "ERROR" : t.listing ? "出售中" : "持有中");
-    const statusCellClass = t.pending_receipt ? "status-pending" : sold ? "status-sold" : listingError ? "status-error" : t.listing ? "status-listing" : "status-holding";
+    const pendingConfirmation = t.listing_status === "pending_confirmation";
+    const statusStr = pendingConfirmation ? "等待 Steam 确认" : t.order_status_label || (t.pending_receipt ? "待收货" : sold ? "已出售" : listingError ? "ERROR" : t.listing ? "出售中" : "持有中");
+    const statusCellClass = pendingConfirmation || t.pending_receipt ? "status-pending" : sold ? "status-sold" : listingError ? "status-error" : t.listing ? "status-listing" : "status-holding";
     const salePriceStr = sold ? Number(t.sale_price).toFixed(2) : "—";
     let discountRatioStr = "—", cashProfitStr = "—", selfUseStr = "—", discountRatioClass = "";
     if (sold) {
@@ -295,12 +328,28 @@ function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelect
     } else {
       deviationCell = `<td class="mono">—</td>`;
     }
-    const delistBtn = !multiSelectMode && t.listing ? `<button type="button" class="btn btn-sm btn-warning-outline ph-btn-delist" data-type="purchase" data-idx="${idx}">下架</button> ` : "";
-    const actHtml = !multiSelectMode ? (delistBtn + `<button type="button" class="btn btn-sm btn-danger-outline ph-btn-del" data-type="purchase" data-idx="${idx}">删除</button>`) : "";
+    const delistBtn = !multiSelectMode && t.listing && !pendingConfirmation ? `<button type="button" class="btn btn-sm btn-warning-outline ph-btn-delist" data-type="purchase" data-idx="${idx}">下架</button> ` : "";
+    const pendingReviewBtn = !multiSelectMode && pendingConfirmation ? `<button type="button" class="btn btn-sm btn-warning-outline ph-btn-pending-review" data-idx="${idx}">人工处理</button> ` : "";
+    const deleteBtn = !pendingConfirmation ? `<button type="button" class="btn btn-sm btn-danger-outline ph-btn-del" data-type="purchase" data-idx="${idx}">删除</button>` : "";
+    const actHtml = !multiSelectMode ? (pendingReviewBtn + delistBtn + deleteBtn) : "";
     const assetidStr = t.assetid ?? "—";
     rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td><td class="mono">${escapeHtml(assetidStr)}</td><td class="mono">${escapeHtml(Number(t.price).toFixed(2))}</td><td class="mono">${escapeHtml(mp)}</td><td class="status-cell ${statusCellClass}">${escapeHtml(statusStr)}</td><td class="mono">${escapeHtml(salePriceStr)}</td><td class="mono ${discountRatioClass}">${escapeHtml(discountRatioStr)}</td><td class="mono ${cashClass}">${escapeHtml(cashProfitStr)}</td><td class="mono ${selfUseClass}">${escapeHtml(selfUseStr)}</td>${deviationCell}<td class="tx-actions">${actHtml}</td></tr>`);
   }
   tbody.innerHTML = rowHtmls.join("");
+  tbody.querySelectorAll(".ph-btn-pending-review").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      const t = list.find(x => x.type === "purchase" && x.idx === idx);
+      if (!t) return;
+      const since = t.listed_at ? new Date(t.listed_at * 1000).toLocaleString() : "未知";
+      appModal({
+        title: "Steam 上架等待人工确认",
+        message: `请在 Steam 手机端检查并处理该市场上架确认。\n物品：${t.name || "—"}\nassetid：${t.assetid || "—"}\n提交时间：${since}\n\n系统会保持待确认状态，不会自动重复上架。处理后等待后台同步即可。`,
+        variant: "warning",
+        actions: [{ label: "我知道了", value: true, kind: "primary" }],
+      });
+    });
+  });
   tbody.querySelectorAll(".ph-btn-delist").forEach(btn => {
     btn.addEventListener("click", async () => {
       if (!(await appConfirm("确定下架该饰品？下架后 assetid 会变更。", { title: "下架饰品", confirmText: "下架" }))) return;
@@ -495,6 +544,8 @@ async function refreshTransactions() {
   if (!tbodyP && !tbodyS && !tbodyHistory) return;
   try {
     const d = await fetchJson(API + "/transactions?enrich_current_price=0");
+    const holdingsAccountEl = el("holdings-account-name");
+    if (holdingsAccountEl) holdingsAccountEl.textContent = d.account?.name || d.account?.steam_id || "未选择账号";
     const historyAccountEl = el("history-account-name");
     if (historyAccountEl) historyAccountEl.textContent = d.account?.name || d.account?.steam_id || "未选择账号";
     const all = d.transactions || [];

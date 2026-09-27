@@ -4,6 +4,11 @@ let accountsCurrentId = null;
 let selectedAccountId = null;
 let accountEditId = null;
 let accountsSearchTerm = '';
+function formatSteamSessionTime(timestamp) {
+  const value = Number(timestamp || 0);
+  if (!value) return "—";
+  return new Date(value * 1000).toLocaleString("zh-CN", { hour12: false });
+}
 function renderAccountDetail(acc, currentId) {
   const detail = el("account-detail");
   if (!detail) return;
@@ -34,6 +39,20 @@ function renderAccountDetail(acc, currentId) {
   else if (currency === "EUR") currencyLabel = "欧元 (EUR)";
   const region = (acc.region_code || "").toUpperCase();
   const runtime = acc.runtime || {};
+  const steamSession = runtime.steam_session || {};
+  const sessionLabels = {
+    valid: "可用",
+    stale: "待重新确认",
+    pending: "待确认",
+    rate_limited: "请求受限，Cookie 已保留",
+    unavailable: "暂时无法确认",
+    invalid: "需要更新登录信息",
+    unconfigured: "未配置",
+  };
+  const steamSessionLabel = sessionLabels[steamSession.status] || "待确认";
+  const steamSessionDetail = steamSession.last_ok_at
+    ? `${formatSteamSessionTime(steamSession.last_ok_at)} · ${steamSession.last_ok_source || "Steam 业务请求"}`
+    : "尚无成功业务记录";
   let regionLabel = region || "—";
   if (region === "CN") regionLabel = "中国 (CN)";
   else if (region === "HK") regionLabel = "中国香港 (HK)";
@@ -51,8 +70,9 @@ function renderAccountDetail(acc, currentId) {
         </div>
       </div>
       <div class="account-detail-actions">
-        <button type="button" class="btn btn-secondary btn-sm" id="btn-acc-verify" data-id="${escapeHtml(acc.id)}">验证</button>
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-acc-verify" data-id="${escapeHtml(acc.id)}">检查会话</button>
         ${isCurrent ? `<button type="button" class="btn btn-secondary btn-sm" id="btn-acc-relogin">更新 Steam 信息</button>` : ""}
+        ${isCurrent ? `<button type="button" class="btn btn-secondary btn-sm" id="btn-acc-buff-relogin">更新 BUFF 信息</button>` : ""}
         ${!isCurrent ? `<button type="button" class="btn btn-primary btn-sm" id="btn-acc-set-current" data-id="${escapeHtml(acc.id)}">设为当前</button>` : ""}
         <button type="button" class="btn btn-edit btn-sm" id="btn-acc-edit" data-id="${escapeHtml(acc.id)}">编辑</button>
         <button type="button" class="btn btn-danger-outline btn-sm" id="btn-acc-del" data-id="${escapeHtml(acc.id)}">删除</button>
@@ -67,10 +87,13 @@ function renderAccountDetail(acc, currentId) {
         <div class="kv"><div class="k">结算币种</div><div class="v mono">${escapeHtml(currencyLabel)}</div></div>
         <div class="kv"><div class="k">地区</div><div class="v mono">${escapeHtml(regionLabel)}</div></div>
         <div class="kv"><div class="k">Steam Cookie</div><div class="v">${runtime.has_cookie ? "已配置" : "未配置"}</div></div>
+        <div class="kv"><div class="k">BUFF Cookie</div><div class="v">${runtime.has_buff_cookie ? "已配置" : "未配置"}</div></div>
         <div class="kv"><div class="k">令牌配置</div><div class="v">${runtime.has_shared_secret && runtime.has_identity_secret ? "已配置" : "未完整配置"}</div></div>
         <div class="kv"><div class="k">自动出售</div><div class="v ${runtime.auto_sell_enabled ? "text-ok" : "text-bad"}">${runtime.auto_sell_enabled ? "已开启（仅托管商品）" : "已关闭（个人库存保护）"}</div></div>
         <div class="kv"><div class="k">身份一致性</div><div class="v">${runtime.identity_matches === false ? "SteamID不一致" : "正常"}</div></div>
-        <div class="kv"><div class="k">本地记录</div><div class="v">购入 ${runtime.records?.purchases || 0} · 订单 ${runtime.records?.orders || 0} · 售出 ${runtime.records?.sales || 0}</div></div>
+        <div class="kv"><div class="k">Steam 会话</div><div class="v ${steamSession.status === "valid" ? "text-ok" : (steamSession.status === "invalid" ? "text-bad" : "")}">${escapeHtml(steamSessionLabel)}</div></div>
+        <div class="kv"><div class="k">最近业务确认</div><div class="v">${escapeHtml(steamSessionDetail)}</div></div>
+        <div class="kv"><div class="k">本地记录</div><div class="v">购入 ${runtime.records?.purchases || 0} · 订单 ${runtime.records?.orders || 0} · 已售出 ${runtime.records?.sales || 0}</div></div>
       </div>
       <div class="account-detail-actions" style="margin-top:12px">
         <button type="button" class="btn btn-secondary btn-sm" id="btn-acc-auto-sell" data-id="${escapeHtml(acc.id)}" data-enabled="${runtime.auto_sell_enabled ? "1" : "0"}">${runtime.auto_sell_enabled ? "关闭自动出售" : "开启自动出售"}</button>
@@ -138,7 +161,12 @@ function renderAccountDetail(acc, currentId) {
     }
   });
   detail.querySelector("#btn-acc-relogin")?.addEventListener("click", () => {
-    showReloginModal("steam");
+    showReloginModal("steam", { reason: "manual_update" });
+    const btnOpen = el("relogin-btn-open");
+    if (btnOpen) btnOpen.click();
+  });
+  detail.querySelector("#btn-acc-buff-relogin")?.addEventListener("click", () => {
+    showReloginModal("buff");
     const btnOpen = el("relogin-btn-open");
     if (btnOpen) btnOpen.click();
   });
@@ -148,16 +176,16 @@ function renderAccountDetail(acc, currentId) {
     if (!id) return;
     const origText = btn.textContent;
     btn.disabled = true;
-    btn.textContent = "验证中…";
+    btn.textContent = "检查中…";
     try {
       const r = await fetchJson(API + "/accounts/" + id + "/verify", { method: "POST" });
       if (r.ok) {
-        toast("验证通过", r.message || "可自动登录");
+        toast("Steam 会话可用", r.message || "真实业务请求已确认");
         accountsCurrentId = id;
         await refreshAccounts();
       } else if (r.status === "rate_limited" || r.status === "temporarily_unavailable") {
         toast("Steam 暂时无法验证", r.message || "Cookie 已保留，请稍后再试", 12000);
-      } else if (r.status === "need_2fa" || r.status === "wrong_creds") {
+      } else if (["invalid", "need_2fa", "wrong_creds", "no_creds"].includes(r.status)) {
         toast(r.message || "自动登录未通过，改用浏览器登录");
         showReloginModal("steam");
         const btnOpen = el("relogin-btn-open");
@@ -169,7 +197,7 @@ function renderAccountDetail(acc, currentId) {
       toast("验证失败", err.message || "", 12000);
     } finally {
       btn.disabled = false;
-      btn.textContent = origText || "验证";
+      btn.textContent = origText || "检查会话";
     }
   });
 }
@@ -217,6 +245,8 @@ async function promptManualCookieLogin(type, reason = "", options = {}) {
     if (options.refreshAfterSave !== false) {
       if (isSteam) {
         await refreshAccounts();
+      } else if (typeof refreshBuffBalance === "function") {
+        await refreshBuffBalance();
       } else if (typeof refreshStatus === "function") {
         await refreshStatus();
       }
@@ -271,7 +301,9 @@ async function finishRelogin(success) {
       toast("登录信息已更新");
       if (reloginType === "steam") {
         await refreshAccounts();
-        toast("Steam Cookie 已保存", "请稍后只验证一次账号；不会自动刷新库存");
+        toast("Steam Cookie 已保存", "无需重复登录；下一次检查会话或真实业务请求会自动确认");
+      } else if (typeof refreshBuffBalance === "function") {
+        await refreshBuffBalance();
       } else {
         await refreshStatus();
       }

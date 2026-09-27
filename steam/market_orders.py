@@ -517,6 +517,13 @@ def _fetch_action_orderbook_cny(
                 if not isinstance(payload, dict):
                     last_error = "Steam 新版 orderbook 接口返回格式异常"
                     break
+                nested_payload = payload.get("data")
+                if (
+                    "success" not in payload
+                    and isinstance(nested_payload, dict)
+                    and "success" in nested_payload
+                ):
+                    payload = nested_payload
                 if payload.get("success") not in (True, 1, "1"):
                     msg = payload.get("message") or payload.get("error") or ""
                     last_error = "Steam 新版 orderbook 接口返回失败" + (f": {msg}" if msg else "")

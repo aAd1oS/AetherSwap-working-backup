@@ -152,35 +152,53 @@ def _match_purchase_for_item(
     pending_purchases: List[dict],
     assigned_db_ids: set,
 ) -> Optional[dict]:
-    """Return the best matching purchase record dict (containing _db_id), or None.
-    Matching priority:
-      1. goods_id exact match (most reliable)
-      2. name substring match (fallback)
-    Among candidates, prefer the oldest (smallest ``at`` timestamp).
-    """
-    goods_id_buff = item.get("goods_id")
-    name_for_match = (item.get("market_hash_name") or item.get("name") or "").strip()
+    """Return a purchase only when this item has exactly one eligible match."""
+    goods_id = item.get("goods_id")
+    item_name = (item.get("market_hash_name") or item.get("name") or "").strip()
     candidates: List[dict] = []
-    for p in pending_purchases:
-        db_id = p.get("_db_id")
-        if not db_id or db_id in assigned_db_ids:
+    for purchase in pending_purchases:
+        db_id = purchase.get("_db_id")
+        if not db_id or db_id in assigned_db_ids or purchase.get("assetid"):
             continue
-        if p.get("assetid"):  
-            continue
-        if goods_id_buff is not None and p.get("goods_id") is not None:
+        if goods_id is not None:
             try:
-                if int(goods_id_buff) == int(p.get("goods_id")):
-                    candidates.append(p)
-                    continue
+                if int(goods_id) == int(purchase.get("goods_id")):
+                    candidates.append(purchase)
             except (ValueError, TypeError):
                 pass
-        pname = (p.get("name") or "").strip()
-        if pname and name_for_match and (pname == name_for_match or name_for_match in pname or pname in name_for_match):
-            candidates.append(p)
-    if not candidates:
+            continue
+        if item_name and (purchase.get("name") or "").strip() == item_name:
+            candidates.append(purchase)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+_ALLOWED_RECEIPT_STATES = frozenset({"awaiting_ship", "awaiting_trade"})
+
+
+def _plan_trade_offer_matches(
+    items: List[dict],
+    pending_purchases: List[dict],
+    expected_account_id: str = "",
+) -> Optional[List[Tuple[dict, dict]]]:
+    """Build a complete one-to-one match before any state or network action."""
+    if not isinstance(items, list) or not items:
         return None
-    candidates.sort(key=lambda x: (x.get("at") or 0))
-    return candidates[0]
+    assigned_db_ids: set = set()
+    pairs: List[Tuple[dict, dict]] = []
+    for item in items:
+        purchase = _match_purchase_for_item(item, pending_purchases, assigned_db_ids)
+        if purchase is None:
+            return None
+        account_id = str(purchase.get("account_id") or "")
+        if expected_account_id and account_id and account_id != expected_account_id:
+            return None
+        if str(purchase.get("order_status") or "") not in _ALLOWED_RECEIPT_STATES:
+            return None
+        assigned_db_ids.add(purchase["_db_id"])
+        pairs.append((purchase, item))
+    return pairs
+
+
 
 def reconcile_pending_purchases_from_inventory(
     get_purchases: Callable[[], List[dict]],
@@ -190,6 +208,44 @@ def reconcile_pending_purchases_from_inventory(
 ) -> dict:
     """Match manually accepted trades using an inventory snapshot already fetched by the caller."""
     purchases = list(get_purchases() or [])
+    inventory_by_assetid = {
+        str(item.get("assetid") or "").strip(): item
+        for item in (inventory_items or [])
+        if str(item.get("assetid") or "").strip()
+    }
+    matched = 0
+    for positional_idx, purchase in enumerate(purchases):
+        assetid = str(purchase.get("assetid") or "").strip()
+        if not purchase.get("pending_receipt") or not assetid:
+            continue
+        item = inventory_by_assetid.get(assetid)
+        purchase_name = (purchase.get("name") or "").strip().casefold()
+        inventory_name = (
+            (item or {}).get("market_hash_name") or (item or {}).get("name") or ""
+        ).strip().casefold()
+        if not item or not purchase_name or purchase_name != inventory_name:
+            continue
+        tradable_at = item.get("cooldown_at")
+        now_ts = time.time()
+        data = {
+            "pending_receipt": False,
+            "received_at": float(purchase.get("received_at") or now_ts),
+            "tradable_at": tradable_at,
+            "order_status": (
+                "trade_locked"
+                if tradable_at and float(tradable_at) > now_ts
+                else "received"
+            ),
+        }
+        db_id = int(purchase.get("_db_id") or 0)
+        if update_purchase_by_id and db_id:
+            updated = update_purchase_by_id(db_id, data)
+        else:
+            updated = update_purchase(positional_idx, data)
+        if updated:
+            purchase.update(data)
+            matched += 1
+
     pending_by_name: Dict[str, List[Tuple[int, dict]]] = {}
     used_assetids = {
         str(p.get("assetid") or "").strip()
@@ -211,7 +267,6 @@ def reconcile_pending_purchases_from_inventory(
             continue
         inventory_by_name.setdefault(name, []).append(item)
 
-    matched = 0
     ambiguous = 0
     for name, pending_rows in pending_by_name.items():
         candidates = inventory_by_name.get(name) or []
@@ -266,6 +321,8 @@ def try_receive_once(
     Falls back to positional ``update_purchase`` only if``update_purchase_by_id``
     is not supplied (backward-compatibility).
     """
+    from app.accounts import get_current_id
+    expected_account_id = str(get_current_id() or "")
     purchases = get_purchases()
     pending_records: List[dict] = [
         p for p in purchases
@@ -286,7 +343,18 @@ def try_receive_once(
     if not ok or not pending_tasks:
         return 0
     pending_tasks = sorted(pending_tasks, key=lambda t: (t.get("created_at") or 0, t.get("tradeofferid") or ""))
+    inventory_before_ids: Optional[set] = None
+    if scan_inventory:
+        ok_before, inventory_before, _ = scan_inventory()
+        if not ok_before:
+            return 0
+        inventory_before_ids = {
+            str(item.get("assetid") or "").strip()
+            for item in (inventory_before or [])
+            if str(item.get("assetid") or "").strip()
+        }
     received = 0
+    claimed_db_ids: set = set()
     def _do_update(db_id: int, positional_idx: int, data: dict) -> bool:
         """Update a purchase record, preferring _db_id-based O(1) update."""
         if update_purchase_by_id and db_id:
@@ -296,23 +364,60 @@ def try_receive_once(
         offer_id = task.get("tradeofferid")
         if not offer_id:
             continue
-        assigned_before_accept: set = set()
-        for item in task.get("items") or []:
-            matched = _match_purchase_for_item(item, pending_records, assigned_before_accept)
-            if matched is None:
-                continue
+        offer_items = task.get("items") or []
+        eligible_records = [
+            row for row in pending_records
+            if row.get("_db_id") not in claimed_db_ids
+        ]
+        planned_pairs = _plan_trade_offer_matches(
+            offer_items, eligible_records, expected_account_id
+        )
+        if planned_pairs is None:
+            for row in eligible_records:
+                candidate_match = False
+                for item in offer_items:
+                    if item.get("goods_id") is not None:
+                        try:
+                            candidate_match = int(row.get("goods_id")) == int(item.get("goods_id"))
+                        except (TypeError, ValueError):
+                            candidate_match = False
+                    else:
+                        item_name = (item.get("market_hash_name") or item.get("name") or "").strip()
+                        candidate_match = bool(item_name and (row.get("name") or "").strip() == item_name)
+                    if candidate_match:
+                        break
+                if not candidate_match:
+                    continue
+                db_id = int(row.get("_db_id") or 0)
+                positional_idx = next(
+                    (i for i, purchase in enumerate(purchases) if purchase.get("_db_id") == db_id),
+                    -1,
+                )
+                if positional_idx >= 0:
+                    _do_update(db_id, positional_idx, {"order_status": "needs_review"})
+                claimed_db_ids.add(db_id)
+            continue
+        claimed_db_ids.update(pair[0]["_db_id"] for pair in planned_pairs)
+        updates_ok = True
+        for matched, _item in planned_pairs:
             db_id = matched.get("_db_id") or 0
             positional_idx = next(
                 (i for i, p in enumerate(purchases) if p.get("_db_id") == db_id),
                 -1,
             )
-            if positional_idx >= 0 and _do_update(
+            if positional_idx < 0 or not _do_update(
                 db_id,
                 positional_idx,
                 {"order_status": "awaiting_trade"},
             ):
-                matched["order_status"] = "awaiting_trade"
-                assigned_before_accept.add(db_id)
+                updates_ok = False
+                break
+            matched["order_status"] = "awaiting_trade"
+        if not updates_ok:
+            continue
+        if expected_account_id:
+            from app.account_operations import assert_current_account
+            assert_current_account(expected_account_id)
         if not accept_steam_trade_offer(str(offer_id), steam_cookies):
             continue
         received += 1
@@ -323,22 +428,32 @@ def try_receive_once(
             p for p in purchases
             if p.get("pending_receipt") and not p.get("assetid") and p.get("_db_id")
         ]
-        assigned_db_ids: set = set()
-        pairs: List[Tuple[dict, dict]] = []  
-        for it in task.get("items") or []:
-            matched = _match_purchase_for_item(it, pending_records, assigned_db_ids)
-            if matched is not None:
-                assigned_db_ids.add(matched["_db_id"])
-                pairs.append((matched, it))
+        pending_by_id = {p["_db_id"]: p for p in pending_records}
+        pairs = [
+            (pending_by_id[planned["_db_id"]], item)
+            for planned, item in planned_pairs
+            if planned.get("_db_id") in pending_by_id
+        ]
         pairs.sort(key=lambda x: (x[0].get("at") or 0, x[0].get("_db_id") or 0))
         already_used = {str(p.get("assetid")) for p in get_purchases() if p.get("assetid")}
         inv_by_name: Dict[str, List[dict]] = {}
+        inventory_diff_available = False
         if scan_inventory:
             ok_inv, inv_list, _ = scan_inventory()
-            if ok_inv and inv_list:
+            if not ok_inv:
+                return received
+            current_inventory_ids = {
+                str(inv_item.get("assetid") or "").strip()
+                for inv_item in (inv_list or [])
+                if str(inv_item.get("assetid") or "").strip()
+            }
+            new_assetids = current_inventory_ids - (inventory_before_ids or set())
+            inventory_before_ids = current_inventory_ids
+            inventory_diff_available = bool(new_assetids)
+            if new_assetids:
                 for inv_item in inv_list:
                     aid = str(inv_item.get("assetid") or "")
-                    if not aid or aid in already_used:
+                    if not aid or aid not in new_assetids or aid in already_used:
                         continue
                     mhn = (inv_item.get("market_hash_name") or "").strip()
                     if mhn:
@@ -359,8 +474,6 @@ def try_receive_once(
                     already_used.add(aid)
                     inv_by_name[mhn].remove(inv_item)
                     break
-            if not our_assetid:
-                our_assetid = (it.get("assetid") or "").strip()
             if our_assetid:
                 db_id = purchase_rec.get("_db_id") or 0
                 pos_idx = next(
@@ -372,13 +485,23 @@ def try_receive_once(
                     tradable_at = matched_inventory_item.get("cooldown_at")
                 now_ts = time.time()
                 order_status = "trade_locked" if tradable_at and float(tradable_at) > now_ts else "received"
-                _do_update(db_id, pos_idx, {
-                    "assetid": our_assetid,
-                    "pending_receipt": False,
-                    "received_at": now_ts,
-                    "tradable_at": tradable_at,
-                    "order_status": order_status,
-                })
-                already_used.add(our_assetid)
+                try:
+                    _do_update(db_id, pos_idx, {
+                        "assetid": our_assetid,
+                        "pending_receipt": False,
+                        "received_at": now_ts,
+                        "tradable_at": tradable_at,
+                        "order_status": order_status,
+                    })
+                    already_used.add(our_assetid)
+                except Exception as exc:
+                    from app.database import DuplicateAssetIdError
+                    if not isinstance(exc, DuplicateAssetIdError):
+                        raise
+                    _do_update(db_id, pos_idx, {
+                        "order_status": "needs_review",
+                    })
+        if scan_inventory and not inventory_diff_available:
+            return received
         jittered_sleep(1)
     return received

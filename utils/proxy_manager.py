@@ -85,6 +85,14 @@ class ProxyManager:
         self._proxies = [{"config": p, "score": 1} for p in raw if p.get("host")]
         self._cached_strategy = int(cfg.get("strategy", 1))
         self._cached_enabled = bool(cfg.get("enabled", False))
+        route_mode = str(cfg.get("steam_route_mode", "auto") or "auto").strip().lower()
+        self._cached_steam_route_mode = (
+            route_mode
+            if route_mode in {"auto", "project_proxy", "local_accelerator", "system", "direct"}
+            else "auto"
+        )
+        self._last_steam_route_log_key = None
+        self._last_steam_route_log_at = 0.0
         self._sync_cycle()
     def _sync_cycle(self):
         self._proxies.sort(key=lambda x: x["score"], reverse=True)
@@ -178,14 +186,86 @@ class ProxyManager:
     def should_always_use_proxy(self) -> bool:
         """策略2：一直走代理。"""
         return self.is_proxy_enabled() and self.get_strategy() == 2
-    def get_steam_proxies(self) -> Optional[dict]:
-        """Route Steam traffic through the configured pool whenever it is enabled."""
+    def _project_proxy_or_none(self) -> Optional[dict]:
         if not self.is_proxy_enabled():
             return None
         proxies = self.get_next_proxy_dict()
         if not proxies:
             raise RuntimeError("Steam proxy pool is enabled but has no usable proxy")
         return proxies
+
+    def _log_steam_route(self, route: dict) -> None:
+        now = time.time()
+        key = (route.get("name"), route.get("reason"))
+        last_key = getattr(self, "_last_steam_route_log_key", None)
+        last_at = getattr(self, "_last_steam_route_log_at", 0.0)
+        if key == last_key and now - last_at < 60:
+            return
+        _pm_log(
+            f"[SteamRoute] route={route.get('name')} reason={route.get('reason')}"
+        )
+        self._last_steam_route_log_key = key
+        self._last_steam_route_log_at = now
+
+    def get_steam_route(self) -> dict:
+        """Choose one unambiguous route for all Steam traffic."""
+        from steam.session import direct_proxy_bypass, get_local_steam_accelerator_status
+
+        mode = getattr(self, "_cached_steam_route_mode", "project_proxy")
+        accelerator = get_local_steam_accelerator_status()
+
+        if mode in {"auto", "local_accelerator"} and accelerator.get("active"):
+            route = {
+                "name": "local_accelerator",
+                "reason": accelerator.get("reason") or "ready",
+                "proxies": direct_proxy_bypass(),
+                "local_accelerator": accelerator,
+            }
+        elif mode == "local_accelerator":
+            raise RuntimeError(
+                "Steam local accelerator was selected but is not active "
+                f"({accelerator.get('reason') or 'unknown'})"
+            )
+        elif mode == "direct":
+            route = {
+                "name": "direct",
+                "reason": "configured_direct",
+                "proxies": direct_proxy_bypass(),
+                "local_accelerator": accelerator,
+            }
+        elif mode == "system":
+            route = {
+                "name": "system",
+                "reason": "configured_system",
+                "proxies": None,
+                "local_accelerator": accelerator,
+            }
+        else:
+            proxies = self._project_proxy_or_none()
+            route = {
+                "name": "project_proxy" if proxies else "system",
+                "reason": (
+                    "local_accelerator_unavailable"
+                    if mode == "auto" and proxies
+                    else "configured_project_proxy" if proxies else "no_project_proxy"
+                ),
+                "proxies": proxies,
+                "local_accelerator": accelerator,
+            }
+        self._log_steam_route(route)
+        return route
+
+    def get_steam_route_status(self) -> dict:
+        route = self.get_steam_route()
+        return {
+            "mode": getattr(self, "_cached_steam_route_mode", "project_proxy"),
+            "route": route.get("name"),
+            "reason": route.get("reason"),
+            "local_accelerator": route.get("local_accelerator") or {},
+        }
+
+    def get_steam_proxies(self) -> Optional[dict]:
+        return self.get_steam_route().get("proxies")
     def get_proxies_for_request(self, failed: bool = False) -> Optional[dict]:
         """
         根据策略返回适当的 proxies dict：

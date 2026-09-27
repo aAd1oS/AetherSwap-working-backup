@@ -26,8 +26,7 @@ from app.accounts import (
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 def _steam_request_proxies() -> Optional[dict]:
     from utils.proxy_manager import get_proxy_manager
-    proxies = get_proxy_manager().get_steam_proxies()
-    return proxies if proxies and any(proxies.values()) else None
+    return get_proxy_manager().get_steam_proxies()
 
 
 def _configure_steam_session(session) -> None:
@@ -41,6 +40,41 @@ _STEAM_RATE_LIMITED_MESSAGE = (
     "Steam Community 请求频率受限（HTTP 429），Cookie 已保留且不代表过期，"
     "请停止重复验证，等待约30分钟后再试"
 )
+
+
+def record_steam_session_success(source: str, account_id: str = "") -> None:
+    """Persist strong evidence from a real authenticated Steam operation."""
+    try:
+        account = get_account(account_id) if account_id else get_current_account()
+        if not account:
+            return
+        update_account(
+            account.get("id"),
+            steam_session_last_ok_at=time.time(),
+            steam_session_last_ok_source=(source or "Steam 业务请求")[:80],
+            steam_session_last_issue_at=0,
+            steam_session_last_issue_status="",
+            steam_session_last_issue="",
+        )
+    except Exception:
+        pass
+
+
+def record_steam_session_issue(status: str, message: str, account_id: str = "") -> None:
+    """Record an inconclusive or explicit auth result without deleting cookies."""
+    try:
+        account = get_account(account_id) if account_id else get_current_account()
+        if not account:
+            return
+        normalized = status if status in {"invalid", "rate_limited", "unavailable"} else "unavailable"
+        update_account(
+            account.get("id"),
+            steam_session_last_issue_at=time.time(),
+            steam_session_last_issue_status=normalized,
+            steam_session_last_issue=(message or "Steam 会话暂时无法确认")[:240],
+        )
+    except Exception:
+        pass
 
 
 def _load_steam_auth_cookies(session, cookie_dict: dict) -> None:
@@ -481,7 +515,7 @@ def _extract_creds_from_cookie_dict(cookie_dict: dict) -> Tuple[str, str, str]:
     return cookie_str, session_id, steam_id
 _auto_relogin_lock = threading.Lock()
 _auto_relogin_last_success = 0.0
-def try_steam_auto_relogin() -> tuple:
+def try_steam_auto_relogin(*, force_login: bool = False) -> tuple:
     global _auto_relogin_last_success
     if not _auto_relogin_lock.acquire(blocking=False):
         log("auto_relogin: 另一个自动登录正在进行，跳过", "info", category="steam")
@@ -489,10 +523,10 @@ def try_steam_auto_relogin() -> tuple:
             return True, "auto_ok", "另一个自动登录刚刚完成"
         return False, "busy", "另一个自动登录正在进行"
     try:
-        return _try_steam_auto_relogin_impl()
+        return _try_steam_auto_relogin_impl(force_login=force_login)
     finally:
         _auto_relogin_lock.release()
-def _try_steam_auto_relogin_impl() -> tuple:
+def _try_steam_auto_relogin_impl(*, force_login: bool = False) -> tuple:
     global _auto_relogin_last_success
     cur = get_current_account()
     if not cur:
@@ -525,21 +559,16 @@ def _try_steam_auto_relogin_impl() -> tuple:
                 "info",
                 category="steam",
             )
-        if can_reuse_existing:
-            log("auto_relogin: 检测到现有 steamLoginSecure cookie，用 HTTP API 验证是否仍有效…", "info", category="steam")
-            cookie_status, cookie_reason = _check_steam_cookies(existing_cookies)
-            if cookie_status == "valid":
-                log("auto_relogin: HTTP 验证通过，Cookie 仍有效，无需重新登录", "info", category="steam")
+        if can_reuse_existing and not force_login:
+            from app.account_scope import get_account_runtime_status
+
+            session_info = get_account_runtime_status(account_id).get("steam_session") or {}
+            if session_info.get("status") == "valid":
                 _auto_relogin_last_success = time.time()
-                return True, "auto_ok", "Cookie 验证有效，无需重新登录"
-            if cookie_status == "rate_limited":
-                log(f"auto_relogin: {cookie_reason}，保留现有 Cookie 并停止重登", "warn", category="steam")
-                return False, "rate_limited", _STEAM_RATE_LIMITED_MESSAGE
-            if cookie_status == "unavailable":
-                message = f"Steam 暂时无法验证（{cookie_reason}），Cookie 已保留且不代表过期，请稍后再试"
-                log(f"auto_relogin: {message}", "warn", category="steam")
-                return False, "temporarily_unavailable", message
-            log("auto_relogin: HTTP 验证显示现有 cookie 已过期，继续密码登录", "info", category="steam")
+                return True, "auto_ok", "最近的 Steam 业务请求已确认会话可用"
+            return False, "verification_deferred", "Steam Cookie 已保留，等待库存、钱包或在售列表等真实业务请求确认"
+        if can_reuse_existing and force_login:
+            log("auto_relogin: 业务接口已明确报告登录过期，开始更新 Steam 登录信息", "info", category="steam")
     log("auto_relogin: 开始自动登录…", "info", category="steam")
     cfg = load_app_config_validated()
     steam_guard_dict = _build_steam_guard_dict(cur, cfg)
@@ -607,28 +636,25 @@ def verify_steam_auto_login(account_id: str) -> dict:
         and "steamLoginSecure" in existing_cookies
         and cookie_matches_account
     ):
-        cookie_status, cookie_reason = _check_steam_cookies(existing_cookies, expected_steam_id)
-        if cookie_status == "valid":
-            try:
-                steam_id = cookie_steam_id or expected_steam_id
-                dn, av = fetch_steam_profile_via_api(steam_id, existing_cookies)
-                update_account(
-                    account_id,
-                    steam_id=steam_id,
-                    display_name=dn or acc.get("display_name", ""),
-                    avatar_url=av or acc.get("avatar_url", ""),
-                )
-            except Exception:
-                pass
-            return {"ok": True, "status": "cookie_ok", "message": "Steam Cookie 验证有效"}
-        if cookie_status == "rate_limited":
-            return {"ok": False, "status": "rate_limited", "message": _STEAM_RATE_LIMITED_MESSAGE}
-        if cookie_status == "unavailable":
+        from app.account_scope import get_account_runtime_status
+
+        session_info = get_account_runtime_status(account_id).get("steam_session") or {}
+        if session_info.get("status") == "valid":
             return {
-                "ok": False,
-                "status": "temporarily_unavailable",
-                "message": f"Steam 暂时无法验证（{cookie_reason}），Cookie 已保留且不代表过期，请稍后再试",
+                "ok": True,
+                "status": "business_ok",
+                "message": f"Steam 会话可用（{session_info.get('last_ok_source') or '真实业务请求'}已确认）",
+                "session": session_info,
             }
+        return {
+            "ok": True,
+            "status": "verification_deferred",
+            "message": "Steam Cookie 已配置且账号一致，正在通过钱包等真实业务请求确认",
+            "session": session_info,
+        }
+    if existing_cookies and "steamLoginSecure" in existing_cookies and not cookie_matches_account:
+        record_steam_session_issue("invalid", "当前账号与 Steam Cookie 所属账号不一致", account_id)
+        return {"ok": False, "status": "invalid", "message": "当前账号与 Steam Cookie 所属账号不一致，请更新 Steam 信息"}
 
     cfg = load_app_config_validated()
     steam_guard_dict = _build_steam_guard_dict(acc, cfg)

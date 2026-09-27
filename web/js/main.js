@@ -13,6 +13,23 @@ function formatInventoryUnlockTime(d) {
   const minute = String(d.getMinutes()).padStart(2, "0");
   return `${year}-${month}-${day} ${hour}:${minute}`;
 }
+
+async function recordUserAction(action, phase = "start", options = {}) {
+  try {
+    await fetchJson(API + "/log/user-action", {
+      method: "POST",
+      body: JSON.stringify({
+        action,
+        phase,
+        ok: options.ok,
+        partial: !!options.partial,
+        summary: options.summary || "",
+      }),
+    });
+  } catch {
+    // Logging must never block or change the requested operation.
+  }
+}
 async function tabSwitch(name) {
   console.log("tabSwitch called with name:", name);
   const activePanel = document.querySelector(".panel.active");
@@ -168,6 +185,7 @@ async function refreshStatus() {
       const t = el("pay-type");
       if (t) t.textContent = p.name ? "订单: " + p.name : "";
       box.dataset.payUrl = p.pay_url;
+      box.dataset.orderId = p.order_id || "";
       const qrWrap = el("pay-qrcode-wrap");
       const qrBox = el("pay-qrcode");
       if (p.pay_type === "wechat" && qrWrap && qrBox && typeof QRCode !== "undefined") {
@@ -185,6 +203,7 @@ async function refreshStatus() {
     } else {
       box.classList.add("hidden");
       box.dataset.payUrl = "";
+      box.dataset.orderId = "";
       const qrWrap = el("pay-qrcode-wrap");
       const qrBox = el("pay-qrcode");
       if (qrWrap) qrWrap.classList.add("hidden");
@@ -200,13 +219,22 @@ async function refreshStatus() {
     };
     animateValue(el("stat-total-purchased"), s.total_invested ?? s.total_purchased ?? 0);
     animateValue(el("stat-total-sold"), s.total_sold ?? 0);
-    const diffEl = el("stat-diff");
-    if (s.total_profit != null) {
-      animateValue(diffEl, s.total_profit);
-      diffEl.classList.remove("text-ok", "text-bad");
-      if (s.total_profit > 0) diffEl.classList.add("text-ok");
-      else if (s.total_profit < 0) diffEl.classList.add("text-bad");
-    } else set("stat-diff", "—");
+    animateValue(el("stat-total-sold-after-tax"), s.total_sold_after_tax ?? 0);
+    animateValue(el("stat-total-sold-cost"), s.total_sold_cost ?? 0);
+    const paintProfit = (id, value) => {
+      const target = el(id);
+      if (!target) return;
+      target.classList.remove("text-ok", "text-bad");
+      if (value == null) {
+        target.textContent = "—";
+        return;
+      }
+      animateValue(target, value);
+      if (value > 0) target.classList.add("text-ok");
+      else if (value < 0) target.classList.add("text-bad");
+    };
+    paintProfit("stat-conversion-profit", s.total_conversion_profit);
+    paintProfit("stat-diff", s.total_self_use_profit ?? s.total_profit);
     const ratioEl = el("stat-ratio");
     if (s.discount_ratio != null) {
       animateValue(ratioEl, s.discount_ratio, 400);
@@ -252,6 +280,7 @@ async function refreshBuffBalance() {
     button.disabled = true;
     button.classList.add("is-loading");
   }
+  await recordUserAction("refresh_buff_balance");
   try {
     const result = await fetchJson(API + "/buff/balance/refresh", { method: "POST" });
     if (!result.ok) throw new Error(result.error || "暂时无法读取 BUFF 可用资金");
@@ -261,8 +290,16 @@ async function refreshBuffBalance() {
       "BUFF 可用资金已更新",
       balance == null ? "已完成查询" : `当前 ¥${Number(balance).toFixed(2)}`,
     );
+    await recordUserAction("refresh_buff_balance", "result", {
+      ok: true,
+      summary: balance == null ? "成功，已完成查询" : `成功，当前可用资金 ¥${Number(balance).toFixed(2)}`,
+    });
   } catch (e) {
     toast("BUFF 余额刷新失败", e.message || "请稍后重试");
+    await recordUserAction("refresh_buff_balance", "result", {
+      ok: false,
+      summary: `失败，原因：${e.message || "暂时无法读取 BUFF 可用资金"}`,
+    });
   } finally {
     if (button) {
       button.disabled = false;
@@ -272,6 +309,81 @@ async function refreshBuffBalance() {
 }
 let reloginType = "steam";
 let inventoryRefreshInFlight = false;
+let inventoryOwnershipView = "managed";
+let inventorySortState = { key: "name", direction: "asc" };
+
+function inventoryRowSortValue(row, key) {
+  const attr = `sort${key.charAt(0).toUpperCase()}${key.slice(1)}`;
+  return row.dataset[attr] ?? "";
+}
+
+function applyInventoryViewAndSort() {
+  const tbody = document.querySelector("#inv-table tbody");
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll("tr[data-inventory-ownership]"));
+  const managedCount = rows.filter((row) => row.dataset.inventoryOwnership === "managed").length;
+  const personalCount = rows.length - managedCount;
+  const managedCountEl = el("inv-managed-count");
+  const personalCountEl = el("inv-personal-count");
+  if (managedCountEl) managedCountEl.textContent = String(managedCount);
+  if (personalCountEl) personalCountEl.textContent = String(personalCount);
+
+  const numericKeys = new Set(["sellable", "tradable", "unlock", "price"]);
+  const { key, direction } = inventorySortState;
+  rows.sort((a, b) => {
+    const av = inventoryRowSortValue(a, key);
+    const bv = inventoryRowSortValue(b, key);
+    let result;
+    if (numericKeys.has(key)) {
+      result = (Number(av) || 0) - (Number(bv) || 0);
+    } else {
+      result = String(av).localeCompare(String(bv), "zh-CN", { numeric: true, sensitivity: "base" });
+    }
+    if (result === 0) {
+      result = String(a.dataset.sortName || "").localeCompare(
+        String(b.dataset.sortName || ""),
+        "zh-CN",
+        { numeric: true, sensitivity: "base" },
+      );
+    }
+    return direction === "desc" ? -result : result;
+  });
+  rows.forEach((row) => {
+    row.hidden = row.dataset.inventoryOwnership !== inventoryOwnershipView;
+    tbody.appendChild(row);
+  });
+
+  document.querySelectorAll(".inventory-view-tab").forEach((button) => {
+    const active = button.dataset.inventoryView === inventoryOwnershipView;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll(".inventory-sort-button").forEach((button) => {
+    if (button.dataset.inventorySort === key) button.dataset.direction = direction;
+    else delete button.dataset.direction;
+  });
+}
+
+function setupInventoryTableControls() {
+  document.querySelectorAll(".inventory-view-tab").forEach((button) => {
+    button.addEventListener("click", () => {
+      inventoryOwnershipView = button.dataset.inventoryView === "personal" ? "personal" : "managed";
+      applyInventoryViewAndSort();
+    });
+  });
+  document.querySelectorAll(".inventory-sort-button").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.inventorySort || "name";
+      if (inventorySortState.key === key) {
+        inventorySortState.direction = inventorySortState.direction === "asc" ? "desc" : "asc";
+      } else {
+        inventorySortState = { key, direction: "asc" };
+      }
+      applyInventoryViewAndSort();
+    });
+  });
+}
+
 function showReloginModal(type, opts = {}) {
   reloginType = type || "steam";
   const overlay = el("relogin-overlay");
@@ -289,12 +401,17 @@ function showReloginModal(type, opts = {}) {
       if (msg) msg.textContent = "登录已过期，请按当前运行环境打开浏览器登录 Buff，或手动填写 Cookie 后继续。";
     }
   } else {
-    if (title) title.textContent = "Steam 登录已过期";
-    if (opts.reason === "need_2fa") {
+    if (opts.reason === "manual_update") {
+      if (title) title.textContent = "更新 Steam 登录信息";
+      if (msg) msg.textContent = "请打开浏览器登录当前 Steam 账号；完成后保存新的 Cookie，系统将在下一次真实业务请求中确认会话。";
+    } else if (opts.reason === "need_2fa") {
+      if (title) title.textContent = "Steam 需要二次验证";
       if (msg) msg.textContent = "需要二次验证（验证码），请点击下方按钮打开浏览器并完成 Steam 登录。";
     } else if (opts.error) {
+      if (title) title.textContent = "Steam 登录需要处理";
       if (msg) msg.textContent = compactErrorText(opts.error, 220);
     } else {
+      if (title) title.textContent = "Steam 登录已过期";
       if (msg) msg.textContent = "登录已过期，请按当前运行环境打开浏览器登录 Steam，或手动填写 Cookie 后继续。";
     }
   }
@@ -310,15 +427,32 @@ function hideReloginModal() {
   const overlay = el("relogin-overlay");
   if (overlay) overlay.classList.add("hidden");
 }
-async function refreshInventory(forceRefresh = true, triggerSell = false) {
-  if (inventoryRefreshInFlight) return;
+async function refreshInventory(forceRefresh = true, triggerSell = false, userAction = false) {
+  if (inventoryRefreshInFlight) {
+    if (userAction) {
+      await recordUserAction("refresh_inventory");
+      await recordUserAction("refresh_inventory", "result", {
+        ok: false,
+        partial: true,
+        summary: "未重复执行，原因：已有一次库存刷新正在进行",
+      });
+    }
+    return false;
+  }
   inventoryRefreshInFlight = true;
+  if (userAction) await recordUserAction("refresh_inventory");
   try {
     const query = forceRefresh
       ? `?refresh=1${triggerSell ? "&trigger_sell=1" : ""}`
       : "";
     const d = await fetchJson(API + "/inventory" + query);
     if (d.auth_expired && _hasAnyAccount) {
+      if (userAction) {
+        await recordUserAction("refresh_inventory", "result", {
+          ok: false,
+          summary: `失败，原因：${d.error || "Steam 登录状态需要处理"}`,
+        });
+      }
       showReloginModal("steam", { reason: d.auth_expired_reason, error: d.error });
       return;
     }
@@ -393,6 +527,7 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
         ? `<a href="${steamUrl}" target="_blank" rel="noopener" class="link-steam">Steam</a> <a href="${buffUrl}" target="_blank" rel="noopener" class="link-buff">Buff</a>`
         : "—";
       const ownershipMode = it.ownership_source === "manual" ? it.ownership_mode : "auto";
+      const effectiveOwnership = it.managed_by_aetherswap ? "managed" : "personal";
       const autoOwnershipLabel = it.managed_by_aetherswap ? "自动判断：托管" : "自动判断：个人";
       const ownershipHtml = `
         <select class="inventory-ownership-select" data-assetid="${escapeHtml(String(it.assetid || ""))}" data-current="${escapeHtml(ownershipMode)}" title="设置该物品是否允许自动出售">
@@ -401,7 +536,15 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
           <option value="managed" ${ownershipMode === "managed" ? "selected" : ""}>自动托管</option>
         </select>`;
       rowHtmls.push(`
-        <tr><td>${escapeHtml(fullName)}</td>
+        <tr data-inventory-ownership="${effectiveOwnership}"
+          data-sort-name="${escapeHtml(fullName)}"
+          data-sort-ownership="${effectiveOwnership}"
+          data-sort-wear="${escapeHtml(wear)}"
+          data-sort-sellable="${isListed ? 2 : (it.can_sell ? 1 : 0)}"
+          data-sort-tradable="${isListed ? 2 : (it.can_trade ? 1 : 0)}"
+          data-sort-unlock="${cooldownAt}"
+          data-sort-price="${lowest}"
+          data-sort-status="${escapeHtml(statusLabel)}"><td>${escapeHtml(fullName)}</td>
         <td>${ownershipHtml}</td>
         <td>${escapeHtml(wear)}</td>
         <td class="inv-links">${linksHtml}</td>
@@ -410,9 +553,10 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
         <td>${timeHtml}</td>
         <td class="mono">${escapeHtml(lowestStr)}</td>
         <td>${statusHtml}</td></tr>
-      `);
+    `);
     }
     tbody.innerHTML = rowHtmls.join("");
+    applyInventoryViewAndSort();
     tbody.querySelectorAll(".inventory-ownership-select").forEach((select) => {
       select.addEventListener("change", async () => {
         const previous = select.dataset.current || "auto";
@@ -455,20 +599,44 @@ async function refreshInventory(forceRefresh = true, triggerSell = false) {
     if (v) v.textContent = totalValue.toFixed(2);
     const taxEl = el("inv-tax-value");
     if (taxEl) taxEl.textContent = (totalValue / 1.15).toFixed(2);
+    if (userAction) {
+      await recordUserAction("refresh_inventory", "result", {
+        ok: !d.error,
+        partial: !!d.error && items.length > 0,
+        summary: d.error
+          ? `${items.length ? "部分完成" : "失败"}，读取 ${items.length} 件；原因：${d.error}`
+          : `成功，读取 ${items.length} 件库存`,
+      });
+    }
+    return true;
   } catch (e) {
     toast("刷新库存失败", e.message || "请检查 Steam Cookie");
+    if (userAction) {
+      await recordUserAction("refresh_inventory", "result", {
+        ok: false,
+        summary: `失败，原因：${e.message || "请检查 Steam Cookie"}`,
+      });
+    }
+    return false;
   } finally {
     inventoryRefreshInFlight = false;
   }
 }
-async function refreshMarketPrices(showResult = false) {
+async function refreshMarketPrices(showResult = false, userAction = false) {
   const btn = el("btn-refresh-holdings-prices");
   if (btn) { btn.disabled = true; btn.textContent = "刷新中..."; }
+  if (userAction) await recordUserAction("refresh_prices");
   try {
     const d = await fetchJson(API + "/market-prices");
     const prices = d.prices || {};
     if (Object.keys(prices).length === 0) {
       if (showResult) toast("没有可刷新的商品价格");
+      if (userAction) {
+        await recordUserAction("refresh_prices", "result", {
+          ok: false,
+          summary: `失败，原因：${d.error || "没有获取到可更新的商品价格"}`,
+        });
+      }
       return false;
     }
     const updatedAt = Number(d.updated_at) > 0 ? new Date(Number(d.updated_at) * 1000) : new Date();
@@ -488,6 +656,7 @@ async function refreshMarketPrices(showResult = false) {
           const price = prices[name];
           if (price != null) {
             priceTd.textContent = price.toFixed(2);
+            row.dataset.sortPrice = String(price);
           }
         });
         rows.forEach((row) => {
@@ -514,18 +683,31 @@ async function refreshMarketPrices(showResult = false) {
       await refreshTransactions();
     }
     if (showResult) toast("商品现价已更新", `更新 ${d.updated_names || Object.keys(prices).length} 个商品名称`);
+    if (userAction) {
+      await recordUserAction("refresh_prices", "result", {
+        ok: true,
+        summary: `成功，更新 ${d.updated_names || Object.keys(prices).length} 个商品名称、${d.updated_records || 0} 条持仓记录`,
+      });
+    }
     return true;
   } catch (e) {
     if (showResult) toast("刷新商品现价失败", e.message || "请稍后重试");
+    if (userAction) {
+      await recordUserAction("refresh_prices", "result", {
+        ok: false,
+        summary: `失败，原因：${e.message || "请稍后重试"}`,
+      });
+    }
     return false;
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = "刷新商品现价"; }
   }
 }
 
-async function syncReceiptStatus(showResult = true) {
+async function syncReceiptStatus(showResult = true, userAction = false) {
   const btn = el("btn-sync-receipts");
   if (btn) { btn.disabled = true; btn.textContent = "同步中..."; }
+  if (userAction) await recordUserAction("sync_receipts");
   try {
     const d = await fetchJson(API + "/inventory/sync-receipts", { method: "POST" });
     await refreshInventory(false, false);
@@ -536,9 +718,34 @@ async function syncReceiptStatus(showResult = true) {
         `本次确认入库 ${d.received || 0} 件，更新订单 ${d.orders_changed || 0} 条${d.ambiguous ? `；${d.ambiguous} 条同名库存无法唯一匹配，需人工核对` : ""}${d.error ? "；" + d.error : ""}`
       );
     }
+    if (userAction) {
+      const received = Number(d.received) || 0;
+      const ambiguous = Number(d.ambiguous) || 0;
+      const unresolved = Number(d.unresolved) || 0;
+      const notFound = Math.max(0, unresolved - ambiguous);
+      const parts = [];
+      if (received > 0) parts.push(`成功绑定 ${received} 件`);
+      if (ambiguous > 0) parts.push(`失败 ${ambiguous} 件，原因：库存里已有同名物品，assetid 获取冲突`);
+      if (notFound > 0) parts.push(`${notFound} 件尚未在 Steam 库存中发现`);
+      if ((Number(d.orders_changed) || 0) > 0) parts.push(`更新订单 ${Number(d.orders_changed)} 条`);
+      if (!parts.length) parts.push("完成，未发现需要更新的持仓");
+      if (d.error) parts.push(`错误：${d.error}`);
+      const partial = !!d.error || unresolved > 0;
+      await recordUserAction("sync_receipts", "result", {
+        ok: !!d.ok && !partial,
+        partial: !!d.ok && partial,
+        summary: parts.join("；"),
+      });
+    }
     return !!d.ok;
   } catch (e) {
     if (showResult) toast("同步入库状态失败", e.message || "请稍后重试");
+    if (userAction) {
+      await recordUserAction("sync_receipts", "result", {
+        ok: false,
+        summary: `失败，原因：${e.message || "请稍后重试"}`,
+      });
+    }
     return false;
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = "同步入库状态"; }
@@ -548,14 +755,27 @@ async function syncReceiptStatus(showResult = true) {
 async function refreshAllHoldings() {
   const btn = el("btn-refresh-all-holdings");
   if (btn) { btn.disabled = true; btn.textContent = "刷新中..."; }
+  await recordUserAction("refresh_all_holdings");
   try {
-    const receiptsOk = await syncReceiptStatus(false);
-    if (!receiptsOk) await refreshInventory(true, false);
-    const pricesOk = await refreshMarketPrices(false);
+    const receiptsOk = await syncReceiptStatus(false, false);
+    if (!receiptsOk) await refreshInventory(true, false, false);
+    const pricesOk = await refreshMarketPrices(false, false);
     await refreshTransactions();
-    toast(pricesOk ? "持有信息已全部刷新" : "持有状态已刷新", pricesOk ? "入库、库存和现价均已更新" : "现价未能更新，请稍后单独重试");
+    toast(pricesOk ? "持仓信息已全部刷新" : "持仓状态已刷新", pricesOk ? "入库、库存和现价均已更新" : "现价未能更新，请稍后单独重试");
+    await recordUserAction("refresh_all_holdings", "result", {
+      ok: receiptsOk && pricesOk,
+      partial: receiptsOk !== pricesOk,
+      summary: receiptsOk && pricesOk
+        ? "成功，入库状态、Steam 库存和商品现价均已更新"
+        : `部分完成，入库状态${receiptsOk ? "成功" : "失败"}、商品现价${pricesOk ? "成功" : "失败"}`,
+    });
+  } catch (e) {
+    await recordUserAction("refresh_all_holdings", "result", {
+      ok: false,
+      summary: `失败，原因：${e.message || "请稍后重试"}`,
+    });
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "刷新全部持有信息"; }
+    if (btn) { btn.disabled = false; btn.textContent = "刷新全部持仓信息"; }
   }
 }
 function getInventoryCache() {
@@ -757,10 +977,11 @@ function bindEvents() {
       .then(() => toast("设置已保存"))
       .catch((e) => toast("保存失败", e.message || "请稍后再试"))
   );
-  el("btn-refresh-inventory")?.addEventListener("click", () => refreshInventory(true, false));
+  el("btn-check-c5")?.addEventListener("click", checkC5Connection);
+  el("btn-refresh-inventory")?.addEventListener("click", () => refreshInventory(true, false, true));
   el("btn-refresh-buff-balance")?.addEventListener("click", refreshBuffBalance);
-  el("btn-sync-receipts")?.addEventListener("click", () => syncReceiptStatus(true));
-  el("btn-refresh-holdings-prices")?.addEventListener("click", () => refreshMarketPrices(true));
+  el("btn-sync-receipts")?.addEventListener("click", () => syncReceiptStatus(true, true));
+  el("btn-refresh-holdings-prices")?.addEventListener("click", () => refreshMarketPrices(true, true));
   el("btn-refresh-all-holdings")?.addEventListener("click", refreshAllHoldings);
   el("btn-refresh-sales")?.addEventListener("click", () => refreshTransactions());
   el("btn-add-account")?.addEventListener("click", () => openAccountForm());
@@ -1110,6 +1331,7 @@ async function init() {
   }
   if (typeof _updateScrollBtn === "function") _updateScrollBtn();
   bindEvents();
+  setupInventoryTableControls();
   setupScrollToTop();
   setupKeyboardShortcuts();
   setupButtonInteractions();
@@ -1137,8 +1359,8 @@ async function init() {
     // 如果弹出了引导，则不对无配置的 Steam 发起可能超时的库存请求，仅设置自动刷新
     setupInventoryAutoRefresh();
   } else {
-    // 异步加载库存，避免因 Steam 网络问题阻塞页面其余部分的初始化和展示
-    refreshInventory(true).then(() => {
+    // 首次库存刷新同时检查已在离线期间解禁的托管商品。
+    refreshInventory(true, true).then(() => {
       setupInventoryAutoRefresh();
     });
   }

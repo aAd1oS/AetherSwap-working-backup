@@ -19,7 +19,13 @@ from app.config_loader import (
     update_buff_creds,
     update_steam_creds,
 )
-from app.accounts import get_current_account, get_profile_dir, set_current, update_account
+from app.accounts import (
+    get_buff_profile_dir,
+    get_current_account,
+    get_profile_dir,
+    set_current,
+    update_account,
+)
 from app.services.steam_auth import (
     fetch_steam_profile_via_api,
     try_steam_auto_relogin,
@@ -175,7 +181,15 @@ def _browser_network_kwargs(relogin_type: str) -> dict:
         args.append("--no-proxy-server")
         return kwargs
     from utils.proxy_manager import get_proxy_manager
-    proxies = get_proxy_manager().get_steam_proxies() or {}
+    manager = get_proxy_manager()
+    route = manager.get_steam_route() if hasattr(manager, "get_steam_route") else {
+        "name": "project_proxy",
+        "proxies": manager.get_steam_proxies(),
+    }
+    proxies = route.get("proxies") or {}
+    if route.get("name") in {"local_accelerator", "direct"}:
+        args.append("--no-proxy-server")
+        return kwargs
     server = proxies.get("https") or proxies.get("http")
     if server:
         kwargs["proxy"] = {"server": server}
@@ -234,7 +248,7 @@ def _maybe_resume_after_buff_cookie_update() -> None:
                 log(f"自动恢复流水线失败: {resume_err}", "warn", category="system")
     except Exception as resume_err:
         log(f"Buff Cookie 更新后的恢复检查失败: {resume_err}", "warn", category="system")
-def _relogin_worker(relogin_type: str, steam_account_id: Optional[str] = None) -> None:
+def _relogin_worker_impl(relogin_type: str, target_account_id: Optional[str] = None) -> None:
     global _relogin_playwright, _relogin_browser, _relogin_context, _relogin_error, _relogin_success
     p = None
     context = None
@@ -244,9 +258,9 @@ def _relogin_worker(relogin_type: str, steam_account_id: Optional[str] = None) -
         p = sync_playwright().start()
         if relogin_type == "steam":
             cur = get_current_account()
-            profile_dir = get_profile_dir(steam_account_id or (cur.get("id") if cur else None))
+            profile_dir = get_profile_dir(target_account_id or (cur.get("id") if cur else None))
         else:
-            profile_dir = Path(__file__).resolve().parent.parent.parent / "config" / "playwright_buff"
+            profile_dir = get_buff_profile_dir(target_account_id)
         profile_dir.mkdir(parents=True, exist_ok=True)
         context, temp_profile_dir = _launch_relogin_context(p, profile_dir, relogin_type)
         page = context.pages[0] if context.pages else context.new_page()
@@ -293,7 +307,7 @@ def _relogin_worker(relogin_type: str, steam_account_id: Optional[str] = None) -
                             elif "||" in v:
                                 steam_id = v.split("||")[0].strip()
                             break
-                    target_account_id = steam_account_id or ((get_current_account() or {}).get("id"))
+                    target_account_id = target_account_id or ((get_current_account() or {}).get("id"))
                     update_steam_creds(
                         cookie_str,
                         session_id,
@@ -307,7 +321,7 @@ def _relogin_worker(relogin_type: str, steam_account_id: Optional[str] = None) -
                 if not _has_browser_cookie(cookies, "session"):
                     _relogin_error = "未检测到 Buff 登录 session，请确认弹出的浏览器已经完成登录或验证后再点击完成。"
                 else:
-                    update_buff_creds(cookie_str)
+                    update_buff_creds(cookie_str, account_id=target_account_id)
                     get_buff_request_protection().mark_manual_cookie_updated()
                     set_buff_auth_expired(False)
                     set_buff_verification_required(False)
@@ -347,6 +361,19 @@ def _relogin_worker(relogin_type: str, steam_account_id: Optional[str] = None) -
             _relogin_browser = None
             _relogin_context = None
         _relogin_done.set()
+
+
+def _relogin_worker(relogin_type: str, target_account_id: Optional[str] = None) -> None:
+    from app.account_operations import AccountOperationConflict, account_operation
+    operation_name = "Steam 登录更新" if relogin_type == "steam" else "BUFF 登录更新"
+    try:
+        with account_operation(operation_name, target_account_id):
+            _relogin_worker_impl(relogin_type, target_account_id)
+    except AccountOperationConflict as exc:
+        global _relogin_error
+        _relogin_error = str(exc)
+        _relogin_ready.set()
+        _relogin_done.set()
 def _relogin_start(relogin_type: str):
     global _relogin_type, _relogin_error, _relogin_success, _relogin_playwright, _relogin_browser, _relogin_context
     profile = get_runtime_profile()
@@ -375,12 +402,10 @@ def _relogin_start(relogin_type: str):
     _relogin_ready.clear()
     _relogin_done.clear()
     _relogin_wake.clear()
-    steam_account_id = None
-    if relogin_type == "steam":
-        steam_account_id = str((get_current_account() or {}).get("id") or "") or None
+    target_account_id = str((get_current_account() or {}).get("id") or "") or None
     t = threading.Thread(
         target=_relogin_worker,
-        args=(relogin_type, steam_account_id),
+        args=(relogin_type, target_account_id),
         daemon=True,
     )
     t.start()

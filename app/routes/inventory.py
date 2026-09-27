@@ -147,13 +147,14 @@ def _enrich_inventory_with_steam_prices(items: list, old_items: list) -> None:
     _sync_inventory_metadata(items, purchase_by_assetid)
     for it in items:
         name = (it.get("market_hash_name") or it.get("name") or "").strip()
-        purchase = purchase_by_assetid.get(str(it.get("assetid") or "").strip()) or purchase_by_name.get(name) or {}
-        local_price = purchase.get("current_market_price")
+        asset_purchase = purchase_by_assetid.get(str(it.get("assetid") or "").strip()) or {}
+        price_purchase = asset_purchase or purchase_by_name.get(name) or {}
+        local_price = price_purchase.get("current_market_price")
         if local_price is None:
-            local_price = purchase.get("market_price")
+            local_price = price_purchase.get("market_price")
         it["lowest_price"] = old_price_by_name.get(name, local_price or 0)
-        if not it.get("cooldown_at") and purchase.get("tradable_at"):
-            cooldown_at = float(purchase["tradable_at"])
+        if not it.get("cooldown_at") and asset_purchase.get("tradable_at"):
+            cooldown_at = float(asset_purchase["tradable_at"])
             it["cooldown_at"] = cooldown_at
             it["cooldown_at_iso"] = datetime.fromtimestamp(
                 cooldown_at,
@@ -173,9 +174,8 @@ def _enrich_inventory_with_steam_prices(items: list, old_items: list) -> None:
             it["lowest_price"] = prices[name]
 def _try_steam_auto_relogin():
     from app.services.steam_auth import try_steam_auto_relogin
-    return try_steam_auto_relogin()
-@router.get("/api/inventory")
-def api_inventory(refresh: bool = False, trigger_sell: bool = False):
+    return try_steam_auto_relogin(force_login=True)
+def _api_inventory_impl(refresh: bool = False, trigger_sell: bool = False):
     if refresh or not get_inventory():
         if not is_steam_background_allowed():
             return _inventory_response()
@@ -243,6 +243,18 @@ def api_inventory(refresh: bool = False, trigger_sell: bool = False):
         if trigger_sell:
             run_sell_phase_on_inventory_update(items)
     return _inventory_response()
+
+
+@router.get("/api/inventory")
+def api_inventory(refresh: bool = False, trigger_sell: bool = False):
+    if not refresh and get_inventory():
+        return _inventory_response()
+    from app.account_operations import AccountOperationConflict, account_operation
+    try:
+        with account_operation("库存刷新"):
+            return _api_inventory_impl(refresh=refresh, trigger_sell=trigger_sell)
+    except AccountOperationConflict as exc:
+        return _inventory_response(error=str(exc))
 @router.get("/api/market-prices")
 def api_market_prices():
     """统一批量市场价查询接口.
@@ -278,8 +290,7 @@ def api_market_prices():
         "updated_records": updated_records,
     }
 
-@router.post("/api/inventory/sync-receipts")
-def api_sync_receipts():
+def _api_sync_receipts_impl():
     """Process existing incoming trades and refresh local receipt state only."""
     if not is_steam_background_allowed():
         return {"ok": False, "error": "Steam 后台请求当前不可用"}
@@ -313,12 +324,27 @@ def api_sync_receipts():
         )
         received += int(inventory_reconcile.get("matched") or 0)
     reconciled = reconcile_orders_from_local_records()
+    unresolved = sum(
+        1 for purchase in (get_purchases() or [])
+        if purchase.get("pending_receipt") and not purchase.get("assetid")
+    )
     return {
         "ok": bool(ok),
         "received": int(received or 0),
         "inventory_matched": int(inventory_reconcile.get("matched") or 0),
         "ambiguous": int(inventory_reconcile.get("ambiguous") or 0),
+        "unresolved": int(unresolved),
         "items": get_inventory(),
         "orders_changed": reconciled.get("changed", 0),
         "error": None if ok else err,
     }
+
+
+@router.post("/api/inventory/sync-receipts")
+def api_sync_receipts():
+    from app.account_operations import AccountOperationConflict, account_operation
+    try:
+        with account_operation("手动收货同步"):
+            return _api_sync_receipts_impl()
+    except AccountOperationConflict as exc:
+        return {"ok": False, "error": str(exc)}

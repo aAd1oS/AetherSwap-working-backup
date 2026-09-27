@@ -1,6 +1,10 @@
 
 let inventoryRefreshSeconds = 600;
 let inventoryTimer = null;
+let inventoryResumeTimer = null;
+let inventoryResumeHeartbeatAt = Date.now();
+const INVENTORY_RESUME_HEARTBEAT_MS = 30000;
+const INVENTORY_RESUME_GAP_MS = 90000;
 let currentPriceRefreshMinutes = 10;
 let currentPriceTimer = null;
 async function loadConfig() {
@@ -18,6 +22,7 @@ async function loadConfig() {
   }
   const i = c.iflow || {};
   const b = c.buff || {};
+  const c5 = c.c5 || {};
   const p = c.pipeline || {};
   const s = c.stability || {};
   const inv = c.inventory || {};
@@ -40,6 +45,16 @@ async function loadConfig() {
   if (gBalanceFallback) gBalanceFallback.value = (b.balance_fallback_method || "wechat").toLowerCase();
   const gBalanceAck = el("cfg-balance-auto-pay-acknowledged");
   if (gBalanceAck) gBalanceAck.checked = !!b.balance_auto_pay_acknowledged;
+  const gC5PriceCompare = el("cfg-c5-price-compare-enabled");
+  if (gC5PriceCompare) gC5PriceCompare.checked = !!c5.price_compare_enabled;
+  const gC5AppKey = el("cfg-c5-app-key");
+  if (gC5AppKey) gC5AppKey.value = c5.app_key ?? "";
+  const gC5Manual = el("cfg-c5-manual-recommendation-enabled");
+  if (gC5Manual) gC5Manual.checked = !!c5.manual_recommendation_enabled;
+  const gC5SavingsPercent = el("cfg-c5-min-savings-percent");
+  if (gC5SavingsPercent) gC5SavingsPercent.value = c5.min_savings_percent ?? 2;
+  const gC5SavingsAmount = el("cfg-c5-min-savings-amount");
+  if (gC5SavingsAmount) gC5SavingsAmount.value = c5.min_savings_amount ?? 0.2;
   const gTarget = el("cfg-target_balance");
   if (gTarget) gTarget.value = p.target_balance ?? "";
   const gMaxDisc = el("cfg-max_discount");
@@ -72,6 +87,12 @@ async function loadConfig() {
   if (gUseVwap) gUseVwap.checked = s.use_vwap !== false;
   const gRetrySec = el("cfg-retry_interval_seconds");
   if (gRetrySec) gRetrySec.value = p.retry_interval_seconds ?? "";
+  const gMaxRunRounds = el("cfg-max-run-rounds");
+  if (gMaxRunRounds) gMaxRunRounds.value = p.max_run_rounds ?? 0;
+  const gMaxAutoListingPrice = el("cfg-max-auto-listing-price-cny");
+  if (gMaxAutoListingPrice) gMaxAutoListingPrice.value = p.max_auto_listing_price_cny ?? 50;
+  const gBuffProtectionRecoveryCap = el("cfg-buff-protection-recovery-candidate-cap");
+  if (gBuffProtectionRecoveryCap) gBuffProtectionRecoveryCap.value = p.buff_protection_recovery_candidate_cap ?? 30;
   const verboseCb = el("cfg-verbose-debug");
   if (verboseCb) verboseCb.checked = !!p.verbose_debug;
   const steamListingsDebugCb = el("cfg-steam-listings-debug");
@@ -90,6 +111,10 @@ async function loadConfig() {
   if (maxListingsPerItem) maxListingsPerItem.value = p.max_listings_per_item ?? "";
   const listingDelayEl = el("cfg-listing_delay_seconds");
   if (listingDelayEl) listingDelayEl.value = p.listing_delay_seconds ?? "";
+  const stagedListingMode = el("cfg-stale-listing-staged-mode-enabled");
+  if (stagedListingMode) stagedListingMode.checked = !!p.stale_listing_staged_mode_enabled;
+  const strategyModuleLogs = el("cfg-strategy-module-logs-enabled");
+  if (strategyModuleLogs) strategyModuleLogs.checked = !!p.strategy_module_logs_enabled;
   const resellRatioEl = el("cfg-resell_ratio");
   if (resellRatioEl) resellRatioEl.value = p.resell_ratio ?? "";
   const safeHardCap = el("cfg-safe_purchase_hard_qty_cap");
@@ -119,6 +144,8 @@ async function loadConfig() {
   if (invInput) invInput.value = inv.refresh_seconds ?? "";
   inventoryRefreshSeconds = parseInt(inv.refresh_seconds, 10) || inventoryRefreshSeconds || 600;
   const n = c.notify || {};
+  const gLark = el("cfg-lark_webhook");
+  if (gLark) gLark.value = n.lark_webhook ?? "";
   const gPush = el("cfg-pushplus_token");
   if (gPush) gPush.value = n.pushplus_token ?? "";
   const gHoldingsReport = el("cfg-holdings_report_interval_hours");
@@ -205,6 +232,13 @@ function formToConfig() {
       game: el("cfg-buff-game") ? el("cfg-buff-game").value.trim() : undefined,
       price_tolerance: el("cfg-price_tolerance") ? parseFloat(el("cfg-price_tolerance").value) || undefined : undefined,
     },
+    c5: {
+      price_compare_enabled: !!el("cfg-c5-price-compare-enabled")?.checked,
+      app_key: el("cfg-c5-app-key") ? el("cfg-c5-app-key").value.trim() : undefined,
+      manual_recommendation_enabled: !!el("cfg-c5-manual-recommendation-enabled")?.checked,
+      min_savings_percent: readNumberInput("cfg-c5-min-savings-percent"),
+      min_savings_amount: readNumberInput("cfg-c5-min-savings-amount"),
+    },
     pipeline: {
       target_balance: el("cfg-target_balance") ? parseFloat(el("cfg-target_balance").value) || undefined : undefined,
       max_discount: el("cfg-max_discount") ? parseFloat(el("cfg-max_discount").value) || undefined : undefined,
@@ -212,6 +246,9 @@ function formToConfig() {
       iflow_top_n: el("cfg-iflow_top_n") ? parseInt(el("cfg-iflow_top_n").value, 10) || undefined : undefined,
       sell_price_ratio: el("cfg-sell_ratio") ? parseFloat(el("cfg-sell_ratio").value) || undefined : undefined,
       retry_interval_seconds: el("cfg-retry_interval_seconds") ? parseInt(el("cfg-retry_interval_seconds").value, 10) || undefined : undefined,
+      max_run_rounds: readIntInput("cfg-max-run-rounds"),
+      max_auto_listing_price_cny: readNumberInput("cfg-max-auto-listing-price-cny"),
+      buff_protection_recovery_candidate_cap: readIntInput("cfg-buff-protection-recovery-candidate-cap"),
       exclude_keywords: el("cfg-exclude_keywords") ? Array.from(
         new Set(
           (el("cfg-exclude_keywords").value || "")
@@ -229,6 +266,8 @@ function formToConfig() {
       sell_trend_days: el("cfg-sell_trend_days") ? parseInt(el("cfg-sell_trend_days").value, 10) || undefined : undefined,
       max_listings_per_item: el("cfg-max_listings_per_item") ? parseInt(el("cfg-max_listings_per_item").value, 10) || undefined : undefined,
       listing_delay_seconds: el("cfg-listing_delay_seconds") ? parseInt(el("cfg-listing_delay_seconds").value, 10) || undefined : undefined,
+      stale_listing_staged_mode_enabled: !!el("cfg-stale-listing-staged-mode-enabled")?.checked,
+      strategy_module_logs_enabled: !!el("cfg-strategy-module-logs-enabled")?.checked,
       resell_ratio: el("cfg-resell_ratio") ? parseFloat(el("cfg-resell_ratio").value) || undefined : undefined,
       safe_purchase_hard_qty_cap: el("cfg-safe_purchase_hard_qty_cap") ? parseInt(el("cfg-safe_purchase_hard_qty_cap").value, 10) : undefined,
       safe_purchase_liquidity_ratio: el("cfg-safe_purchase_liquidity_ratio") ? parseFloat(el("cfg-safe_purchase_liquidity_ratio").value) : undefined,
@@ -259,6 +298,7 @@ function formToConfig() {
       refresh_seconds: el("cfg-inv-refresh") ? parseInt(el("cfg-inv-refresh").value, 10) || undefined : undefined,
     },
     notify: {
+      lark_webhook: el("cfg-lark_webhook") ? el("cfg-lark_webhook").value.trim() : undefined,
       pushplus_token: el("cfg-pushplus_token") ? el("cfg-pushplus_token").value.trim() : undefined,
       holdings_report_interval_hours: el("cfg-holdings_report_interval_hours") ? parseInt(el("cfg-holdings_report_interval_hours").value, 10) : undefined,
       holdings_report_change_threshold_pct: el("cfg-holdings_report_change_threshold_pct") ? parseFloat(el("cfg-holdings_report_change_threshold_pct").value) : undefined,
@@ -313,6 +353,25 @@ async function saveConfigFromForm() {
   await loadConfig();
   setupInventoryAutoRefresh();
 }
+
+async function checkC5Connection() {
+  const button = el("btn-check-c5");
+  if (button) button.disabled = true;
+  try {
+    await saveConfigFromForm();
+    const result = await fetchJson(API + "/c5/check", { method: "POST" });
+    if (!result?.ok) throw new Error(result?.error || "C5 连接检查失败");
+    const balance = result.balance || {};
+    toast(
+      "C5 只读连接正常",
+      `账户余额 ${Number(balance.money_amount || 0).toFixed(2)} 元；交易结算 ${Number(balance.trade_settle_amount || 0).toFixed(2)} 元`
+    );
+  } catch (error) {
+    toast("C5 只读连接失败", error.message || "请检查 app-key 与 IP 白名单");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
 async function startPipeline() {
   try {
     const payMethod = el("cfg-pay_method")?.value;
@@ -345,7 +404,10 @@ async function stopPipeline() {
 }
 async function confirmPayment(ok) {
   try {
-    await fetchJson(API + "/confirm_payment", { method: "POST", body: JSON.stringify({ ok }) });
+    const orderId = el("pending-payment")?.dataset.orderId || "";
+    if (!orderId) throw new Error("当前付款订单已过期，请刷新后重试");
+    const result = await fetchJson(API + "/confirm_payment", { method: "POST", body: JSON.stringify({ order_id: orderId, ok }) });
+    if (!result?.ok) throw new Error(result?.error || "订单确认未被接受");
     el("pending-payment")?.classList.add("hidden");
     toast(ok ? "已确认付款" : "已标记为失败");
     refreshStatus();
@@ -403,6 +465,10 @@ function setupInventoryAutoRefresh() {
     clearInterval(inventoryTimer);
     inventoryTimer = null;
   }
+  if (inventoryResumeTimer) {
+    clearInterval(inventoryResumeTimer);
+    inventoryResumeTimer = null;
+  }
   if (currentPriceTimer) {
     clearInterval(currentPriceTimer);
     currentPriceTimer = null;
@@ -411,6 +477,15 @@ function setupInventoryAutoRefresh() {
     inventoryTimer = setInterval(() => {
       refreshInventory(true, true);
     }, inventoryRefreshSeconds * 1000);
+    inventoryResumeHeartbeatAt = Date.now();
+    inventoryResumeTimer = setInterval(() => {
+      const now = Date.now();
+      const resumeGap = now - inventoryResumeHeartbeatAt;
+      inventoryResumeHeartbeatAt = now;
+      if (resumeGap >= INVENTORY_RESUME_GAP_MS && _hasAnyAccount) {
+        refreshInventory(true, true);
+      }
+    }, INVENTORY_RESUME_HEARTBEAT_MS);
   }
   if (currentPriceRefreshMinutes && currentPriceRefreshMinutes > 0) {
     refreshMarketPrices();
@@ -427,7 +502,7 @@ function _wizardIsFirstTime(cfg, accounts, buffNoCookie) {
   const sg = cfg.steam_guard || {};
   const sc = cfg.steam_confirm || {};
   const n = cfg.notify || {};
-  const noConfig = !sg.shared_secret && !sc.identity_secret && !n.pushplus_token;
+  const noConfig = !sg.shared_secret && !sc.identity_secret && !n.pushplus_token && !n.lark_webhook;
   const noAccount = !accounts || accounts.length === 0;
   // 全未配置 或者 buff cookie 不存在也弹向导
   return (noConfig && noAccount) || buffNoCookie;
@@ -649,15 +724,22 @@ function _showWizard(startAtBuffStep = false) {
         const gIdentSec = el("cfg-steam-identity-secret");
         if (gIdentSec && is) gIdentSec.value = is;
       } else if (currentStep === 2) {
+        const lark = (el("wiz-lark-webhook")?.value || "").trim();
         const tok = (el("wiz-pushplus-token")?.value || "").trim();
-        if (!tok) return;
-        const notify = { ...(cfg.notify || {}), pushplus_token: tok };
+        if (!lark && !tok) return;
+        const notify = {
+          ...(cfg.notify || {}),
+          ...(lark ? { lark_webhook: lark } : {}),
+          ...(tok ? { pushplus_token: tok } : {}),
+        };
         await fetchJson(API + "/config", {
           method: "POST",
           body: JSON.stringify({ config: { ...cfg, notify } }),
         });
         const gPush = el("cfg-pushplus_token");
-        if (gPush) gPush.value = tok;
+        if (gPush && tok) gPush.value = tok;
+        const gLark = el("cfg-lark_webhook");
+        if (gLark && lark) gLark.value = lark;
       }
       // step 3 (Buff) is handled by its own buttons; step 4 is info-only
       try { updateUXStatus(((await fetchJson(API + "/config")).config || {})); } catch { }
@@ -735,7 +817,7 @@ function updateNavBadges(cfg, accounts) {
   const sg = cfg.steam_guard || {};
   const sc = cfg.steam_confirm || {};
   const n = cfg.notify || {};
-  const configOk = sg.shared_secret && sc.identity_secret && n.pushplus_token;
+  const configOk = sg.shared_secret && sc.identity_secret && (n.lark_webhook || n.pushplus_token);
   const accountOk = accounts.length > 0;
 
   const badgeSettings = el("nav-badge-settings");
@@ -765,15 +847,15 @@ function renderGettingStartedCard(cfg, accounts) {
       label: "填写 Steam 令牌密钥（<span class='gs-link' onclick='document.querySelector(\"[data-tab=settings]\").click()'>系统设置 → Steam 令牌</span>）",
     },
     {
-      done: !!n.pushplus_token,
-      label: "填写 PushPlus 推送 Token（<span class='gs-link' onclick='document.querySelector(\"[data-tab=settings]\").click()'>系统设置 → 推送与邮箱</span>）",
+      done: !!n.lark_webhook || !!n.pushplus_token,
+      label: "填写 Lark Webhook 或 PushPlus Token（<span class='gs-link' onclick='document.querySelector(\"[data-tab=settings]\").click()'>系统设置 → 推送与邮箱</span>）",
     },
     {
       done: accounts.length > 0,
       label: "添加 Steam 账号并登录（<span class='gs-link' onclick='document.querySelector(\"[data-tab=accounts]\").click()'>账号管理</span>）",
     },
     {
-      done: accounts.length > 0 && !!sg.shared_secret && !!sc.identity_secret && !!n.pushplus_token,
+      done: accounts.length > 0 && !!sg.shared_secret && !!sc.identity_secret && (!!n.lark_webhook || !!n.pushplus_token),
       label: "返回仪表盘点击「启动任务」🚀",
     },
   ];

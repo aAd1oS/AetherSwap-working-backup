@@ -95,7 +95,9 @@ def scan_cs2_inventory() -> Tuple[bool, List[Dict[str, Any]], str]:
         owner_desc = desc.get("owner_descriptions") or []
         cd_text, cd_ts = _parse_cooldown(owner_desc)
         wear = _parse_wear(desc, market_hash_name)
-        can_trade = tradable == 1 and (not cd_ts or now >= cd_ts)
+        can_trade = tradable == 1 and (
+            not cd_text or (cd_ts > 0 and now >= cd_ts)
+        )
         can_sell = marketable == 1 and can_trade
         items.append(
             {

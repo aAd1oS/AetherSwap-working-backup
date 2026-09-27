@@ -15,6 +15,7 @@ class ProxyEntry(BaseModel):
 class ProxyPoolConfig(BaseModel):
     enabled: bool = False
     strategy: int = 1
+    steam_route_mode: str = "auto"
     test_url: str = "https://ipv4.webshare.io/"
     timeout_seconds: int = 10
     webshare_api_key: str = ""
@@ -24,7 +25,16 @@ class ProxyPoolBody(BaseModel):
 @router.get("/api/proxy/config")
 def api_get_proxy_config():
     cfg = load_app_config_validated()
-    return {"proxy_pool": cfg.get("proxy_pool", {})}
+    route_status = {}
+    try:
+        from utils.proxy_manager import get_proxy_manager
+        route_status = get_proxy_manager().get_steam_route_status()
+    except Exception as exc:
+        route_status = {"route": "error", "reason": type(exc).__name__}
+    return {
+        "proxy_pool": cfg.get("proxy_pool", {}),
+        "steam_route": route_status,
+    }
 @router.post("/api/proxy/config")
 def api_save_proxy_config(body: ProxyPoolBody):
     cfg = load_app_config_validated()

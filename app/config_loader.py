@@ -3,10 +3,8 @@ from copy import deepcopy
 import time as _time
 from app.config_schema import DEFAULTS, _validate_ranges, merge, validate_and_fill
 from config import (
-    get_buff,
     load_app_config,
     save_app_config,
-    update_buff_credentials,
 )
 _config_cache: dict = {}
 _config_cache_ts: float = 0.0
@@ -23,12 +21,37 @@ def get_steam_credentials() -> dict:
     from app.account_scope import get_account_steam_credentials
     return get_account_steam_credentials()
 def get_buff_credentials() -> dict:
-    return get_buff()
+    from app.account_scope import get_account_buff_credentials
+    return get_account_buff_credentials()
+
+
+def _log_steam_credential_update(message: str, level: str) -> None:
+    try:
+        from app.state import log
+        log(message, level, category="steam")
+    except Exception:
+        pass
+
+
 def update_steam_creds(cookies: str, session_id: str, steam_id: str = None, account_id: str = None) -> None:
     from app.account_scope import update_account_steam_credentials
-    update_account_steam_credentials(cookies, session_id, steam_id, account_id=account_id)
-def update_buff_creds(cookies: str) -> None:
-    update_buff_credentials(cookies)
+    try:
+        update_account_steam_credentials(cookies, session_id, steam_id, account_id=account_id)
+    except Exception as exc:
+        _log_steam_credential_update(
+            f"Steam 凭证更新失败：未能写入当前账号（{type(exc).__name__}；敏感值未写入日志）",
+            "error",
+        )
+        raise
+    _log_steam_credential_update(
+        "Steam 凭证更新成功：Cookie 与会话信息已写入当前账号（敏感值未写入日志）",
+        "info",
+    )
+def update_buff_creds(cookies: str, account_id: str = None) -> None:
+    from app.account_scope import update_account_buff_credentials
+    update_account_buff_credentials(cookies, account_id=account_id)
+    from app.services.buff_balance import invalidate_buff_balance_observation
+    invalidate_buff_balance_observation()
 def load_app_config_validated() -> dict:
     global _config_cache, _config_cache_ts, _config_cache_account_id
     from app.accounts import get_current_id
@@ -55,6 +78,7 @@ def save_app_config_validated(data: dict) -> None:
         "device_id": "",
         "enabled": False,
     })
+    global_config.setdefault("c5", {})["app_key"] = ""
     save_app_config(global_config)
     _invalidate_config_cache()  
 

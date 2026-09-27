@@ -148,7 +148,7 @@ def test_relogin_finish_surfaces_worker_error(monkeypatch):
     assert wake.is_set()
 
 
-def test_buff_auto_relogin_success_clears_auth_and_verification(monkeypatch):
+def test_buff_auto_relogin_success_clears_auth_and_verification(monkeypatch, tmp_path):
     from app.services import buff_auth
 
     calls = []
@@ -189,6 +189,8 @@ def test_buff_auto_relogin_success_clears_auth_and_verification(monkeypatch):
     monkeypatch.setitem(sys.modules, "playwright", playwright_pkg)
     monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
     monkeypatch.setattr(buff_auth, "get_buff_credentials", lambda: {"cookies": "session=old"})
+    monkeypatch.setattr(buff_auth, "get_current_id", lambda: "account-a")
+    monkeypatch.setattr(buff_auth, "get_buff_profile_dir", lambda *_args: tmp_path / "buff-profile")
     monkeypatch.setattr(buff_auth, "update_buff_creds", lambda cookie: calls.append(("update", cookie)))
     monkeypatch.setattr(buff_auth, "set_buff_auth_expired", lambda value: calls.append(("auth", value)))
     monkeypatch.setattr(
@@ -593,8 +595,9 @@ def test_steam_cookie_verification_uses_configured_project_proxy(monkeypatch):
     assert session.proxies == configured
 
 
-def test_verify_steam_auto_login_rate_limit_does_not_password_login(monkeypatch):
+def test_verify_steam_with_cookie_defers_to_business_request_without_http_login(monkeypatch):
     from app.services import steam_auth
+    from app import account_scope
 
     monkeypatch.setattr(
         steam_auth,
@@ -618,23 +621,25 @@ def test_verify_steam_auto_login_rate_limit_does_not_password_login(monkeypatch)
     monkeypatch.setattr(
         steam_auth,
         "_check_steam_cookies",
-        lambda cookies, steam_id="": ("rate_limited", "Steam Community HTTP 429"),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dedicated HTTP verification must not run")),
     )
+    monkeypatch.setattr(account_scope, "get_account_runtime_status", lambda account_id: {"steam_session": {"status": "pending"}})
     monkeypatch.setattr(
         steam_auth,
         "_do_steampy_login",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rate limit must not trigger login")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("pending evidence must not trigger login")),
     )
 
     result = steam_auth.verify_steam_auto_login("account-1")
 
-    assert result["ok"] is False
-    assert result["status"] == "rate_limited"
-    assert "Cookie 已保留且不代表过期" in result["message"]
+    assert result["ok"] is True
+    assert result["status"] == "verification_deferred"
+    assert "真实业务请求确认" in result["message"]
 
 
-def test_background_auto_relogin_rate_limit_does_not_password_login(monkeypatch):
+def test_background_keepalive_defers_without_http_or_password_login(monkeypatch):
     from app.services import steam_auth
+    from app import account_scope
 
     monkeypatch.setattr(
         steam_auth,
@@ -658,19 +663,68 @@ def test_background_auto_relogin_rate_limit_does_not_password_login(monkeypatch)
     monkeypatch.setattr(
         steam_auth,
         "_check_steam_cookies",
-        lambda cookies, steam_id="": ("rate_limited", "Steam Community HTTP 429"),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dedicated HTTP verification must not run")),
     )
+    monkeypatch.setattr(account_scope, "get_account_runtime_status", lambda account_id: {"steam_session": {"status": "pending"}})
     monkeypatch.setattr(
         steam_auth,
         "_do_steampy_login",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rate limit must not trigger login")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("keepalive must not trigger login")),
     )
 
     result = steam_auth._try_steam_auto_relogin_impl()
 
     assert result[0] is False
-    assert result[1] == "rate_limited"
-    assert "Cookie 已保留且不代表过期" in result[2]
+    assert result[1] == "verification_deferred"
+    assert "真实业务请求确认" in result[2]
+
+
+def test_explicit_auth_expiry_can_force_login_without_dedicated_http_check(monkeypatch):
+    from app.services import steam_auth
+
+    calls = []
+    monkeypatch.setattr(
+        steam_auth,
+        "get_current_account",
+        lambda: {
+            "id": "account-1",
+            "steam_id": "76561198000000000",
+            "username": "user",
+            "password": "password",
+        },
+    )
+    monkeypatch.setattr(steam_auth, "set_current", lambda account_id: True)
+    monkeypatch.setattr(
+        steam_auth,
+        "get_steam_credentials",
+        lambda: {
+            "cookies": "steamLoginSecure=76561198000000000%7C%7Cold-token",
+            "steam_id": "76561198000000000",
+        },
+    )
+    monkeypatch.setattr(
+        steam_auth,
+        "_check_steam_cookies",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("force login must bypass redirect verification")),
+    )
+    monkeypatch.setattr(steam_auth, "load_app_config_validated", lambda: {})
+    monkeypatch.setattr(
+        steam_auth,
+        "_do_steampy_login",
+        lambda *args, **kwargs: (
+            calls.append("login")
+            or (True, "", {"sessionid": "new-session", "steamLoginSecure": "76561198000000000%7C%7Cnew-token"})
+        ),
+    )
+    monkeypatch.setattr(steam_auth, "update_steam_creds", lambda *args, **kwargs: calls.append("saved"))
+    monkeypatch.setattr(steam_auth, "fetch_steam_profile_via_api", lambda *args, **kwargs: ("User", "avatar"))
+    monkeypatch.setattr(steam_auth, "update_account", lambda *args, **kwargs: None)
+
+    result = steam_auth._try_steam_auto_relogin_impl(force_login=True)
+
+    assert result[0] is True
+    assert result[1] == "auto_ok"
+    assert calls == ["login", "saved"]
 
 
 def test_steam_auto_relogin_does_not_reuse_cookie_from_different_account(monkeypatch):

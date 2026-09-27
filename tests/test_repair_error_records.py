@@ -242,3 +242,41 @@ def test_fetch_sold_with_names_paginates_history(monkeypatch):
     assert calls == [0, 500]
     assert sold == {"1001": 11.5, "1002": 23.0}
     assert names == {"1001": "AK-47 | Redline", "1002": "USP-S | Flashback"}
+
+def test_rebuild_does_not_guess_between_same_name_candidates(monkeypatch, tmp_path):
+    purchases = [{"name": "Same Item", "listing_status": "error"}]
+    repair, replaced = _prepare_repair(
+        monkeypatch,
+        tmp_path,
+        purchases,
+        inventory=[
+            {"assetid": "asset-a", "market_hash_name": "Same Item"},
+            {"assetid": "asset-b", "market_hash_name": "Same Item"},
+        ],
+    )
+
+    ok, result = repair.run()
+
+    assert ok is True
+    assert result["filled"] == 0
+    assert result["missing"] == 1
+    assert replaced["purchases"][0].get("assetid") is None
+    assert replaced["purchases"][0]["listing_status"] == "error"
+
+
+def test_rebuild_does_not_write_when_platform_snapshot_is_incomplete(monkeypatch, tmp_path):
+    purchases = [{"name": "One", "assetid": "existing", "listing": True}]
+    repair, replaced = _prepare_repair(monkeypatch, tmp_path, purchases)
+    from app import inventory_cs2
+    monkeypatch.setattr(
+        inventory_cs2,
+        "scan_cs2_inventory",
+        lambda: (False, [], "temporary unavailable"),
+    )
+
+    ok, result = repair.run()
+
+    assert ok is False
+    assert result["changed"] == 0
+    assert "source_errors" in result
+    assert replaced == {}

@@ -9,7 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.pipeline_steps import (
     _adjust_ref_price_for_daily_high,
+    _build_buy_strategy_outputs,
     _compute_sell_pressure_from_orders,
+    _strategy_module_log,
     filter_iflow_rows,
     pick_stable_item,
 )
@@ -92,6 +94,21 @@ def test_过滤_关键词命中被去掉():
     result = filter_iflow_rows(rows, _基础配置)
     assert len(result) == 1
     assert result[0]["name"] == "AWP | 正常枪"
+
+
+def test_keyword_filter_is_case_insensitive_for_english_terms():
+    rows = [
+        _行(name="Paris 2023 Anubis Souvenir Package"),
+        _行(name="AWP | Normal Skin"),
+    ]
+    config = {
+        "pipeline": {"exclude_keywords": ["Souvenir"], "iflow_top_n": 0},
+        "iflow": {"sort_by": "sell", "min_volume": 200},
+    }
+
+    result = filter_iflow_rows(rows, config)
+
+    assert [item["name"] for item in result] == ["AWP | Normal Skin"]
 
 
 def test_过滤_价格非正被去掉():
@@ -350,3 +367,56 @@ def test_daily_high_adjustment_reuses_provided_steam_client(monkeypatch):
 
     assert adjusted == pytest.approx(3.65875)
     assert provided.calls == 1
+
+
+def test_strategy_module_log_is_opt_in():
+    lines = []
+    logger = lambda message, level: lines.append((message, level))
+
+    _strategy_module_log({"pipeline": {}}, logger, "guard.test", "PASS", "value=1")
+    assert lines == []
+
+    _strategy_module_log(
+        {"pipeline": {"strategy_module_logs_enabled": True}},
+        logger,
+        "guard.test",
+        "PASS",
+        "value=1",
+    )
+    assert lines == [("[策略模块:guard.test] PASS | value=1", "info")]
+
+
+def test_split_math_modules_receive_real_runtime_outputs():
+    outputs = _build_buy_strategy_outputs(
+        {"daily_volume": 100},
+        report={
+            "cv": 0.03,
+            "status": "STABLE",
+            "r_squared": 0.7,
+            "slope": 0.01,
+            "price_percentile": 0.4,
+            "recent_percentile": 0.5,
+            "ma7": 10.0,
+            "ma30": 9.8,
+            "bb_upper": 10.5,
+            "bb_lower": 9.1,
+            "raw_count": 100,
+            "clean_count": 98,
+            "outlier_filter_status": "PASS",
+            "outlier_filter_reason": "cleaned",
+            "outlier_count": 2,
+            "outlier_removed_count": 2,
+            "outlier_removed_ratio": 0.02,
+            "outlier_lower_bound": 9.0,
+            "outlier_upper_bound": 11.0,
+            "persistent_shift_detected": False,
+            "outlier_filter_applied": True,
+        },
+        stability_cfg={"cv_threshold": 0.05},
+    )
+
+    assert outputs["guard.volatility_cv"] == {"cv": 0.03, "limit": 0.05}
+    assert outputs["guard.history_outlier_filter"]["removed_count"] == 2
+    assert outputs["guard.history_outlier_filter"]["persistent_shift_detected"] is False
+    assert outputs["guard.trend_quality"]["r_squared"] == 0.7
+    assert outputs["guard.price_position"]["recent_percentile"] == 0.5

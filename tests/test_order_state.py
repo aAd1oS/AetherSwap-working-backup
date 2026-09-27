@@ -87,3 +87,58 @@ def test_reconcile_does_not_revive_terminal_order(monkeypatch):
 
     assert result["changed"] == 0
     assert updates == []
+
+
+def test_reconcile_checks_every_manual_order_and_keeps_batch_intermediate(monkeypatch):
+    orders = [
+        {"external_order_id": "single", "status": "user_confirmed", "source": "buff_manual"},
+        {"external_order_id": "batch", "status": "user_confirmed", "source": "buff_batch"},
+    ]
+    updates = []
+    finalized = []
+    monkeypatch.setattr(order_state, "db_get_purchase_orders", lambda: orders)
+    monkeypatch.setattr(
+        order_state,
+        "db_update_purchase_order",
+        lambda order_id, data, expected_statuses=None: updates.append((order_id, data)) or True,
+    )
+    monkeypatch.setattr(
+        order_state,
+        "db_finalize_purchase_order_payment",
+        lambda order_id, user_confirmed=False: finalized.append(order_id) or {"created": 1},
+    )
+
+    class Client:
+        def get_bill_order_info_once(self, _order_id):
+            return {"data": {"items": [{"state": "PAID", "state_text": "等待卖家发货"}]}}
+
+    result = order_state.reconcile_manual_payment_orders(Client())
+
+    assert result["checked_count"] == 2
+    assert result["changed_count"] == 2
+    assert finalized == ["single"]
+    assert updates[0][0] == "batch"
+    assert updates[0][1]["status"] == "platform_confirmed"
+
+
+def test_reconcile_propagates_purchase_needs_review_without_erasing_reason(monkeypatch):
+    updates = []
+    monkeypatch.setattr(order_state, "db_get_purchases", lambda: [{
+        "external_order_id": "order-1",
+        "pending_receipt": True,
+        "order_status": "needs_review",
+    }])
+    monkeypatch.setattr(order_state, "db_get_purchase_orders", lambda: [{
+        "external_order_id": "order-1",
+        "status": "awaiting_trade",
+        "error": "报价无法唯一匹配",
+    }])
+    monkeypatch.setattr(
+        order_state,
+        "db_update_purchase_order",
+        lambda order_id, data: updates.append((order_id, data)) or True,
+    )
+
+    order_state.reconcile_orders_from_local_records()
+
+    assert updates == [("order-1", {"status": "needs_review"})]

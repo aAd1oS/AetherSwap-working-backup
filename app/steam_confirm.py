@@ -71,7 +71,7 @@ class SteamConfirmer:
             return True, data.get("conf", []), ""
         except Exception as e:
             return False, [], str(e)
-    def accept_all(self, conf_list: List[dict]) -> Tuple[bool, int, str]:
+    def _accept_selected_batch(self, conf_list: List[dict]) -> Tuple[bool, int, str]:
         if not conf_list:
             return True, 0, ""
         ts = int(time.time())
@@ -104,6 +104,80 @@ class SteamConfirmer:
             return True, len(conf_list), ""
         except Exception as e:
             return False, 0, str(e)
+
+    def accept_all(self, conf_list: List[dict]) -> Tuple[bool, int, str]:
+        """Legacy bulk-confirm entry point; production use is intentionally blocked."""
+        return False, 0, "accept_all 已禁用；必须先严格选择本轮唯一确认"
+
+    def accept_selected(self, conf_list: List[dict]) -> Tuple[bool, int, str]:
+        """Accept only confirmations already selected by the caller."""
+        return self._accept_selected_batch(conf_list)
+
+
+def _confirmation_id(conf: dict) -> str:
+    return str((conf or {}).get("id") or "").strip()
+
+
+def _confirmation_creator_id(conf: dict) -> str:
+    return str(
+        (conf or {}).get("creator_id")
+        or (conf or {}).get("creatorid")
+        or (conf or {}).get("listing_id")
+        or ""
+    ).strip()
+
+
+def _is_market_listing_confirmation(conf: dict) -> bool:
+    raw_type = (conf or {}).get("type")
+    if str(raw_type or "").strip() == "3":
+        return True
+    type_name = str((conf or {}).get("type_name") or (conf or {}).get("typeName") or "").lower()
+    return "market" in type_name and "sell" in type_name
+
+
+def select_new_listing_confirmations(
+    before: List[dict],
+    after: List[dict],
+    successful_listings: List[dict],
+) -> Tuple[List[dict], str]:
+    """Fail closed when new confirmations cannot be tied to this listing batch."""
+    before_ids = {_confirmation_id(conf) for conf in before if _confirmation_id(conf)}
+    new_confirmations = [
+        conf for conf in after
+        if _confirmation_id(conf) and _confirmation_id(conf) not in before_ids
+    ]
+    new_market = [conf for conf in new_confirmations if _is_market_listing_confirmation(conf)]
+    expected = [row for row in successful_listings if row.get("requires_confirmation") is True]
+    if not expected:
+        return [], "本轮没有明确要求确认的成功上架"
+
+    selected = []
+    used_ids = set()
+    exact_possible = all(str(row.get("listing_id") or "").strip() for row in expected)
+    if exact_possible:
+        for row in expected:
+            listing_id = str(row.get("listing_id") or "").strip()
+            matches = [
+                conf for conf in new_market
+                if _confirmation_creator_id(conf) == listing_id
+                and _confirmation_id(conf) not in used_ids
+            ]
+            if len(matches) != 1:
+                return [], f"listing_id={listing_id} 的市场确认无法唯一匹配"
+            selected.append(matches[0])
+            used_ids.add(_confirmation_id(matches[0]))
+        return selected, ""
+
+    all_success_require_confirmation = bool(successful_listings) and all(
+        row.get("requires_confirmation") is True for row in successful_listings
+    )
+    if (
+        all_success_require_confirmation
+        and len(new_confirmations) == len(new_market)
+        and len(new_market) == len(successful_listings)
+    ):
+        return new_market, ""
+    return [], "新增确认的类型或数量无法与本轮上架唯一对应"
 def auto_confirm_once(identity_secret: str, device_id: str, steam_id: str, cookies: Union[str, dict]) -> Tuple[bool, int, str]:
     bot = SteamConfirmer(identity_secret, device_id, steam_id, cookies)
     ok, confs, err = bot.get_confirmations()

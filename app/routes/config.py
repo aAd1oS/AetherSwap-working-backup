@@ -18,6 +18,7 @@ class ConfigBody(BaseModel):
 class ImportFullBody(BaseModel):
     app_config: dict = {}
     credentials: dict = {}
+    account_runtimes: list = []
     transactions: dict = {}
     accounts: dict = {}
     log: list = []
@@ -77,6 +78,7 @@ def api_data_init():
         },
         "notify": {
             "pushplus_token": "",
+            "lark_webhook": "",
             "email_user": "",
             "email_pass": "",
             "imap_server": "",
@@ -151,36 +153,37 @@ def api_data_init():
 
     return {"ok": True}
 
-@router.get("/api/export_full")
-def api_export_full():
+def _build_full_export() -> dict:
     from datetime import datetime, timezone
     from app.accounts import get_current_id
-    data = {
-        "version": 1,
+    from app.database import db_export_account_runtimes
+    accounts = list_accounts()
+    account_ids = {str(account.get("id") or "") for account in accounts}
+    runtimes = [
+        runtime for runtime in db_export_account_runtimes()
+        if runtime and str(runtime.get("account_id") or "") in account_ids
+    ]
+    return {
+        "version": 2,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "app_config": load_app_config(),
         "credentials": get_all_credentials(),
+        "account_runtimes": runtimes,
         "transactions": {"purchases": get_purchases(), "sales": get_sales()},
-        "accounts": {"accounts": list_accounts(), "current_id": get_current_id()},
+        "accounts": {"accounts": accounts, "current_id": get_current_id()},
         "log": get_log(0),
     }
-    return data
+
+@router.get("/api/export_full")
+def api_export_full():
+    return _build_full_export()
 
 @router.get("/api/export_full/download")
 def api_export_full_download():
     import json
-    from datetime import datetime, timezone
+    from datetime import datetime
     from fastapi.responses import Response
-    from app.accounts import get_current_id
-    data = {
-        "version": 1,
-        "exported_at": datetime.now(timezone.utc).isoformat(),
-        "app_config": load_app_config(),
-        "credentials": get_all_credentials(),
-        "transactions": {"purchases": get_purchases(), "sales": get_sales()},
-        "accounts": {"accounts": list_accounts(), "current_id": get_current_id()},
-        "log": get_log(0),
-    }
+    data = _build_full_export()
     ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     filename = f"full_backup_{ts}.json"
     return Response(
@@ -191,14 +194,20 @@ def api_export_full_download():
 @router.post("/api/import_full")
 def api_import_full(body: ImportFullBody):
     try:
-        if body.app_config:
-            save_app_config_validated(body.app_config)
-        if body.credentials:
-            save_credentials(body.credentials)
-        tx = body.transactions or {}
-        replace_transactions(tx.get("purchases", []), tx.get("sales", []))
         if body.accounts:
             accounts_replace_all(body.accounts)
+        if body.credentials:
+            save_credentials(body.credentials)
+        if body.app_config:
+            save_app_config_validated(body.app_config)
+        if body.account_runtimes:
+            from app.database import db_import_account_runtimes
+            from app.config_loader import invalidate_config_cache
+            allowed_ids = {str(account.get("id") or "") for account in list_accounts()}
+            db_import_account_runtimes(body.account_runtimes, allowed_account_ids=allowed_ids)
+            invalidate_config_cache()
+        tx = body.transactions or {}
+        replace_transactions(tx.get("purchases", []), tx.get("sales", []))
         if body.log is not None:
             replace_log(body.log)
         return {"ok": True}

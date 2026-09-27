@@ -217,10 +217,12 @@ def _source_order(source: str, order: tuple) -> int:
 def _pick_candidate(name_to_candidates: dict, name: str, used_assetids: set, source_order: tuple = ("listing", "inventory", "sold")) -> dict:
     candidates = name_to_candidates.get(name) or []
     ordered = sorted(candidates, key=lambda x: (_source_order(x.get("source"), source_order), str(x.get("assetid") or "")))
-    for c in ordered:
-        if c["assetid"] not in used_assetids:
-            return c
-    return None
+    unique_by_assetid = {}
+    for candidate in ordered:
+        assetid = str(candidate.get("assetid") or "").strip()
+        if assetid and assetid not in used_assetids and assetid not in unique_by_assetid:
+            unique_by_assetid[assetid] = candidate
+    return next(iter(unique_by_assetid.values())) if len(unique_by_assetid) == 1 else None
 def _has_sale_price(purchase: dict) -> bool:
     try:
         return purchase.get("sale_price") is not None and float(purchase.get("sale_price") or 0) > 0
@@ -345,15 +347,19 @@ def run(log_fn=None):
         log_fn(f"开始全量重建操作记录，共 {repair_total} 条", "info")
     if repair_total <= 0:
         return True, {"filled": 0, "missing": 0, "total": 0, "list_by_name": {}}
+    source_errors = []
     inv_items = []
     if log_fn:
         log_fn("正在拉取 CS2 库存…", "info")
     try:
         from app.inventory_cs2 import scan_cs2_inventory
         ok, inv_items, err = scan_cs2_inventory()
-        if not ok and log_fn:
-            log_fn(f"拉取库存: {err}", "warn")
+        if not ok:
+            source_errors.append(f"库存读取失败: {err}")
+            if log_fn:
+                log_fn(f"拉取库存: {err}", "warn")
     except Exception as e:
+        source_errors.append(f"库存读取异常: {type(e).__name__}")
         if log_fn:
             log_fn(f"拉取库存异常: {e}", "warn")
     if log_fn:
@@ -363,8 +369,9 @@ def run(log_fn=None):
         if log_fn:
             log_fn(f"解析到售出 {len(sold_map)} 条", "info")
     except Exception as e:
+        source_errors.append(f"售出历史读取异常: {type(e).__name__}")
         if log_fn:
-            log_fn(f"拉取售出历史异常: {e}，将只使用库存/在售列表重建，并保留已售记录", "warn")
+            log_fn(f"拉取售出历史异常: {e}，本次不会写入数据库", "warn")
         sold_map, sold_names = {}, {}
     if log_fn:
         log_fn("正在拉取出售中列表…", "info")
@@ -376,11 +383,22 @@ def run(log_fn=None):
         if ok:
             if log_fn:
                 log_fn(f"在售 {len(listing_assetids)} 条", "info")
-        elif log_fn:
-            log_fn(f"拉取在售列表: {err}", "warn")
+        else:
+            source_errors.append(f"在售列表读取失败: {err}")
+            if log_fn:
+                log_fn(f"拉取在售列表: {err}", "warn")
     except Exception as e:
+        source_errors.append(f"在售列表读取异常: {type(e).__name__}")
         if log_fn:
             log_fn(f"拉取在售列表异常: {e}", "warn")
+    if source_errors:
+        if log_fn:
+            log_fn("平台快照不完整，本次修复已失败关闭，数据库未改动", "error")
+        return False, {
+            "error": "平台快照不完整，未执行修复",
+            "source_errors": source_errors,
+            "changed": 0,
+        }
     name_to_candidates = _build_merged(inv_items, sold_map, sold_names, listing_assetids, listing_name_by_assetid)
     record_name_counts = _record_name_counts(purchases)
     list_by_name = {name: len(name_to_candidates.get(name) or []) for name in record_name_counts.keys()}

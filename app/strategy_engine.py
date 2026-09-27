@@ -152,6 +152,18 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
             "use_vwap": {"type": "boolean", "default": True, "label": "使用 VWAP"},
         },
     },
+    "guard.history_outlier_filter": {
+        "id": "guard.history_outlier_filter",
+        "name": "历史异常值清洗（IQR）",
+        "category": "guard.history",
+        "strategy_types": ["buy"],
+        "description": "清除孤立异常成交并让清洗后的时间序列统一进入波动、趋势和均线计算；持续异动或异常过多时暂停购入。",
+        "params_schema": {
+            "outlier_iqr_multiplier": {"type": "number", "min": 0.1, "max": 5, "default": 1.5, "label": "IQR 倍数"},
+            "outlier_max_removed_ratio": {"type": "number", "min": 0, "max": 0.5, "default": 0.2, "label": "最大清洗比例"},
+            "outlier_protect_persistent_recent": {"type": "boolean", "default": True, "label": "保护近期持续变动"},
+        },
+    },
     "guard.volatility_cv": {
         "id": "guard.volatility_cv",
         "name": "波动率过滤",
@@ -361,6 +373,7 @@ SYSTEM_STRATEGIES: List[Dict[str, Any]] = [
             {"module_id": "guard.sell_pressure", "enabled": True, "params": {}},
             {"module_id": "guard.max_discount", "enabled": True, "params": {}},
             {"module_id": "guard.history_data_window", "enabled": True, "params": {}},
+            {"module_id": "guard.history_outlier_filter", "enabled": True, "params": {}},
             {"module_id": "guard.volatility_cv", "enabled": True, "params": {}},
             {"module_id": "guard.trend_quality", "enabled": True, "params": {}},
             {"module_id": "guard.price_position", "enabled": True, "params": {}},
@@ -440,12 +453,17 @@ MODULE_CONSTRAINTS: Dict[str, Dict[str, Any]] = {
     "guard.history_stability": {
         "conflicts": [
             "guard.history_data_window",
+            "guard.history_outlier_filter",
             "guard.volatility_cv",
             "guard.trend_quality",
             "guard.price_position",
         ],
     },
     "guard.history_data_window": {"conflicts": ["guard.history_stability"]},
+    "guard.history_outlier_filter": {
+        "conflicts": ["guard.history_stability"],
+        "requires": ["guard.history_data_window"],
+    },
     "guard.volatility_cv": {"conflicts": ["guard.history_stability"]},
     "guard.trend_quality": {"conflicts": ["guard.history_stability"]},
     "guard.price_position": {"conflicts": ["guard.history_stability"]},
@@ -515,6 +533,36 @@ MODULE_DATA_OUTPUTS: Dict[str, Dict[str, str]] = {
         "ma30": "Long moving average.",
         "is_stable": "Whether the history analyzer accepted the item.",
     },
+    "guard.history_outlier_filter": {
+        "status": "PASS or REJECT for the outlier filter.",
+        "reason": "Outlier filter decision reason.",
+        "raw_count": "History rows before filtering.",
+        "clean_count": "History rows used after filtering.",
+        "outlier_count": "Detected IQR outlier rows.",
+        "removed_count": "Rows actually removed.",
+        "removed_ratio": "Detected outlier ratio.",
+        "lower_bound": "IQR lower bound.",
+        "upper_bound": "IQR upper bound.",
+        "persistent_shift_detected": "Whether recent consecutive days indicate a regime shift.",
+        "applied": "Whether rows were removed.",
+    },
+    "guard.volatility_cv": {
+        "cv": "Observed coefficient of variation.",
+        "limit": "Configured CV threshold.",
+    },
+    "guard.trend_quality": {
+        "status": "History trend classification.",
+        "r_squared": "Trend fit quality.",
+        "slope": "Trend slope.",
+    },
+    "guard.price_position": {
+        "price_percentile": "Current price percentile in the history window.",
+        "recent_percentile": "Current price percentile in the recent window.",
+        "ma7": "Short moving average.",
+        "ma30": "Long moving average.",
+        "bb_upper": "Upper volatility band.",
+        "bb_lower": "Lower volatility band.",
+    },
     "guard.max_discount": {
         "estimated_ratio": "Computed discount ratio.",
         "limit": "Configured max discount threshold.",
@@ -575,6 +623,12 @@ MODULE_SAMPLE_OUTPUTS: Dict[str, Dict[str, Any]] = {
         "ma7": 12.6,
         "ma30": 12.2,
         "is_stable": True,
+    },
+    "guard.history_outlier_filter": {
+        "status": "PASS", "reason": "cleaned", "raw_count": 100,
+        "clean_count": 98, "outlier_count": 2, "removed_count": 2,
+        "removed_ratio": 0.02, "lower_bound": 11.2, "upper_bound": 13.8,
+        "persistent_shift_detected": False, "applied": True,
     },
     "guard.volatility_cv": {"cv": 0.032, "limit": 0.05},
     "guard.trend_quality": {"r_squared": 0.72, "slope": 0.001, "status": "STABLE"},
@@ -1334,6 +1388,11 @@ def _current_param_values(config: dict) -> Dict[str, Dict[str, Any]]:
             "min_daily_trades": stability.get("min_daily_trades"),
             "use_vwap": stability.get("use_vwap"),
         },
+        "guard.history_outlier_filter": {
+            "outlier_iqr_multiplier": stability.get("outlier_iqr_multiplier"),
+            "outlier_max_removed_ratio": stability.get("outlier_max_removed_ratio"),
+            "outlier_protect_persistent_recent": stability.get("outlier_protect_persistent_recent"),
+        },
         "guard.volatility_cv": {"cv_threshold": stability.get("cv_threshold")},
         "guard.trend_quality": {
             "r2_threshold": stability.get("r2_threshold"),
@@ -1498,8 +1557,10 @@ def apply_strategy_to_config(config: dict, strategy_type: str, strategy_override
             for key, val in _step_params(strategy, "guard.history_stability").items():
                 if key in stability:
                     stability[key] = val
+        stability["outlier_filter_enabled"] = "guard.history_outlier_filter" in enabled_ids
         for module_id in (
             "guard.history_data_window",
+            "guard.history_outlier_filter",
             "guard.volatility_cv",
             "guard.trend_quality",
             "guard.price_position",

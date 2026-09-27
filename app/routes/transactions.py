@@ -36,8 +36,7 @@ from buff.buyer import BuffAuthExpired, BuffVerificationRequired
 from utils.buff_protection import BuffProtectionError
 from app.services.buff_balance import (
     get_buff_balance,
-    get_buff_balance_probe,
-    record_buff_balance_preview,
+    record_buff_balance_amount,
 )
 from app.services.buff_client import create_buff_client_from_config
 from app.order_state import (
@@ -45,6 +44,7 @@ from app.order_state import (
     ORDER_STATUS_LABELS,
     derive_purchase_status,
     get_daily_budget_summary,
+    reconcile_manual_payment_orders,
     reconcile_orders_from_local_records,
 )
 router = APIRouter()
@@ -189,6 +189,10 @@ def api_transactions(enrich_current_price: bool = False):
             row["current_price_updated_at"] = float(p.get("current_price_updated_at"))
         if p.get("received_at") is not None:
             row["received_at"] = float(p.get("received_at"))
+        if p.get("listed_at") is not None:
+            row["listed_at"] = float(p.get("listed_at"))
+        if p.get("listing_price") is not None:
+            row["listing_price"] = round(float(p.get("listing_price")), 2)
         if p.get("tradable_at") is not None:
             row["tradable_at"] = float(p.get("tradable_at"))
         out.append(row)
@@ -222,13 +226,56 @@ def api_orders():
     cfg = load_app_config_validated().get("pipeline", {})
     target = float(cfg.get("target_balance", 100) or 100)
     orders = db_get_purchase_orders()
+    attention_hints = {
+        "awaiting_payment": "等待用户付款或平台取消",
+        "user_confirmed": "用户已确认；请用平台复核确认真实付款结果",
+        "platform_confirmed": "平台已确认；批量订单仍需继续核销",
+        "payment_unconfirmed": "平台付款结果不明确，禁止自动重试",
+        "needs_review": "自动链路已失败关闭，请人工核对",
+        "awaiting_trade": "报价已唯一匹配；若自动接受失败，请到 Steam 手动接受",
+    }
     for order in orders:
-        order["status_label"] = ORDER_STATUS_LABELS.get(order.get("status"), order.get("status"))
-        order["blocking"] = order.get("status") in BLOCKING_PAYMENT_STATUSES
+        status = str(order.get("status") or "")
+        source = str(order.get("source") or "")
+        order["status_label"] = ORDER_STATUS_LABELS.get(status, status)
+        order["blocking"] = status in BLOCKING_PAYMENT_STATUSES
+        order["needs_attention"] = order["blocking"] or status == "awaiting_trade"
+        order["attention_hint"] = attention_hints.get(status, "")
+        actions = []
+        if status in {"awaiting_payment", "payment_unconfirmed", "needs_review"} and not (
+            source == "buff_balance" and status == "awaiting_payment"
+        ):
+            actions.append("cancel")
+        if status in {"awaiting_payment", "user_confirmed", "payment_unconfirmed", "needs_review"}:
+            actions.append("replace_paid")
+        order["available_actions"] = actions
     return {
         "orders": list(reversed(orders)),
+        "attention_count": sum(bool(order["needs_attention"]) for order in orders),
         "budget": get_daily_budget_summary(target),
     }
+
+
+@router.post("/api/orders/reconcile")
+def api_reconcile_payment_orders():
+    credentials = get_buff_credentials() or {}
+    if not (credentials.get("cookies") or "").strip():
+        return {"ok": False, "error": "当前账号没有可用的 BUFF Cookie"}
+    try:
+        config = load_app_config_validated()
+        client = create_buff_client_from_config(
+            credentials,
+            config,
+            steam_credentials=get_steam_credentials(),
+        )
+        result = reconcile_manual_payment_orders(client)
+        reconcile_orders_from_local_records()
+        return {"ok": True, **result}
+    except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError) as exc:
+        return {"ok": False, "error": str(exc) or type(exc).__name__}
+    except Exception as exc:
+        return {"ok": False, "error": f"平台复核失败: {type(exc).__name__}: {exc}"}
+
 
 @router.post("/api/order/{external_order_id}/cancel")
 def api_cancel_unresolved_order(external_order_id: str):
@@ -238,10 +285,8 @@ def api_cancel_unresolved_order(external_order_id: str):
     )
     if order is None:
         return {"ok": False, "error": "订单不存在"}
-    if order.get("status") not in BLOCKING_PAYMENT_STATUSES:
-        return {"ok": False, "error": "该订单当前不是待支付或待核对状态"}
-    if order.get("status") == "user_confirmed":
-        return {"ok": False, "error": "该订单已确认付款，不能直接取消；请先核对 BUFF 订单状态"}
+    if order.get("status") not in {"awaiting_payment", "payment_unconfirmed", "needs_review"}:
+        return {"ok": False, "error": "该订单不能直接取消；请先用平台复核确认真实状态"}
     if order.get("source") == "buff_balance" and order.get("status") == "awaiting_payment":
         return {"ok": False, "error": "余额订单正在自动扣款，当前不能取消；请等待结果明确后再处理"}
     expected_status = str(order.get("status") or "")
@@ -345,16 +390,22 @@ def api_update_transaction(body: TransactionUpdateBody):
 @router.get("/api/stats")
 def api_stats():
     purchases = get_purchases()
+    pipeline_cfg = load_app_config_validated().get("pipeline", {})
+    resell_ratio = max(0.01, min(1.0, float(pipeline_cfg.get("resell_ratio", 0.85) or 0.85)))
     total_invested = sum(_positive_amount(p.get("price")) for p in purchases)
     sold_purchases = [p for p in purchases if _positive_amount(p.get("sale_price")) > 0]
     total_sold = sum(_positive_amount(p.get("sale_price")) for p in sold_purchases)
+    total_sold_after_tax = total_sold / 1.15
+    total_sold_cost = sum(_positive_amount(p.get("price")) for p in sold_purchases)
     ratio_sum = 0.0
     ratio_count = 0
-    total_profit = 0.0
+    total_self_use_profit = 0.0
+    total_conversion_profit = 0.0
     for p in sold_purchases:
         after_tax = _positive_amount(p.get("sale_price")) / 1.15
         cost = _positive_amount(p.get("price"))
-        total_profit += after_tax - cost
+        total_self_use_profit += after_tax - cost
+        total_conversion_profit += after_tax * resell_ratio - cost
         if after_tax > 0 and cost > 0:
             ratio_sum += cost / after_tax
             ratio_count += 1
@@ -363,7 +414,12 @@ def api_stats():
         "total_invested": round(total_invested, 2),
         "total_purchased": round(total_invested, 2),
         "total_sold": round(total_sold, 2),
-        "total_profit": round(total_profit, 2),
+        "total_sold_after_tax": round(total_sold_after_tax, 2),
+        "total_sold_cost": round(total_sold_cost, 2),
+        "total_profit": round(total_self_use_profit, 2),
+        "total_self_use_profit": round(total_self_use_profit, 2),
+        "total_conversion_profit": round(total_conversion_profit, 2),
+        "resell_ratio": resell_ratio,
         "discount_ratio": round(discount_ratio, 4) if discount_ratio is not None else None,
         "buff_balance": get_buff_balance(),
     }
@@ -383,29 +439,6 @@ def api_refresh_buff_balance():
     steam_credentials = get_steam_credentials() or {}
     if not str(buff_credentials.get("cookies") or "").strip():
         return {"ok": False, "error": "尚未配置 BUFF Cookie", "buff_balance": cached}
-    if not str(steam_credentials.get("steam_id") or "").strip():
-        return {"ok": False, "error": "尚未配置 SteamID64", "buff_balance": cached}
-
-    probe = get_buff_balance_probe()
-    try:
-        goods_id = int(probe.get("goods_id") or 0)
-    except (TypeError, ValueError):
-        goods_id = 0
-    game = str(probe.get("game") or "csgo")
-    if goods_id <= 0:
-        for purchase in reversed(get_purchases()):
-            try:
-                goods_id = int(purchase.get("goods_id") or 0)
-            except (TypeError, ValueError):
-                goods_id = 0
-            if goods_id > 0:
-                break
-    if goods_id <= 0:
-        return {
-            "ok": False,
-            "error": "暂无可用于只读查询的已知 BUFF 商品；任务首次进行余额预检后会自动显示",
-            "buff_balance": cached,
-        }
 
     try:
         client = create_buff_client_from_config(
@@ -413,49 +446,21 @@ def api_refresh_buff_balance():
             load_app_config_validated(),
             steam_credentials,
         )
-        orders = client.get_sell_orders(goods_id, game) or []
-        order = next(
-            (
-                row for row in orders
-                if str(row.get("id") or "").strip()
-                and _positive_amount(row.get("price")) > 0
-            ),
-            None,
-        )
-        if order is None:
+        observation = client.get_available_funds_once()
+        if observation.get("ok") is not True or observation.get("balance") is None:
             return {
                 "ok": False,
-                "error": "该参考商品当前没有可用于余额预览的在售订单，请稍后重试",
+                "error": observation.get("reason") or "BUFF 账户资产接口未返回可识别余额",
                 "buff_balance": cached,
             }
-        preview = client.preview_balance_payment(
-            game,
-            goods_id,
-            str(order.get("id")),
-            str(order.get("price")),
+        balance = record_buff_balance_amount(
+            observation.get("balance"),
+            source="account_asset",
         )
-        balance = record_buff_balance_preview(
-            preview,
-            game=game,
-            goods_id=goods_id,
-            sell_order_id=str(order.get("id")),
-            price=str(order.get("price")),
-        )
-        if balance.get("observation_accepted") is False:
-            retained = (
-                f"，已保留最近可信余额 {float(balance['balance']):.2f}"
-                if balance.get("has_value")
-                else ""
-            )
-            return {
-                "ok": False,
-                "error": f"当前参考订单只返回订单级不可用支付通道，不能据此更新账号余额{retained}",
-                "buff_balance": balance,
-            }
         if not balance.get("has_value"):
             return {
                 "ok": False,
-                "error": (preview or {}).get("reason") or "BUFF 预览未返回可识别的余额",
+                "error": observation.get("reason") or "BUFF 账户资产接口未返回可识别余额",
                 "buff_balance": balance,
             }
         log(
@@ -492,6 +497,7 @@ def api_refresh_buff_balance():
         }
 @router.post("/api/purchase/{idx}/delist")
 def api_delist_purchase(idx: int):
+    from app.account_operations import AccountOperationConflict, account_operation
     from app.steam_delist import delist_item
     purchases = get_purchases()
     if idx < 0 or idx >= len(purchases):
@@ -505,12 +511,32 @@ def api_delist_purchase(idx: int):
     name = (p.get("name") or "").strip()
     def log_fn(msg: str, level: str = "info"):
         log(msg, level, category="delist")
-    ok, new_assetid, err = delist_item(assetid, name, log_fn=log_fn)
+    try:
+        with account_operation("手动下架"):
+            ok, new_assetid, err = delist_item(assetid, name, log_fn=log_fn)
+    except AccountOperationConflict as exc:
+        return {"ok": False, "error": str(exc)}
     if not ok:
         log(err or "下架失败", "error", category="delist")
         return {"ok": False, "error": err}
-    update_purchase(idx, {"assetid": new_assetid, "listing": False, "listing_status": None})
-    out = {"ok": True, "assetid": new_assetid}
+    updates = {
+        "listing": False,
+        "listing_status": None if new_assetid else "assetid_pending",
+        "listed_at": None,
+        "listing_price": None,
+        "stale_listing_notified_at": None,
+        "listing_review_after": None,
+    }
+    if new_assetid:
+        updates["assetid"] = new_assetid
+    try:
+        update_purchase(idx, updates)
+    except Exception as exc:
+        from app.database import DuplicateAssetIdError
+        if isinstance(exc, DuplicateAssetIdError):
+            return {"ok": False, "error": str(exc)}
+        raise
+    out = {"ok": True, "assetid": new_assetid or assetid}
     if new_assetid is None:
         out["message"] = "下架成功，但未检测到新 assetid，正自动尝试同步补全..."
         log_fn("未检测到新 assetid，开始自动同步售出/持有", "info")

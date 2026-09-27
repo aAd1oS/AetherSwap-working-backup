@@ -11,13 +11,50 @@ from app.strategy_engine import evaluate_strategy_runtime_modules, is_strategy_m
 from app.services.steam_client import SteamClient
 from app.services.analysis_client import StabilityAnalyzer
 from app.services.buff_client import count_lowest_price_orders, first_order_at_price
-from app.notify import send_pushplus, build_payment_notify_content, wait_email_command
-from app.database import db_upsert_purchase_order, db_update_purchase_order
+from app.services.c5_client import C5ApiError
+from app.services.c5_compare import (
+    evaluate_c5_manual_recommendation,
+    fetch_c5_executable_quote,
+    format_c5_shadow_log,
+    notify_c5_manual_recommendation,
+)
+from app.notify import send_configured_notification, send_lark, build_payment_notify_content, wait_email_command
+from app.database import (
+    db_finalize_purchase_order_payment,
+    db_upsert_purchase_order,
+    db_update_purchase_order,
+)
 from utils.delay import jittered_sleep
 from buff.buyer import BuffAuthExpired, BuffOrderOutcomeUnknown, BuffVerificationRequired
 from utils.buff_protection import BuffProtectionError, get_buff_request_protection
 
 STEAM_FEE_FACTOR = 1.15  # Steam take rate for calculating net proceeds
+MANUAL_PAYMENT_MAX_SECONDS = 165
+MANUAL_PAYMENT_POLL_SECONDS = 25
+MANUAL_PAYMENT_REMINDER_SECONDS = (105, 150)
+
+
+def _strategy_module_log(config: dict, log_fn, module_id: str, status: str, detail: str) -> None:
+    pipeline_cfg = (config or {}).get("pipeline") if isinstance((config or {}).get("pipeline"), dict) else (config or {})
+    if not log_fn or not pipeline_cfg.get("strategy_module_logs_enabled", False):
+        return
+    level = "warn" if status in {"REJECT", "ERROR", "UNAVAILABLE"} else "info"
+    log_fn(f"[策略模块:{module_id}] {status} | {detail}", level)
+
+
+def _format_module_values(values: dict) -> str:
+    return " ".join(f"{key}={value}" for key, value in values.items() if value is not None)
+
+
+def _notify_lark_payment_review(config: dict, order_id: str, reason: str) -> bool:
+    webhook = str(((config or {}).get("notify") or {}).get("lark_webhook") or "").strip()
+    if not webhook:
+        return False
+    return send_lark(
+        webhook,
+        "BUFF 订单需要人工核对",
+        f"订单 {order_id or '未知'} 的结果无法明确确认，购买任务已停止。原因：{reason}",
+    )
 
 def _fetch_steam_sell_data(
     market_hash_name: str,
@@ -252,6 +289,7 @@ TARGET_REACHED = object()
 SKIP_NO_FAILED = object()
 SKIP_VERIFICATION_FAILED = object()
 SKIP_BALANCE_UNAVAILABLE = object()
+SKIP_C5_MANUAL_RECOMMENDED = object()
 PAYMENT_REVIEW_REQUIRED = object()
 
 
@@ -274,6 +312,21 @@ def _goods_id_from_buff_url(url: str) -> int:
 _RATIO_ATTR = {"sell": "sell_ratio", "buy": "buy_ratio"}
 
 
+def _format_shadow_stability_metrics(report: dict) -> str:
+    """Format diagnostics that deliberately do not participate in filtering."""
+    fields = (
+        ("MAD", "mad", 4),
+        ("稳健CV", "robust_cv", 4),
+        ("TS斜率", "theil_sen_slope", 4),
+        ("Spearman", "spearman_rho", 3),
+        ("高点持续", "spike_persistence", 2),
+    )
+    parts = []
+    for label, key, digits in fields:
+        value = report.get(key)
+        if value is not None:
+            parts.append(f"{label}={float(value):.{digits}f}")
+    return (" [影子指标] " + " ".join(parts)) if parts else ""
 def _log_stability_rejection(
     report: dict,
     stability_cfg: dict,
@@ -295,7 +348,8 @@ def _log_stability_rejection(
     ma_str = f" EMA7={report.get('ma7',0):.2f} EMA30={report.get('ma30',0):.2f}"
     bb_upper = report.get("bb_upper")
     bb_str = f" BB+={bb_upper:.2f}" if bb_upper is not None else ""
-    log_fn(f"[稳定性]   → 拒绝: {msg} status={st} cv={cv:.3f} R2={r2:.3f} 均价={avg:.2f} slope={slope:.4f}{ma_str}{bb_str}{smart_str}{pp_str}", "warn")
+    shadow_str = _format_shadow_stability_metrics(report)
+    log_fn(f"[稳定性]   → 拒绝: {msg} status={st} cv={cv:.3f} R2={r2:.3f} 均价={avg:.2f} slope={slope:.4f}{ma_str}{bb_str}{smart_str}{pp_str}{shadow_str}", "warn")
 
 
 def filter_iflow_rows(
@@ -306,13 +360,21 @@ def filter_iflow_rows(
 ) -> List[Dict[str, Any]]:
     pipeline_cfg = config.get("pipeline", {})
     iflow_cfg = config.get("steamdt") or config.get("iflow", {})
-    exclude = pipeline_cfg.get("exclude_keywords", [])
+    exclude = [
+        str(keyword).strip().lower()
+        for keyword in pipeline_cfg.get("exclude_keywords", [])
+        if str(keyword).strip()
+    ]
     try:
         min_volume = max(0, int(float(iflow_cfg.get("min_volume", 200) or 0)))
     except (TypeError, ValueError):
         min_volume = 200
     configured_top_n = int(pipeline_cfg.get("iflow_top_n", 0) or 0)
-    safety_cap = get_buff_request_protection().effective_candidate_cap()
+    recovery_cap = pipeline_cfg.get("buff_protection_recovery_candidate_cap", 30)
+    safety_cap = get_buff_request_protection().effective_candidate_cap(
+        recovery_cap,
+        configured_top_n,
+    )
     top_n = min(configured_top_n, safety_cap) if configured_top_n > 0 else safety_cap
     excluded = exclude_goods_ids or set()
     sort_by = (iflow_cfg.get("sort_by") or "sell").strip()
@@ -369,6 +431,9 @@ def filter_iflow_rows(
             "steam_link": steam_link,
             "ratio": ratio_val,
             "daily_volume": vol,
+            "c5_reference_price": getattr(r, "c5_reference_price", 0) or 0,
+            "c5_reference_link": getattr(r, "c5_reference_link", "") or "",
+            "c5_reference_update_time": getattr(r, "c5_reference_update_time", "") or "",
         })
     eligible_count = len(filtered)
     if top_n > 0:
@@ -383,6 +448,18 @@ def filter_iflow_rows(
         parts.append(f"合格{eligible_count}条后取前{top_n}条")
         parts.extend([f"非Buff链接={skipped_no_buff}", f"→ 通过 {len(filtered)} 条"])
         log_fn(f"[筛选] {' '.join(parts)}", "info")
+    _strategy_module_log(
+        config, log_fn, "buy.exclude_keywords", "PASS",
+        f"excluded={skipped_keyword} keywords={len(exclude)}",
+    )
+    _strategy_module_log(
+        config, log_fn, "buy.basic_candidate_filter", "PASS",
+        f"invalid_price={skipped_price} missing_buff={skipped_no_buff} low_volume={skipped_low_volume}",
+    )
+    _strategy_module_log(
+        config, log_fn, "buy.steamdt_top_n", "PASS",
+        f"eligible={eligible_count} selected={len(filtered)} limit={top_n}",
+    )
     return filtered
 
 def _check_sell_pressure_precheck(
@@ -402,9 +479,23 @@ def _check_sell_pressure_precheck(
             if pressure is not None and pressure > sell_pressure_threshold:
                 if log_fn:
                     log_fn(f"[稳定性]   → 预检未通过: 卖压过高 前{n_sell_orders}档总量/日销={pressure:.2f} 阈值={sell_pressure_threshold}", "warn")
+                _strategy_module_log(
+                    pipeline_cfg, log_fn, "guard.sell_pressure", "REJECT",
+                    f"pressure={pressure:.4f} limit={sell_pressure_threshold}",
+                )
                 return False
-        elif daily_vol <= 0 and log_fn:
-            log_fn("[稳定性]   → 卖压检查: 日销量为0，跳过", "info")
+            _strategy_module_log(
+                pipeline_cfg, log_fn, "guard.sell_pressure", "PASS",
+                f"pressure={pressure:.4f} limit={sell_pressure_threshold}",
+            )
+        else:
+            if log_fn:
+                log_fn("[稳定性]   → 预检未通过: 卖压模块缺少日销量或卖单深度", "warn")
+            _strategy_module_log(
+                pipeline_cfg, log_fn, "guard.sell_pressure", "UNAVAILABLE",
+                f"daily_volume={daily_vol} orders={len(sell_orders or [])}",
+            )
+            return False
     return True
 
 def _check_max_discount_precheck(
@@ -445,6 +536,7 @@ def _build_buy_strategy_outputs(
     ref_price_est: Optional[float] = None,
     report: Optional[Dict[str, Any]] = None,
     pipeline_cfg: Optional[dict] = None,
+    stability_cfg: Optional[dict] = None,
 ) -> Dict[str, Any]:
     outputs: Dict[str, Any] = {}
     if steam_sell_data:
@@ -474,6 +566,33 @@ def _build_buy_strategy_outputs(
                 "ma7", "ma30", "is_stable",
             )
         }
+        outputs["guard.history_outlier_filter"] = {
+            "status": report.get("outlier_filter_status"),
+            "reason": report.get("outlier_filter_reason"),
+            "raw_count": report.get("raw_count"),
+            "clean_count": report.get("clean_count"),
+            "outlier_count": report.get("outlier_count"),
+            "removed_count": report.get("outlier_removed_count"),
+            "removed_ratio": report.get("outlier_removed_ratio"),
+            "lower_bound": report.get("outlier_lower_bound"),
+            "upper_bound": report.get("outlier_upper_bound"),
+            "persistent_shift_detected": report.get("persistent_shift_detected"),
+            "applied": report.get("outlier_filter_applied"),
+        }
+        outputs["guard.volatility_cv"] = {
+            "cv": report.get("cv"),
+            "limit": (stability_cfg or {}).get("cv_threshold"),
+        }
+        outputs["guard.trend_quality"] = {
+            key: report.get(key) for key in ("status", "r_squared", "slope")
+        }
+        outputs["guard.price_position"] = {
+            key: report.get(key)
+            for key in (
+                "price_percentile", "recent_percentile", "ma7", "ma30",
+                "bb_upper", "bb_lower",
+            )
+        }
     if est_ratio is not None:
         outputs["guard.max_discount"] = {
             "estimated_ratio": est_ratio,
@@ -501,6 +620,7 @@ def _passes_custom_buy_modules(
         ref_price_est=ref_price_est,
         report=report,
         pipeline_cfg=config.get("pipeline") or {},
+        stability_cfg=config.get("stability") or {},
     )
     context = {
         "item": item,
@@ -513,7 +633,15 @@ def _passes_custom_buy_modules(
         context=context,
         outputs=outputs,
     )
-    if log_fn:
+    if log_fn and (config.get("pipeline") or {}).get("strategy_module_logs_enabled", False):
+        runtime_modules = set(
+            ((((config or {}).get("_strategy_runtime") or {}).get("buy") or {}).get("enabled_modules") or [])
+        )
+        for module_id, module_output in outputs.items():
+            if module_id in runtime_modules:
+                _strategy_module_log(
+                    config, log_fn, module_id, "DATA", _format_module_values(module_output),
+                )
         for result in results:
             level = "warn" if result.get("status") in {"reject", "error"} else "info"
             log_fn(f"[策略模块] {result.get('module_name')}: {result.get('reason')} ({result.get('status')})", level)
@@ -545,12 +673,14 @@ def pick_stable_item(
     failure_delay = max(0, float(stability_cfg.get("request_failure_delay_seconds", 5) or 5))
     legacy_history_enabled = is_strategy_module_enabled(config, "buy", "guard.history_stability", default=False)
     history_data_enabled = legacy_history_enabled or is_strategy_module_enabled(config, "buy", "guard.history_data_window")
+    outlier_filter_enabled = is_strategy_module_enabled(config, "buy", "guard.history_outlier_filter")
     volatility_enabled = legacy_history_enabled or is_strategy_module_enabled(config, "buy", "guard.volatility_cv")
     trend_quality_enabled = legacy_history_enabled or is_strategy_module_enabled(config, "buy", "guard.trend_quality")
     price_position_enabled = legacy_history_enabled or is_strategy_module_enabled(config, "buy", "guard.price_position")
     history_analysis_enabled = any((
         legacy_history_enabled,
         history_data_enabled,
+        outlier_filter_enabled,
         volatility_enabled,
         trend_quality_enabled,
         price_position_enabled,
@@ -763,6 +893,10 @@ def pick_stable_item(
             slope_stable_floor=float(stability_cfg.get("slope_stable_floor", -0.005)) if trend_quality_enabled else -999.0,
             price_percentile_ceil_rising=float(stability_cfg.get("price_percentile_ceil_rising", 0.5)) if price_position_enabled else 999.0,
             use_vwap=bool(stability_cfg.get("use_vwap", True)),
+            outlier_filter_enabled=outlier_filter_enabled,
+            outlier_iqr_multiplier=float(stability_cfg.get("outlier_iqr_multiplier", 1.5)),
+            outlier_max_removed_ratio=float(stability_cfg.get("outlier_max_removed_ratio", 0.2)),
+            outlier_protect_persistent_recent=bool(stability_cfg.get("outlier_protect_persistent_recent", True)),
         )
         if smart_price is not None and not report.get("valid"):
             if gid:
@@ -774,6 +908,15 @@ def pick_stable_item(
             continue
 
         if not report.get("is_stable"):
+            if outlier_filter_enabled:
+                outlier_output = _build_buy_strategy_outputs(
+                    item, report=report,
+                ).get("guard.history_outlier_filter") or {}
+                _strategy_module_log(
+                    config, item_log, "guard.history_outlier_filter",
+                    str(outlier_output.get("status") or "DATA"),
+                    _format_module_values(outlier_output),
+                )
             _log_stability_rejection(report, stability_cfg, smart_price, item_log)
             if gid:
                 stability_failed.add(gid)
@@ -809,10 +952,12 @@ def pick_stable_item(
             ma_str = f" EMA7={report.get('ma7',0):.2f} EMA30={report.get('ma30',0):.2f}"
             bb_upper = report.get("bb_upper")
             bb_str = f" BB+={bb_upper:.2f}" if bb_upper is not None else ""
-            item_log(f"[稳定性] ✓ 通过 status={st} cv={report.get('cv',0):.3f} R2={r2:.3f} 均价={report.get('avg',0):.2f} slope={sl:.4f}{ma_str}{bb_str}{smart_str}{pp_str}，选定本件", "info")
+            shadow_str = _format_shadow_stability_metrics(report)
+            item_log(f"[稳定性] ✓ 通过 status={st} cv={report.get('cv',0):.3f} R2={r2:.3f} 均价={report.get('avg',0):.2f} slope={sl:.4f}{ma_str}{bb_str}{smart_str}{pp_str}{shadow_str}，选定本件", "info")
         return item, stability_failed
     return None, stability_failed
 def _do_payment_notify_and_wait(
+    buff_client: Any,
     item: Dict[str, Any],
     config: dict,
     unit_price: float,
@@ -828,9 +973,7 @@ def _do_payment_notify_and_wait(
     log_fn: Optional[Callable[[str, str], None]],
     on_entering_payment: Optional[Callable[[], None]] = None,
 ) -> bool:
-    """Handle notification and wait for user payment confirmation.
-    Returns True if user confirmed, False on cancel/timeout/stop.
-    """
+    """Wait for BUFF to confirm payment; a user click is only an intermediate state."""
     name = item.get("name", "")
     set_pending_payment({
         "pay_url": pay_url,
@@ -849,14 +992,17 @@ def _do_payment_notify_and_wait(
         "unit_price": round(float(unit_price), 2),
         "total_price": round(float(unit_price) * int(num), 2),
         "status": "awaiting_payment",
-        "source": "buff",
+        "source": "buff_batch" if int(num) > 1 else "buff_manual",
         "error": None,
     })
     if on_entering_payment:
         on_entering_payment()
     notify_cfg = config.get("notify") or {}
-    push_token = (notify_cfg.get("pushplus_token") or "").strip()
-    if push_token:
+    has_notification = bool(
+        (notify_cfg.get("lark_webhook") or "").strip()
+        or (notify_cfg.get("pushplus_token") or "").strip()
+    )
+    if has_notification:
         sell_ratio = None
         value_ratio = item.get("value_ratio")
         try:
@@ -875,42 +1021,110 @@ def _do_payment_notify_and_wait(
             steam_market_hash_name=mhn, steam_link=sl
         )
         try:
-            if send_pushplus(push_token, "Buff 待付款", content):
+            sent, channel = send_configured_notification(notify_cfg, "Buff 待付款", content)
+            if sent:
                 if log_fn:
-                    log_fn("[Buff]   → PushPlus 推送已发送", "info")
+                    log_fn(f"[Buff]   → {channel} 推送已发送", "info")
             else:
                 if log_fn:
-                    log_fn("[Buff]   → PushPlus 推送发送失败 (返回False)", "warn")
+                    log_fn("[Buff]   → 通知发送失败（Lark/PushPlus 均不可用）", "warn")
         except Exception as e:
             if log_fn:
-                log_fn(f"[Buff]   → PushPlus 推送发送异常: {e}", "warn")
+                log_fn(f"[Buff]   → 通知发送异常: {type(e).__name__}", "warn")
     email_user = (notify_cfg.get("email_user") or "").strip()
     email_pass = (notify_cfg.get("email_pass") or "").strip()
-    timeout_sec = int(notify_cfg.get("email_timeout_seconds", 300))
+    timeout_sec = min(
+        MANUAL_PAYMENT_MAX_SECONDS,
+        max(1, int(notify_cfg.get("email_timeout_seconds", MANUAL_PAYMENT_MAX_SECONDS) or MANUAL_PAYMENT_MAX_SECONDS)),
+    )
     if email_user and email_pass:
         def _email_waiter() -> None:
             res = wait_email_command(config, timeout_seconds=timeout_sec, is_stop_requested=is_stop_requested, log_fn=log_fn)
-            confirm_payment(res == "success")
+            try:
+                confirm_payment(order_id, res == "success")
+            except TypeError:
+                confirm_payment(res == "success")
         t = threading.Thread(target=_email_waiter, daemon=True)
         t.start()
-        ok = wait_payment_confirm()
-    else:
-        ok = wait_payment_confirm(timeout_seconds=timeout_sec)
+
+    started = time.monotonic()
+    reminders_sent = set()
+    platform_confirmed = False
+    user_confirmed = False
+    explicit_cancel = False
+    while time.monotonic() - started < timeout_sec and not is_stop_requested():
+        remaining = timeout_sec - (time.monotonic() - started)
+        wait_for = max(0.05, min(float(MANUAL_PAYMENT_POLL_SECONDS), remaining))
+        try:
+            user_result = wait_payment_confirm(order_id, timeout_seconds=wait_for)
+        except TypeError:
+            user_result = wait_payment_confirm(timeout_seconds=wait_for)
+        if user_result is True:
+            user_confirmed = True
+        try:
+            order_info = buff_client.get_bill_order_info_once(order_id)
+        except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
+            raise
+        except Exception as exc:
+            order_info = None
+            if log_fn:
+                log_fn(f"[Buff]   → 订单状态核对暂不可用: {type(exc).__name__}", "warn")
+        if _balance_order_info_confirms_payment(order_info):
+            platform_confirmed = True
+            if log_fn:
+                log_fn("[Buff]   → 平台已明确显示付款成功", "info")
+            break
+        if _order_info_explicitly_cancelled(order_info):
+            explicit_cancel = True
+            break
+        if user_result is False or user_confirmed:
+            break
+        elapsed = time.monotonic() - started
+        for reminder_at in MANUAL_PAYMENT_REMINDER_SECONDS:
+            if elapsed >= reminder_at and reminder_at not in reminders_sent:
+                reminders_sent.add(reminder_at)
+                urgency = "紧急" if reminder_at >= 150 else "再次"
+                send_configured_notification(
+                    notify_cfg,
+                    f"BUFF 待付款{urgency}提醒",
+                    f"订单 {order_id} 仍待确认，请尽快在约三分钟有效期内处理。",
+                )
     set_pending_payment(None)
-    if ok:
+    if platform_confirmed:
+        db_update_purchase_order(order_id, {
+            "status": "platform_confirmed",
+            "paid_at": time.time(),
+            "user_confirmed_at": time.time() if user_confirmed else None,
+            "error": None,
+        }, expected_statuses={"awaiting_payment", "user_confirmed"})
+    elif explicit_cancel:
+        db_update_purchase_order(order_id, {
+            "status": "cancelled",
+            "error": "BUFF 平台明确显示订单已取消或失效",
+        }, expected_statuses={"awaiting_payment"})
+    elif user_confirmed:
         db_update_purchase_order(order_id, {
             "status": "user_confirmed",
             "user_confirmed_at": time.time(),
-            "error": None,
+            "error": "用户已确认付款，等待 BUFF 平台状态确认",
         }, expected_statuses={"awaiting_payment"})
     else:
         db_update_purchase_order(order_id, {
-            "status": "payment_unconfirmed",
-            "error": "用户取消、等待超时或程序停止，需人工核对平台订单",
-        }, expected_statuses={"awaiting_payment"})
+            "status": "needs_review",
+            "error": "付款结果未得到平台明确结论，需人工核对",
+        }, expected_statuses={"awaiting_payment", "user_confirmed"})
+        _notify_lark_payment_review(config, order_id, "付款超时、用户否认或平台状态不明确")
     if log_fn:
-        log_fn(f"[Buff]   → 用户确认={'成功' if ok else '取消/失败'}", "info")
-    return ok
+        if platform_confirmed:
+            result_label = "平台已确认付款"
+        elif explicit_cancel:
+            result_label = "平台已取消"
+        elif user_confirmed:
+            result_label = "用户已确认，等待平台核实"
+        else:
+            result_label = "结果未知，转人工核对"
+        log_fn(f"[Buff]   → {result_label}", "info" if platform_confirmed else "warn")
+    return platform_confirmed
 def _do_batch_wait_finalize_and_append(
     buff_client: Any,
     item: Dict[str, Any],
@@ -932,17 +1146,26 @@ def _do_batch_wait_finalize_and_append(
     on_entering_payment: Optional[Callable[[], None]] = None,
 ) -> Optional[float]:
     ok = _do_payment_notify_and_wait(
-        item, config, unit_price, num, pay_url, "wechat", batch_id, acc,
+        buff_client, item, config, unit_price, num, pay_url, "wechat", batch_id, acc,
         set_pending_payment, wait_payment_confirm, confirm_payment,
         is_stop_requested, log_fn, on_entering_payment,
     )
     if is_stop_requested() or not ok:
-        return None
+        return PAYMENT_REVIEW_REQUIRED
+    db_finalize_purchase_order_payment(
+        batch_id, user_confirmed=True, create_purchases=False,
+    )
     if log_fn:
         log_fn("[Buff]   → 正在扫描市场匹配卖家并核销…", "info")
-    matched = buff_client.batch_buy_find_and_finalize(
+    try:
+        matched = buff_client.batch_buy_find_and_finalize_once(
         goods_id, game_buff, unit_price, num, batch_id
-    )
+        )
+    except BuffOrderOutcomeUnknown as exc:
+        db_update_purchase_order(batch_id, {"status": "needs_review", "error": str(exc)})
+        if log_fn:
+            log_fn(f"[Buff]   → 批量核销结果未知，停止任务: {exc}", "error")
+        return PAYMENT_REVIEW_REQUIRED
     if not matched:
         db_update_purchase_order(batch_id, {
             "status": "needs_review",
@@ -958,6 +1181,7 @@ def _do_batch_wait_finalize_and_append(
         market_price = _fetch_smart_market_price(mhn, config, app_id=730)
     saved_name = (item.get("steam_market_name") or item.get("name") or "").strip()
     total = 0.0
+    purchase_rows = []
     for m in matched:
         p = m.get("price", 0)
         total += p
@@ -973,12 +1197,12 @@ def _do_batch_wait_finalize_and_append(
         }
         if market_price is not None and market_price > 0:
             rec["market_price"] = round(float(market_price), 2)
-        append_purchase(rec)
-    db_update_purchase_order(batch_id, {
-        "status": "awaiting_ship",
-        "paid_at": time.time(),
-        "error": None,
-    })
+        purchase_rows.append(rec)
+    db_finalize_purchase_order_payment(
+        batch_id,
+        user_confirmed=True,
+        purchase_rows=purchase_rows,
+    )
     bill_order_ids = [m.get("bill_order_id") for m in matched if m.get("bill_order_id")]
     if bill_order_ids:
         try:
@@ -1014,35 +1238,21 @@ def _do_wait_payment_and_append(
     on_entering_payment: Optional[Callable[[], None]] = None,
 ) -> Optional[float]:
     ok = _do_payment_notify_and_wait(
-        item, config, unit_price, num, pay_url, pay_type, order_id, acc,
+        buff_client, item, config, unit_price, num, pay_url, pay_type, order_id, acc,
         set_pending_payment, wait_payment_confirm, confirm_payment,
         is_stop_requested, log_fn, on_entering_payment,
     )
     if is_stop_requested() or not ok:
-        return None
+        return PAYMENT_REVIEW_REQUIRED
     if market_price is None:
         mhn = (item.get("steam_market_name") or item.get("name") or "").strip()
         market_price = _fetch_smart_market_price(mhn, config, app_id=730)
     saved_name = (item.get("steam_market_name") or item.get("name") or "").strip()
-    base_rec = {
-        "name": saved_name,
-        "goods_id": goods_id,
-        "price": unit_price,
-        "at": time.time(),
-        "pending_receipt": True,
-        "external_order_id": order_id,
-        "source": "auto",
-        "order_status": "awaiting_ship",
-    }
-    if market_price is not None and market_price > 0:
-        base_rec["market_price"] = round(float(market_price), 2)
-    for _ in range(num):
-        append_purchase(dict(base_rec))
-    db_update_purchase_order(order_id, {
-        "status": "awaiting_ship",
-        "paid_at": time.time(),
-        "error": None,
-    })
+    db_finalize_purchase_order_payment(
+        order_id,
+        user_confirmed=True,
+        market_price=(round(float(market_price), 2) if market_price is not None and market_price > 0 else None),
+    )
     try:
         if buff_client.ask_seller_to_send(order_id, game_buff) and log_fn:
             log_fn("[Buff]   → 已提醒卖家发货，请留意 Steam 报价", "info")
@@ -1076,6 +1286,19 @@ def _balance_order_info_confirms_payment(order_info: Optional[dict]) -> bool:
     if any(marker.casefold() in state_text for marker in paid_text_markers):
         return True
     return state in {"PAID", "SUCCESS", "DELIVERING", "DELIVERED", "TRADE"}
+
+
+def _order_info_explicitly_cancelled(order_info: Optional[dict]) -> bool:
+    items = ((order_info or {}).get("data") or {}).get("items") or []
+    if not items:
+        return False
+    item = items[0] or {}
+    state = str(item.get("state") or "").strip().upper()
+    state_text = str(item.get("state_text") or "").strip().casefold()
+    markers = ("已取消", "已失效", "已过期", "cancelled", "canceled", "expired", "closed")
+    return state in {"CANCELLED", "CANCELED", "EXPIRED", "CLOSED"} or any(
+        marker in state_text for marker in markers
+    )
 
 def _balance_payment_confirmed(page_pay: Optional[dict], order_info: Optional[dict]) -> bool:
     if _balance_order_info_confirms_payment(order_info):
@@ -1301,6 +1524,14 @@ def lock_and_confirm_payment(
     log_fn: Optional[Callable[[str, str], None]] = None,
     on_entering_payment: Optional[Callable[[], None]] = None,
 ) -> Optional[float]:
+    from app.accounts import get_current_id
+    expected_account_id = str(get_current_id() or "")
+
+    def _assert_account_before_side_effect() -> None:
+        if expected_account_id:
+            from app.account_operations import assert_current_account
+            assert_current_account(expected_account_id)
+
     buff_cfg = config.get("buff", {})
     game_buff = buff_cfg.get("game", "csgo")
     tolerance = float(buff_cfg.get("price_tolerance", 0.5))
@@ -1327,6 +1558,23 @@ def lock_and_confirm_payment(
         return None
     if log_fn:
         log_fn(f"[Buff]   → 最低价={lowest_price:.2f} 同价数量={count_at_lowest} 参考价={plan_price} 容忍={tolerance} 累计={acc:.2f} 目标={target_balance}", "info")
+        c5_message = format_c5_shadow_log(lowest_price, item, config)
+        if c5_message:
+            log_fn(c5_message, "info")
+    c5_quote = None
+    try:
+        c5_quote = fetch_c5_executable_quote(item, config)
+        if c5_quote is not None and log_fn:
+            delivery = "未知" if c5_quote.delivery is None else str(c5_quote.delivery)
+            log_fn(
+                f"[C5比价·实盘只读] 最低可核验卖单={c5_quote.price:.2f} "
+                f"卖单数={c5_quote.listing_count} 发货类型原始值={delivery}；"
+                "未发起 C5 下单",
+                "info",
+            )
+    except C5ApiError as exc:
+        if log_fn:
+            log_fn(f"[C5比价·实盘只读] {exc}；继续原 BUFF 流程", "warn")
     if acc + lowest_price > target_balance:
         if log_fn:
             log_fn(f"[Buff]   → 累计+本件={acc + lowest_price:.2f} 已达/超过目标，不再锁单", "info")
@@ -1349,7 +1597,16 @@ def lock_and_confirm_payment(
                 f"{max_unit_price:.2f}，未锁单",
                 "warn",
             )
+        _strategy_module_log(
+            config, log_fn, "guard.max_unit_purchase_price", "REJECT",
+            f"unit_price={lowest_price:.2f} limit={max_unit_price:.2f}",
+        )
         return SKIP_NO_FAILED
+    if max_unit_price is not None:
+        _strategy_module_log(
+            config, log_fn, "guard.max_unit_purchase_price", "PASS",
+            f"unit_price={lowest_price:.2f} limit={max_unit_price:.2f}",
+        )
     max_discount = scfg.get("max_discount") if is_strategy_module_enabled(config, "buy", "guard.max_discount") else None
     sell_pressure_threshold = _parse_threshold(scfg.get("sell_pressure_threshold")) if is_strategy_module_enabled(config, "buy", "guard.sell_pressure") else None
     steam_depth_enabled = is_strategy_module_enabled(config, "buy", "buy.steam_sell_depth")
@@ -1381,6 +1638,10 @@ def lock_and_confirm_payment(
             if log_fn:
                 reason = steam_sell_error or "Steam 卖单为空或智能参考价无效"
                 log_fn(f"[Buff]   → 二次验证: 无法获取 Steam 参考价：{reason}，跳过本件", "warn")
+            _strategy_module_log(
+                config, log_fn, "guard.max_discount", "UNAVAILABLE",
+                f"reference_price={ref_price} reason={steam_sell_error or 'invalid_reference'}",
+            )
             return SKIP_VERIFICATION_FAILED
         ref_price = _adjust_ref_price_for_daily_high(
             market_hash_name, ref_price, config, log_fn, app_id=730
@@ -1390,9 +1651,17 @@ def lock_and_confirm_payment(
             if value_ratio >= max_discount:
                 if log_fn:
                     log_fn(f"[Buff]   → 二次验证未通过 (Buff最低价/参考价)×1.15={value_ratio:.4f} 需<{max_discount} (参考价={ref_price:.2f})", "warn")
+                _strategy_module_log(
+                    config, log_fn, "guard.max_discount", "REJECT",
+                    f"ratio={value_ratio:.4f} limit={max_discount}",
+                )
                 return SKIP_VERIFICATION_FAILED
             if log_fn:
                 log_fn(f"[Buff]   → 二次验证通过 (Buff最低价/参考价)×1.15={value_ratio:.4f} 参考价={ref_price:.2f}", "info")
+            _strategy_module_log(
+                config, log_fn, "guard.max_discount", "PASS",
+                f"ratio={value_ratio:.4f} limit={max_discount}",
+            )
     if ref_price and lowest_price > 0:
         item["value_ratio"] = (lowest_price / ref_price) * 1.15
     n_sell_orders = int(scfg.get("sell_pressure_orders_n", 5) or 5)
@@ -1403,9 +1672,23 @@ def lock_and_confirm_payment(
             if pressure is not None and pressure > sell_pressure_threshold:
                 if log_fn:
                     log_fn(f"[Buff]   → 卖压过高 前{n_sell_orders}档总量/日销={pressure:.2f} 阈值={sell_pressure_threshold}，跳过", "warn")
+                _strategy_module_log(
+                    config, log_fn, "guard.sell_pressure", "REJECT",
+                    f"pressure={pressure:.4f} limit={sell_pressure_threshold}",
+                )
                 return None
-        elif daily_vol <= 0 and log_fn:
-            log_fn("[Buff]   → 卖压检查: 日销量为0，跳过", "info")
+            _strategy_module_log(
+                config, log_fn, "guard.sell_pressure", "PASS",
+                f"pressure={pressure:.4f} limit={sell_pressure_threshold}",
+            )
+        else:
+            if log_fn:
+                log_fn("[Buff]   → 卖压模块缺少日销量或卖单深度，跳过本件", "warn")
+            _strategy_module_log(
+                config, log_fn, "guard.sell_pressure", "UNAVAILABLE",
+                f"daily_volume={daily_vol} orders={len(sell_orders or [])}",
+            )
+            return SKIP_VERIFICATION_FAILED
     buy_runtime = ((config or {}).get("_strategy_runtime") or {}).get("buy")
     if buy_runtime:
         legacy_safe_enabled = is_strategy_module_enabled(config, "buy", "guard.safe_purchase_limit", default=False)
@@ -1440,6 +1723,21 @@ def lock_and_confirm_payment(
         safe_limit = max(min(cap_candidates), 0) if cap_candidates else count_at_lowest
     else:
         safe_limit = count_at_lowest
+    if hard_cap_enabled:
+        _strategy_module_log(
+            config, log_fn, "guard.purchase_hard_cap", "DATA",
+            f"hard_cap={int(scfg.get('safe_purchase_hard_qty_cap', 50))}",
+        )
+    if liquidity_cap_enabled:
+        _strategy_module_log(
+            config, log_fn, "guard.purchase_liquidity_cap", "DATA",
+            f"daily_volume={int(item.get('daily_volume', 0) or 0)} ratio={float(scfg.get('safe_purchase_liquidity_ratio', 0.05))} cap={safe_limit}",
+        )
+    if low_price_guard_enabled:
+        _strategy_module_log(
+            config, log_fn, "guard.low_price_purchase_guard", "DATA",
+            f"unit_price={lowest_price:.2f} low_price={is_low_price if safe_purchase_enabled else False} cap={safe_limit}",
+        )
     item_name = market_hash_name
     if item_name and held_same_guard_enabled:
         purchases_snapshot = get_purchases()
@@ -1448,6 +1746,10 @@ def lock_and_confirm_payment(
         safe_limit = max(0, safe_limit - held_same)
         if log_fn and held_same > 0:
             log_fn(f"[Buff]   → 已持有同名(英文) {held_same} 件，安全上限 {safe_limit + held_same} → {safe_limit}", "info")
+        _strategy_module_log(
+            config, log_fn, "guard.held_same_item_guard", "DATA",
+            f"held_same_name={held_same} remaining_cap={safe_limit}",
+        )
     if safe_limit <= 0:
         if log_fn:
             log_fn("[Buff]   → 安全采购模块限制为0，跳过本件", "warn")
@@ -1458,6 +1760,34 @@ def lock_and_confirm_payment(
     num_to_buy = min(num_to_buy, max(1, safe_limit))
     if log_fn and orig_num > num_to_buy:
         log_fn(f"[Buff]   → 安全采购上限={safe_limit}，原计划={orig_num} 实际购买={num_to_buy}", "info")
+    recommendation = evaluate_c5_manual_recommendation(
+        quote=c5_quote,
+        buff_price=lowest_price,
+        steam_reference_price=ref_price,
+        remaining_budget=target_balance - acc,
+        max_unit_price=max_unit_price,
+        max_discount=max_discount,
+        config=config,
+    )
+    if recommendation is not None:
+        notified, channel = notify_c5_manual_recommendation(recommendation, config)
+        if notified:
+            if log_fn:
+                notify_text = "已在 30 分钟内通知过" if channel == "cooldown" else f"已通过 {channel} 通知"
+                log_fn(
+                    f"[C5人工建议] C5={recommendation.c5_price:.2f} "
+                    f"BUFF={recommendation.buff_price:.2f}，低 "
+                    f"{recommendation.savings_amount:.2f} 元"
+                    f"（{recommendation.savings_percent:.2f}%）；{notify_text}，"
+                    "本件不锁 BUFF 订单",
+                    "success",
+                )
+            return SKIP_C5_MANUAL_RECOMMENDED
+        if log_fn:
+            log_fn(
+                "[C5人工建议] 价格满足条件，但通知发送失败；为避免静默漏单，继续原 BUFF 流程",
+                "warn",
+            )
     payment_mode = str(getattr(buff_client, "payment_mode", "") or "").strip().lower()
     balance_mode = payment_mode == "balance"
     smart_balance_mode = payment_mode == "balance_first"
@@ -1480,6 +1810,7 @@ def lock_and_confirm_payment(
         if balance_mode:
             if log_fn:
                 log_fn(f"[Buff余额] 准备预览 sell_order_id={o.get('id')} price={o.get('price')}", "info")
+            _assert_account_before_side_effect()
             return _execute_balance_purchase(
                 buff_client,
                 item,
@@ -1528,6 +1859,7 @@ def lock_and_confirm_payment(
                         f"[智能支付] 可用资金 {balance_text} 元可覆盖本笔 {p:.2f} 元，选择余额自动支付",
                         "info",
                     )
+                _assert_account_before_side_effect()
                 return _execute_balance_purchase(
                     buff_client,
                     item,
@@ -1560,7 +1892,14 @@ def lock_and_confirm_payment(
         if log_fn:
             log_fn(f"[Buff]   → 锁单 order_id={o.get('id')} price={o.get('price')}", "info")
         try:
-            result = buff_client.lock_and_get_pay_url(game_buff, goods_id, o["id"], o["price"])
+            _assert_account_before_side_effect()
+            result = buff_client.lock_manual_order_once(game_buff, goods_id, o["id"], o["price"])
+        except BuffOrderOutcomeUnknown as exc:
+            unknown_id = _record_unknown_balance_order(item, goods_id, p, str(exc))
+            _notify_lark_payment_review(config, unknown_id, str(exc))
+            if log_fn:
+                log_fn(f"[Buff]   → 锁单结果未知，已登记 {unknown_id} 并停止任务", "error")
+            return PAYMENT_REVIEW_REQUIRED
         except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
             raise
         except Exception as e:
@@ -1573,6 +1912,23 @@ def lock_and_confirm_payment(
                 msg_str = result.get('msg', '无响应内容') if result else '请求失败或超时'
                 log_fn(f"[Buff]   → 锁单失败 code={code_str} msg={msg_str}", "warn")
             return None
+        if result.get("outcome_unknown"):
+            known_order_id = str(result.get("order_id") or "").strip()
+            db_upsert_purchase_order({
+                "external_order_id": known_order_id,
+                "name": (item.get("steam_market_name") or item.get("name") or "").strip(),
+                "goods_id": goods_id,
+                "quantity": 1,
+                "unit_price": p,
+                "total_price": p,
+                "status": "needs_review",
+                "source": "buff_manual_unknown",
+                "error": str(result.get("msg") or "订单已创建，但后续结果未知"),
+            })
+            _notify_lark_payment_review(config, known_order_id, str(result.get("msg") or "订单后续结果未知"))
+            if log_fn:
+                log_fn(f"[Buff]   → 订单 {known_order_id} 已创建但结果未知，停止任务", "error")
+            return PAYMENT_REVIEW_REQUIRED
         if log_fn:
             log_fn(f"[Buff]   → 锁单成功 order_id={result.get('order_id')} 等待用户确认付款…", "info")
         return _do_wait_payment_and_append(
@@ -1598,7 +1954,14 @@ def lock_and_confirm_payment(
         )
     def _try_batch_buy():
         try:
-            batch_result = buff_client.try_batch_buy(goods_id, game_buff, orders, lowest_price, num_to_buy)
+            _assert_account_before_side_effect()
+            batch_result = buff_client.try_batch_buy_once(goods_id, game_buff, orders, lowest_price, num_to_buy)
+        except BuffOrderOutcomeUnknown as exc:
+            unknown_id = _record_unknown_balance_order(item, goods_id, lowest_price * num_to_buy, str(exc))
+            _notify_lark_payment_review(config, unknown_id, str(exc))
+            if log_fn:
+                log_fn(f"[Buff]   → 批量锁单结果未知，已登记 {unknown_id} 并停止任务", "error")
+            return PAYMENT_REVIEW_REQUIRED
         except (BuffAuthExpired, BuffVerificationRequired, BuffProtectionError):
             raise
         except Exception as e:
@@ -1609,6 +1972,23 @@ def lock_and_confirm_payment(
             if log_fn:
                 log_fn("[Buff]   → 批量锁单失败，接口未返回成功状态", "warn")
             return None
+        if batch_result.get("outcome_unknown"):
+            batch_id = str(batch_result.get("batch_id") or "").strip()
+            db_upsert_purchase_order({
+                "external_order_id": batch_id,
+                "name": (item.get("steam_market_name") or item.get("name") or "").strip(),
+                "goods_id": goods_id,
+                "quantity": num_to_buy,
+                "unit_price": lowest_price,
+                "total_price": lowest_price * num_to_buy,
+                "status": "needs_review",
+                "source": "buff_batch_unknown",
+                "error": str(batch_result.get("msg") or "批量订单已创建，但后续结果未知"),
+            })
+            _notify_lark_payment_review(config, batch_id, str(batch_result.get("msg") or "批量订单后续结果未知"))
+            if log_fn:
+                log_fn(f"[Buff]   → 批量订单 {batch_id} 结果未知，停止任务", "error")
+            return PAYMENT_REVIEW_REQUIRED
         if log_fn:
             log_fn(f"[Buff]   → 批量锁单成功 batch_id={batch_result.get('batch_id')} 数量={num_to_buy} 单价={lowest_price:.2f} 总价={batch_result.get('total_price', 0):.2f} 等待用户确认付款…", "info")
         return _do_batch_wait_finalize_and_append(
@@ -1634,21 +2014,11 @@ def lock_and_confirm_payment(
     if balance_mode or smart_balance_mode:
         return _try_single_buy()
     if num_to_buy == 1:
-        retry_delay = max(0, int(config.get("pipeline", {}).get("buff_retry_delay_seconds", 5) or 5))
-        for attempt in range(3):
-            paid = _try_single_buy()
-            if paid is not None:
-                return paid
-            if attempt < 2:
-                if log_fn:
-                    log_fn(f"[Buff]   → 单件购买失败，{retry_delay}秒后重试 ({attempt + 2}/3)…", "info")
-                if retry_delay > 0:
-                    jittered_sleep(retry_delay)
-        if log_fn:
-            log_fn("[Buff]   → 单件购买重试2次后仍失败，跳过", "warn")
-        return None
+        return _try_single_buy()
     else:
         paid = _try_batch_buy()
+        if paid is PAYMENT_REVIEW_REQUIRED:
+            return paid
         if paid is not None:
             return paid
         if log_fn:

@@ -75,9 +75,19 @@ function _roundSummaryClass(category = "") {
   };
   return classes[category] || "";
 }
+function _userActionClass(category = "") {
+  const classes = {
+    user_action: "log-user-action",
+    user_result_success: "log-user-result-success",
+    user_result_partial: "log-user-result-partial",
+    user_result_failure: "log-user-result-failure",
+  };
+  return classes[category] || "";
+}
 function _lineClasses(entry) {
   return [
     _levelClass(entry.level || "info", entry.msg || ""),
+    _userActionClass(entry.category || ""),
     _roundSummaryClass(entry.category || ""),
   ].filter(Boolean).join(" ");
 }

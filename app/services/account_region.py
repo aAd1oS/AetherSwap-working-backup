@@ -114,6 +114,9 @@ def refresh_account_region_currency(
             currency_checked_at=checked_at,
             wallet_currency_id=wallet.get("currency_id"),
         )
+        from app.services.steam_auth import record_steam_session_success
+
+        record_steam_session_success("Steam 钱包与结算币种", aid)
         return {
             "ok": True,
             "account": updated,
@@ -124,6 +127,12 @@ def refresh_account_region_currency(
         }
     except Exception as exc:
         error = _short_error(exc)
+        if "Cookie未登录或已过期" in error or "Cookie 不一致" in error or "Cookie不一致" in error:
+            session_status = "invalid"
+        elif "HTTP 429" in error:
+            session_status = "rate_limited"
+        else:
+            session_status = "unavailable"
         if aid:
             update_account(
                 aid,
@@ -131,4 +140,7 @@ def refresh_account_region_currency(
                 region_check_error=error,
                 region_checked_at=checked_at,
             )
-        return {"ok": False, "error": error, "checked_at": checked_at}
+            from app.services.steam_auth import record_steam_session_issue
+
+            record_steam_session_issue(session_status, error, aid)
+        return {"ok": False, "status": session_status, "error": error, "checked_at": checked_at}

@@ -79,6 +79,28 @@ def get_buff_balance_probe() -> dict:
         return dict(probe) if isinstance(probe, dict) else {}
 
 
+def clear_buff_balance_cache() -> None:
+    with _LOCK:
+        try:
+            _CACHE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def invalidate_buff_balance_observation() -> None:
+    """Drop balance data after BUFF credentials change, but keep the read-only probe."""
+    with _LOCK:
+        data = _load_unlocked()
+        probe = data.get("probe") or {}
+        if isinstance(probe, dict) and probe:
+            _save_unlocked({"probe": dict(probe)})
+            return
+        try:
+            _CACHE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def record_buff_balance_preview(
     preview: Optional[dict],
     *,
@@ -149,6 +171,34 @@ def record_buff_balance_preview(
         _save_unlocked(data)
         view = _public_view(data)
         view["observation_accepted"] = observation_accepted
+        view["observed_balance"] = observed
+        return view
+
+
+def record_buff_balance_amount(amount: Any, *, source: str = "account_asset") -> dict:
+    """Persist a trusted account-level balance observation."""
+    observed = _amount(amount)
+    with _LOCK:
+        data = _load_unlocked()
+        if observed is None:
+            view = _public_view(data)
+            view["observation_accepted"] = False
+            return view
+        now = time.time()
+        data.update({
+            "balance": observed,
+            "updated_at": now,
+            "source": str(source or "account_asset"),
+            "uncertain": False,
+            "uncertainty_reason": "",
+            "last_observed_balance": observed,
+            "last_observation_at": now,
+            "last_observation_trusted": True,
+            "last_observation_reason": "BUFF 账户资产接口返回的可用资金",
+        })
+        _save_unlocked(data)
+        view = _public_view(data)
+        view["observation_accepted"] = True
         view["observed_balance"] = observed
         return view
 

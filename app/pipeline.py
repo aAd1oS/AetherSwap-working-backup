@@ -14,6 +14,7 @@ from app.pipeline_steps import (
     TARGET_REACHED,
     PAYMENT_REVIEW_REQUIRED,
     SKIP_BALANCE_UNAVAILABLE,
+    SKIP_C5_MANUAL_RECOMMENDED,
     SKIP_NO_FAILED,
     SKIP_VERIFICATION_FAILED,
     filter_iflow_rows,
@@ -23,7 +24,7 @@ from app.pipeline_steps import (
 from app.services.iflow_client import fetch_iflow_rows
 from app.services.analysis_client import StabilityAnalyzer
 from app.services.buff_client import create_buff_client_from_config
-from app.services.buff_balance import get_buff_balance, get_buff_balance_probe
+from app.services.buff_balance import get_buff_balance, record_buff_balance_amount
 from app.services.steam_client import SteamClient
 from app.state import get_state, append_sale
 from app.strategy_engine import apply_strategy_to_config
@@ -72,18 +73,6 @@ def _refresh_buff_balance_after_retry(
     if str(payment_mode or "").strip().lower() not in {"balance", "balance_first"}:
         return False
 
-    probe = get_buff_balance_probe()
-    try:
-        goods_id = int(probe.get("goods_id") or 0)
-    except (TypeError, ValueError):
-        goods_id = 0
-    game = str(probe.get("game") or "csgo")
-    sell_order_id = str(probe.get("sell_order_id") or "").strip()
-    price = str(probe.get("price") or "").strip()
-    if goods_id <= 0 or not sell_order_id or not price:
-        ctx.debug("[Buff余额] Retry 结束，暂无完整的只读余额探针，本轮跳过自动刷新")
-        return False
-
     previous = get_buff_balance()
     previous_amount = previous.get("balance") if previous.get("has_value") else None
     ctx.set_status(
@@ -92,12 +81,7 @@ def _refresh_buff_balance_after_retry(
         progress_item="Retry completed; checking BUFF balance",
     )
     try:
-        preview = buyer.preview_balance_payment_once(
-            game,
-            goods_id,
-            sell_order_id,
-            price,
-        )
+        observation = buyer.get_available_funds_once()
     except (BuffAuthExpired, BuffVerificationRequired, BuffManualCircuitOpen, BuffTemporaryCircuitOpen):
         raise
     except Exception as exc:
@@ -108,30 +92,16 @@ def _refresh_buff_balance_after_retry(
         )
         return False
 
-    if (preview or {}).get("balance_observation_trustworthy") is False:
-        cached = get_buff_balance()
-        observed_amount = _preview_balance_amount(preview)
-        observed_text = f"{observed_amount:.2f}" if observed_amount is not None else "未知"
-        if cached.get("has_value"):
-            retained_text = f"，未覆盖最近可信余额 {float(cached['balance']):.2f}"
-        else:
-            retained_text = "，未写入账号余额"
-        ctx.log(
-            f"[Buff余额] Retry 预览只返回订单级不可用通道 {observed_text}{retained_text}；继续下一轮",
-            "warn",
-            category="buff",
-        )
-        return False
-
-    current_amount = _preview_balance_amount(preview)
+    current_amount = _preview_balance_amount(observation)
     if current_amount is None:
-        reason = str((preview or {}).get("reason") or "购买预览未返回可识别余额")
+        reason = str((observation or {}).get("reason") or "账户资产接口未返回可识别余额")
         ctx.log(
             f"[Buff余额] Retry 结束自动刷新未取得余额: {reason}；继续下一轮",
             "warn",
             category="buff",
         )
         return False
+    record_buff_balance_amount(current_amount, source="account_asset")
 
     try:
         previous_value = float(previous_amount)
@@ -174,6 +144,53 @@ def _new_round_summary(round_number: int, start_acc: float) -> dict:
         "notes": [],
         "emitted": False,
     }
+
+
+def _complete_limited_round(
+    ctx: PipelineContext,
+    completed_rounds: int,
+    max_run_rounds: int,
+    total_bought: int,
+) -> tuple[int, bool]:
+    completed_rounds += 1
+    if max_run_rounds <= 0:
+        return completed_rounds, False
+    if completed_rounds < max_run_rounds:
+        ctx.log(
+            f"运行轮次进度: {completed_rounds}/{max_run_rounds}",
+            "info",
+            category="pipeline",
+        )
+        return completed_rounds, False
+    ctx.log(
+        f"已完成设定的 {max_run_rounds} 个完整轮次，任务自动结束；本次共成功购买 {total_bought} 单",
+        "info",
+        category="pipeline",
+    )
+    ctx.set_status(
+        "idle",
+        "ROUND_LIMIT_REACHED",
+        progress_done=completed_rounds,
+        progress_total=max_run_rounds,
+        progress_item="",
+    )
+    return completed_rounds, True
+
+
+def _round_summary_next_action(
+    retry_interval: int,
+    completed_rounds: int,
+    max_run_rounds: int,
+    *,
+    counts_as_complete: bool,
+) -> str:
+    if (
+        counts_as_complete
+        and max_run_rounds > 0
+        and completed_rounds + 1 >= max_run_rounds
+    ):
+        return f"等待 {retry_interval} 秒后自动结束"
+    return f"{retry_interval} 秒后重新拉取"
 
 
 def _add_round_failure(summary: dict, reason: str, count: int = 1) -> None:
@@ -424,6 +441,15 @@ def _process_deals_for_target(
             else:
                 ctx.log("BUFF 可用资金当前不可用，本件未锁单", "warn", category="buff")
             continue
+        if paid is SKIP_C5_MANUAL_RECOMMENDED:
+            gid = chosen.get("goods_id")
+            if gid is not None:
+                skipped_this_round.add(gid)
+            round_summary.setdefault("notes", []).append(
+                f"C5 人工建议：{chosen.get('name') or chosen.get('steam_market_name') or '未命名商品'}"
+            )
+            ctx.log("已转为 C5 人工核验建议，本轮不锁该件 BUFF 订单", "success", category="c5")
+            continue
         if paid is PAYMENT_REVIEW_REQUIRED:
             _add_round_failure(round_summary, "付款结果需人工核对")
             ctx.log("余额锁单或付款结果需要人工核对，已立即停止任务并阻止继续锁单", "error", category="buff")
@@ -466,16 +492,6 @@ def _run_pipeline(config: dict) -> None:
 
     target = float(pipeline_cfg.get("target_balance", 100))
     budget = get_daily_budget_summary(target)
-    blocking_orders = get_blocking_payment_orders()
-    if blocking_orders:
-        order_ids = ", ".join(str(order.get("external_order_id")) for order in blocking_orders[:3])
-        ctx.log(
-            f"检测到 {len(blocking_orders)} 个待支付或待核对订单（{order_ids}），已阻止继续锁单；请先处理订单状态",
-            "error",
-            category="buff",
-        )
-        ctx.set_status("error", "PENDING_ORDER_REVIEW")
-        return
     exclude = pipeline_cfg.get("exclude_keywords", [])
     cred_buff = get_buff_credentials()
     cookies_buff = cred_buff.get("cookies", "")
@@ -507,9 +523,11 @@ def _run_pipeline(config: dict) -> None:
     sort_labels = {"sell": "最优寄售", "buy": "最优求购"}
     sort_desc = sort_labels.get(sort_by, sort_by)
     retry_interval = int(pipeline_cfg.get("retry_interval_seconds", DEFAULT_RETRY_INTERVAL_SECONDS))
+    max_run_rounds = max(0, int(pipeline_cfg.get("max_run_rounds", 0) or 0))
+    rounds_desc = "不限" if max_run_rounds == 0 else str(max_run_rounds)
     ctx.log(
         f"配置: 目标余额={target}, 排除关键词={exclude}, 最高折扣={max_discount}, "
-        f"排序={sort_desc}({sort_by}), 无符合时{retry_interval}秒后重试",
+        f"排序={sort_desc}({sort_by}), 运行轮次={rounds_desc}, 无符合时{retry_interval}秒后重试",
         "info",
     )
     if ctx.verbose:
@@ -545,9 +563,30 @@ def _run_pipeline(config: dict) -> None:
     steam_client = SteamClient()
     analyzer = StabilityAnalyzer(usd_to_cny=USD_TO_CNY_DEFAULT)
     buyer = create_buff_client_from_config(cred_buff, cfg, steam_credentials=steam_credentials)
+    from app.order_state import reconcile_single_manual_payment_order
+    reconcile_result = reconcile_single_manual_payment_order(buyer)
+    if reconcile_result.get("checked"):
+        ctx.log(
+            f"启动前订单核对: {reconcile_result.get('status')}"
+            + (f" order_id={reconcile_result.get('order_id')}" if reconcile_result.get("order_id") else ""),
+            "info" if reconcile_result.get("status") in {"paid", "cancelled"} else "warn",
+            category="buff",
+        )
+    budget = get_daily_budget_summary(target)
+    blocking_orders = get_blocking_payment_orders()
+    if blocking_orders:
+        order_ids = ", ".join(str(order.get("external_order_id")) for order in blocking_orders[:3])
+        ctx.log(
+            f"检测到 {len(blocking_orders)} 个待支付或待核对订单（{order_ids}），已阻止继续锁单；请先处理订单状态",
+            "error",
+            category="buff",
+        )
+        ctx.set_status("error", "PENDING_ORDER_REVIEW")
+        return
     failed_goods_ids_ttl: dict = {}
     previous_round_checked_ids: set = set()
     round_number = 0
+    completed_rounds = 0
 
     while True:
         if ctx.is_stop_requested():
@@ -627,7 +666,12 @@ def _run_pipeline(config: dict) -> None:
                     ctx,
                     round_summary,
                     target,
-                    f"{retry_interval} 秒后重新拉取",
+                    _round_summary_next_action(
+                        retry_interval,
+                        completed_rounds,
+                        max_run_rounds,
+                        counts_as_complete=not fetch_failed,
+                    ),
                 )
                 if _wait_retry_and_refresh_buff_balance(
                     ctx,
@@ -636,6 +680,15 @@ def _run_pipeline(config: dict) -> None:
                     buff_payment_mode,
                 ):
                     return
+                if not fetch_failed:
+                    completed_rounds, limit_reached = _complete_limited_round(
+                        ctx,
+                        completed_rounds,
+                        max_run_rounds,
+                        total_bought,
+                    )
+                    if limit_reached:
+                        return
                 continue
 
             ctx.log("支付方式与 Buff 客户端已就绪", "info", category="buff")
@@ -676,7 +729,12 @@ def _run_pipeline(config: dict) -> None:
                 ctx,
                 round_summary,
                 target,
-                f"{retry_interval} 秒后重新拉取",
+                _round_summary_next_action(
+                    retry_interval,
+                    completed_rounds,
+                    max_run_rounds,
+                    counts_as_complete=True,
+                ),
             )
             if _wait_retry_and_refresh_buff_balance(
                 ctx,
@@ -684,6 +742,14 @@ def _run_pipeline(config: dict) -> None:
                 buyer,
                 buff_payment_mode,
             ):
+                return
+            completed_rounds, limit_reached = _complete_limited_round(
+                ctx,
+                completed_rounds,
+                max_run_rounds,
+                total_bought,
+            )
+            if limit_reached:
                 return
 
         except BuffManualCircuitOpen as e:
@@ -740,11 +806,13 @@ def is_pipeline_running() -> bool:
         return _pipeline_thread is not None and _pipeline_thread.is_alive()
 
 
-def _run_pipeline_guarded(config: dict) -> None:
+def _run_pipeline_guarded(config: dict, operation_token: str) -> None:
     global _pipeline_thread
     try:
         _run_pipeline(config)
     finally:
+        from app.account_operations import end_account_operation
+        end_account_operation(operation_token)
         with _pipeline_start_lock:
             _pipeline_thread = None
 
@@ -754,7 +822,21 @@ def start_pipeline(config: dict) -> bool:
     with _pipeline_start_lock:
         if _pipeline_thread is not None and _pipeline_thread.is_alive():
             return False
-        t = threading.Thread(target=_run_pipeline_guarded, args=(config,), daemon=True, name="buy-pipeline")
-        _pipeline_thread = t
-        t.start()
+        from app.account_operations import begin_account_operation, end_account_operation
+        try:
+            operation_token, _account_id = begin_account_operation("购买任务")
+        except Exception:
+            return False
+        try:
+            t = threading.Thread(
+                target=_run_pipeline_guarded,
+                args=(config, operation_token),
+                daemon=True,
+                name="buy-pipeline",
+            )
+            _pipeline_thread = t
+            t.start()
+        except Exception:
+            end_account_operation(operation_token)
+            raise
         return True

@@ -28,8 +28,18 @@ def list_item(
         "price": str(int(price) if isinstance(price, float) and price == int(price) else price),
     }
     try:
-        r = session.post(SELL_ITEM_URL, data=payload, timeout=15)
-        return {"status_code": r.status_code, "text": r.text}
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Origin": "https://steamcommunity.com",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        r = session.post(SELL_ITEM_URL, data=payload, headers=headers, timeout=15)
+        return {
+            "status_code": r.status_code,
+            "text": r.text,
+            "content_type": r.headers.get("Content-Type", ""),
+            "url": r.url,
+        }
     except Exception:
         return None
 def list_item_by_name(
